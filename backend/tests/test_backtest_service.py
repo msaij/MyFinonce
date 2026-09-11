@@ -27,7 +27,7 @@ DATES = [datetime.date(2025, 1, 1) + datetime.timedelta(days=i) for i in range(9
 @pytest.fixture()
 def db_con(tmp_path, monkeypatch):
     monkeypatch.setattr(connection, "DB_PATH", str(tmp_path / "test.sqlite3"))
-    connection._CON = None
+    connection._THREAD_LOCAL.con = None
     db.init_db()
 
     con = connection.get_connection()
@@ -43,7 +43,7 @@ def db_con(tmp_path, monkeypatch):
     con.executemany("INSERT INTO nav_history (scheme_code, nav_date, nav) VALUES (?, ?, ?)", rows)
     con.close()
     yield
-    connection._CON = None
+    connection._THREAD_LOCAL.con = None
 
 
 class TestRunPortfolioBacktest:

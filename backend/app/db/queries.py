@@ -45,54 +45,11 @@ from app.db.connection import (
     bump_data_version,
     get_data_version,
     DB_PATH,
+    fetchdf as _fetchdf,
+    pyval as _pyval,
+    write_staging_table as _write_staging_table,
 )
 from app.core.cache import cached
-
-
-def _fetchdf(cursor: sqlite3.Cursor) -> pd.DataFrame:
-    """DuckDB's cursor.fetchdf() equivalent for the stdlib sqlite3 API."""
-    cols = [d[0] for d in cursor.description] if cursor.description else []
-    return pd.DataFrame(cursor.fetchall(), columns=cols)
-
-
-def _pyval(v: Any) -> Any:
-    """Normalizes a pandas/numpy scalar to a type sqlite3's parameter binder
-    accepts natively (it only knows None/int/float/str/bytes) -- mirrors
-    core/serialize.py's sanitize_floats(), but at the DB-write boundary
-    instead of the JSON-response boundary."""
-    if v is None:
-        return None
-    if isinstance(v, float) and pd.isna(v):
-        return None
-    if isinstance(v, np.integer):
-        return int(v)
-    if isinstance(v, np.floating):
-        f = float(v)
-        return None if f != f else f  # NaN != NaN
-    if isinstance(v, pd.Timestamp):
-        return v.date().isoformat()
-    if isinstance(v, datetime.datetime):
-        return v.isoformat(sep=" ")
-    if isinstance(v, datetime.date):
-        return v.isoformat()
-    if isinstance(v, np.bool_):
-        return bool(v)
-    return v
-
-
-def _write_staging_table(con: sqlite3.Cursor, table_name: str, df: pd.DataFrame) -> None:
-    """Writes a DataFrame to a connection-scoped TEMP TABLE for use in
-    UPDATE...FROM / INSERT...SELECT / DELETE...WHERE EXISTS patterns --
-    SQLite has no DuckDB-style register()-a-DataFrame-directly. Caller is
-    responsible for dropping it when done (mirrors the old unregister() step)."""
-    con.execute(f"DROP TABLE IF EXISTS {table_name}")
-    cols = list(df.columns)
-    col_defs = ", ".join(f'"{c}"' for c in cols)
-    con.execute(f"CREATE TEMP TABLE {table_name} ({col_defs})")
-    placeholders = ", ".join(["?"] * len(cols))
-    rows = [tuple(_pyval(v) for v in row) for row in df.itertuples(index=False, name=None)]
-    if rows:
-        con.executemany(f"INSERT INTO {table_name} VALUES ({placeholders})", rows)
 
 # A fund occasionally resets its face value by a clean factor (e.g. a Liquid/Overnight
 # fund rebasing from Rs 1000 to Rs 100 per unit, or an ETF splitting units to track its

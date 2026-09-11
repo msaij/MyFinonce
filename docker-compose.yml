@@ -43,7 +43,18 @@ services:
       - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
       - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
       - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
-      - ENABLE_SYNC_DAEMON=true
+      # false during active development (not "true" as originally set right after the
+      # SQLite migration): the daemon does a real, potentially long-running startup
+      # catch-up sync (check_and_catchup_sync(), possibly a full historical backfill)
+      # against the live AMFI servers, unconditionally, on every container start --
+      # discovered when it made the backend unresponsive (even /api/health timing out)
+      # for minutes after an ordinary dev rebuild. That's fine for the real, deliberate
+      # write-ownership handoff (Phase 9, where this flips true on purpose), not for a
+      # container that gets rebuilt many times per hour while iterating. The database
+      # already has real synced data from whichever rebuild it last happened to be true
+      # for -- this flag only controls the daemon auto-starting, not whether previously
+      # synced data is kept.
+      - ENABLE_SYNC_DAEMON=false
     volumes:
       - ./backend:/app
       # Read-write: this is backend's own, exclusively-owned data directory

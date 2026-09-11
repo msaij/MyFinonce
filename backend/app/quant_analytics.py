@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.cache import cached
-from app.db.connection import get_connection
+from app.db.connection import get_connection, fetchdf
 
 def calendar_day_cagr(cum_return: float, start_date, end_date) -> float:
     """Annualizes a cumulative return over its actual calendar-day span. Compounds for spans
@@ -474,7 +474,7 @@ def get_synthetic_category_benchmark(
         ORDER BY nav_date ASC;
     """
     try:
-        df_bench = con.execute(sql, [category, lookback_start, lookback_start, end_date, end_date]).fetchdf()
+        df_bench = fetchdf(con.execute(sql, [category, lookback_start, lookback_start, end_date, end_date]))
     except Exception:
         df_bench = pd.DataFrame()
     finally:

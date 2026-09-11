@@ -41,7 +41,7 @@ def db_con(tmp_path, monkeypatch):
     dataset described in the module docstring. Yields nothing; tests call
     db.* functions directly, matching how routers use them."""
     monkeypatch.setattr(connection, "DB_PATH", str(tmp_path / "test.sqlite3"))
-    connection._CON = None
+    connection._THREAD_LOCAL.con = None
 
     db.init_db()
 
@@ -63,7 +63,7 @@ def db_con(tmp_path, monkeypatch):
 
     db.refresh_summary_table()
     yield
-    connection._CON = None
+    connection._THREAD_LOCAL.con = None
 
 
 def test_init_db_creates_expected_tables(db_con):

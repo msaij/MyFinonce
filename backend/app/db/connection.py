@@ -15,11 +15,14 @@ This is a clean-slate database: no data was migrated from the old DuckDB
 file. init_db() creates empty tables; the user re-runs the AMFI sync to
 repopulate from scratch.
 
-Structural pattern kept identical to the old DuckDB version on purpose --
-module-global singleton + threading.RLock write-serialization, self-healing
-get_connection(), bump_data_version()/get_data_version() -- so queries.py's
-calling convention (`con = get_connection(); ...; con.close()`) needed no
-structural change, only the SQL dialect inside each query.
+Structural pattern kept mostly identical to the old DuckDB version on purpose
+-- threading.RLock write-serialization, self-healing get_connection(),
+bump_data_version()/get_data_version() -- so queries.py's calling convention
+(`con = get_connection(); ...; con.close()`) needed no structural change,
+only the SQL dialect inside each query. One deliberate exception: connections
+are thread-local, not a single shared global -- see get_connection()'s
+docstring for why (sharing one connection's cursors across concurrently-
+running threads made the whole app hang intermittently under real load).
 """
 
 import datetime
@@ -27,7 +30,10 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
+
+import numpy as np
+import pandas as pd
 
 from app.core.cache import clear_all_caches
 from app.core.config import settings
@@ -88,15 +94,20 @@ class _Stddev:
         return var ** 0.5
 
 
-_CON: Optional[sqlite3.Connection] = None
-_LOCK = threading.Lock()
+# One real sqlite3.Connection per thread, not one shared global -- see get_connection()'s
+# docstring below for why (sharing cursors of one connection across concurrently-running
+# threads was found to make the whole app hang intermittently). Tests force a fresh
+# connection for a new temp DB path via `connection._THREAD_LOCAL.con = None`.
+_THREAD_LOCAL = threading.local()
 
 # Serializes every DB *write* path (daily sync, backfill chunks, cost import, summary-table
 # rebuild) so the background sync daemon's scheduled/heartbeat runs can never race a manual
-# "Sync Now" / "Recompute" click (or each other) on the same shared connection. Reentrant so
-# a writer that itself calls refresh_summary_table() (which also takes this lock) doesn't
-# deadlock on itself. Within-process only, same as before -- see connection setup below for
-# how cross-process safety is now handled differently than the DuckDB version.
+# "Sync Now" / "Recompute" click (or each other). Reentrant so a writer that itself calls
+# refresh_summary_table() (which also takes this lock) doesn't deadlock on itself. This is
+# still needed even with thread-local connections: SQLite's WAL mode allows multiple
+# concurrent readers alongside one writer, but still only one writer at a time -- this lock
+# is what makes that true across this app's own multiple threads (SQLite's own busy_timeout
+# handles it too, but returning a clean queued wait beats surfacing "database is locked").
 WRITE_LOCK = threading.RLock()
 
 _DATA_VERSION = 0
@@ -149,24 +160,43 @@ def _connect() -> sqlite3.Connection:
 
 
 def get_connection() -> sqlite3.Connection:
-    """Returns a cursor on the shared singleton connection, transparently reconnecting if
-    the connection has gone bad (mirrors the old DuckDB self-healing check). A cheap
-    SELECT 1 health-check catches this before it can take down every page until a human
-    intervenes."""
-    global _CON
-    with _LOCK:
-        if _CON is not None:
+    """Returns a cursor on a connection unique to the calling thread, transparently
+    reconnecting if that thread's connection has gone bad (mirrors the old DuckDB
+    self-healing check). A cheap SELECT 1 health-check catches this before it can take
+    down every page until a human intervenes.
+
+    Thread-local, NOT a shared global connection (an earlier version of this function
+    used one global `sqlite3.Connection` and handed out `.cursor()`s from it to every
+    thread) -- found live, the hard way, that sharing one connection's cursors across
+    concurrently-running threads (FastAPI's sync route handlers each run in their own
+    thread via run_in_threadpool; a single page load fires ~8 of them at once) made the
+    whole app intermittently and unpredictably hang, including for completely unrelated,
+    read-only, lock-free requests, until the *whole backend* looked dead (even /api/health
+    stopped responding, and Docker's own healthcheck started failing). SQLite's WAL mode
+    is specifically designed for multiple independent connections to the same file
+    coexisting safely -- this leverages that directly instead of serializing everything
+    through one shared connection object, which doesn't reliably work across threads
+    regardless of `check_same_thread=False` (that flag only disables Python's own
+    same-thread assertion; it doesn't retroactively make concurrent multi-thread use of
+    one connection's cursors safe).
+
+    Contract note: callers still get back a `.cursor()` and still call `.close()` on it
+    exactly as before -- that only closes the cursor, not the thread's underlying
+    connection, so no call site anywhere else in the codebase needed to change."""
+    con = getattr(_THREAD_LOCAL, "con", None)
+    if con is not None:
+        try:
+            con.execute("SELECT 1")
+        except Exception:
             try:
-                _CON.execute("SELECT 1")
+                con.close()
             except Exception:
-                try:
-                    _CON.close()
-                except Exception:
-                    pass
-                _CON = None
-        if _CON is None:
-            _CON = _connect()
-    return _CON.cursor()
+                pass
+            con = None
+    if con is None:
+        con = _connect()
+        _THREAD_LOCAL.con = con
+    return con.cursor()
 
 
 def _execute_with_conflict_retry(con, sql, attempts=3, delay_seconds=1.0):
@@ -185,3 +215,57 @@ def _execute_with_conflict_retry(con, sql, attempts=3, delay_seconds=1.0):
             if attempt < attempts - 1:
                 time.sleep(delay_seconds)
     raise last_err
+
+
+# --- Shared SQLite-dialect helpers -----------------------------------------
+# Used by both db/queries.py and amfi_sync.py (both write DataFrames into
+# staging tables and read result sets back into DataFrames), so they live
+# here rather than being duplicated or cross-imported as "private" helpers.
+# See db/queries.py's module docstring for the full DuckDB->SQLite dialect
+# notes these exist to bridge.
+
+
+def fetchdf(cursor: sqlite3.Cursor) -> pd.DataFrame:
+    """DuckDB's cursor.fetchdf() equivalent for the stdlib sqlite3 API."""
+    cols = [d[0] for d in cursor.description] if cursor.description else []
+    return pd.DataFrame(cursor.fetchall(), columns=cols)
+
+
+def pyval(v: Any) -> Any:
+    """Normalizes a pandas/numpy scalar to a type sqlite3's parameter binder
+    accepts natively (it only knows None/int/float/str/bytes) -- mirrors
+    core/serialize.py's sanitize_floats(), but at the DB-write boundary
+    instead of the JSON-response boundary."""
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        f = float(v)
+        return None if f != f else f  # NaN != NaN
+    if isinstance(v, pd.Timestamp):
+        return v.date().isoformat()
+    if isinstance(v, datetime.datetime):
+        return v.isoformat(sep=" ")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    if isinstance(v, np.bool_):
+        return bool(v)
+    return v
+
+
+def write_staging_table(con: sqlite3.Cursor, table_name: str, df: pd.DataFrame) -> None:
+    """Writes a DataFrame to a connection-scoped TEMP TABLE for use in
+    UPDATE...FROM / INSERT...SELECT / DELETE...WHERE EXISTS patterns --
+    SQLite has no DuckDB-style register()-a-DataFrame-directly. Caller is
+    responsible for dropping it when done (mirrors the old unregister() step)."""
+    con.execute(f"DROP TABLE IF EXISTS {table_name}")
+    cols = list(df.columns)
+    col_defs = ", ".join(f'"{c}"' for c in cols)
+    con.execute(f"CREATE TEMP TABLE {table_name} ({col_defs})")
+    placeholders = ", ".join(["?"] * len(cols))
+    rows = [tuple(pyval(v) for v in row) for row in df.itertuples(index=False, name=None)]
+    if rows:
+        con.executemany(f"INSERT INTO {table_name} VALUES ({placeholders})", rows)

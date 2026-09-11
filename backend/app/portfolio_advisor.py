@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from app.db import queries as db
+from app.db.connection import fetchdf
 from app import quant_analytics
 from app import portfolio_sim
 
@@ -132,11 +133,13 @@ SCORE_WEIGHTS = {"sharpe": 0.30, "sortino": 0.25, "alpha_vs_sleeve_median": 0.25
 def _sleeve_where_clause(sleeve: str) -> Tuple[str, List[Any]]:
     spec = SLEEVE_CATEGORY_FILTERS[sleeve]
     keywords = spec["category_keywords"]
-    cat_conditions = " OR ".join(["s.category ILIKE ?"] * len(keywords))
+    # LIKE, not ILIKE (DuckDB-only) -- SQLite's LIKE is already ASCII case-insensitive by
+    # default, the same effect for this English-text-only data.
+    cat_conditions = " OR ".join(["s.category LIKE ?"] * len(keywords))
     params: List[Any] = [f"%{kw}%" for kw in keywords]
     where = f"({cat_conditions})"
     if spec.get("name_keyword"):
-        where += " AND s.scheme_name ILIKE ?"
+        where += " AND s.scheme_name LIKE ?"
         params.append(f"%{spec['name_keyword']}%")
     return where, params
 
@@ -218,14 +221,14 @@ def get_sleeve_candidates(
         JOIN p_end pe ON s.scheme_code = pe.scheme_code
         JOIN inception i ON s.scheme_code = i.scheme_code
         LEFT JOIN vol_calc v ON s.scheme_code = v.scheme_code
-        WHERE s.is_active = TRUE
+        WHERE s.is_active = 1
           AND i.first_nav_date <= ?
           {plan_clause}
           AND {where_cat};
     """
     all_params = [active_start, active_end, active_start, active_end, active_start, active_end, track_record_cutoff] + cat_params
     try:
-        df = con.execute(sql, all_params).fetchdf()
+        df = fetchdf(con.execute(sql, all_params))
     finally:
         con.close()
 

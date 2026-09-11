@@ -25,18 +25,21 @@ export function DateRangePicker() {
   useEffect(() => {
     if (!status) return;
     if (status.min_date && status.max_date) {
-      syncBounds(status.min_date, status.max_date);
+      syncBounds(status.min_date, status.max_date, false);
       return;
     }
     // Empty database (no sync has run yet): min_date/max_date are both null, so there's
     // no real bound to seed from. Without this fallback the store never seeds at all --
     // start/end stay "" forever, silently blocking every page whose queries gate on
     // `enabled: !!start && !!end` (Overview's KPIs/trend chart, Leaders, ...). Seed with
-    // today's date as a placeholder bound; once a real sync lands, this same syncBounds()
-    // call naturally transitions to the real max_date via the live-edge-slide rule, since
-    // a relative preset's end will still equal this placeholder (== "was tracking live").
+    // today's date as a placeholder bound, marked `isPlaceholder: true` so that once a
+    // real sync lands, syncBounds() forces a fresh reseed even if the real max_date
+    // coincidentally equals today (very likely right after a fresh sync) -- plain
+    // value-equality alone can't tell "nothing changed" from "the placeholder happened
+    // to match", which silently left the window stuck at a degenerate 0-day range the
+    // first time this was tested against a real, just-synced database.
     const today = new Date().toISOString().slice(0, 10);
-    syncBounds(today, today);
+    syncBounds(today, today, true);
   }, [status, syncBounds]);
 
   const span = start && end ? Math.round((new Date(end).getTime() - new Date(start).getTime()) / 86400000) : 0;

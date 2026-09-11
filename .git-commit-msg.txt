@@ -1,0 +1,85 @@
+Phase 7: Portfolio Suggestion page + 3 critical infra fixes found while verifying it
+
+Phase 7 itself: GET /api/portfolio-advisor/questionnaire, POST /score,
+POST /suggest (composes build_rules_based_portfolio + build_mvo_portfolio +
+backtest_portfolio into one response, stripping the DataFrame-bearing
+`shortlists` field that's internal plumbing between the two builders and
+was never rendered client-side in the original page either).
+app/portfolio/page.tsx: both profile-input modes (questionnaire with live
+scoring, quick-select), budget/horizon inputs, and all 3 result tabs
+(Rules-Based, Efficient-Frontier, Compare Both).
+
+Verifying this page against real, live-synced data (the database now has
+14,361 real schemes from an actual AMFI sync, not just empty-DB checks)
+surfaced three real, independent bugs -- each caught by exercising the app
+for real rather than trusting "it was already ported/it already passed
+tests":
+
+1. amfi_sync.py / portfolio_advisor.py / quant_analytics.py had their OWN
+   direct DuckDB SQL that the original DuckDB->SQLite migration sweep
+   missed (it only audited db/queries.py). amfi_sync.py's gap was the most
+   serious: all three of its bulk-upsert write paths (daily sync, AMC
+   historical backfill, full-universe backfill merge) used DuckDB-only
+   con.register()/UPDATE...FROM/DELETE...USING, meaning the actual
+   sync-population mechanism -- the one thing the user explicitly needs to
+   work -- would have failed on first real use. portfolio_advisor.py's
+   get_sleeve_candidates() used ILIKE + .fetchdf(). Fixed by moving the
+   staging-table helpers (fetchdf/pyval/write_staging_table) from
+   db/queries.py into db/connection.py as shared public utilities, then
+   applying the same rewrites already established there. New
+   backend/tests/test_amfi_sync_write_path.py mocks only the network layer
+   and runs the real sync function end-to-end for positive proof, not just
+   an absence-of-regression signal.
+
+2. DateRangePicker's empty-database placeholder (today's date, seeded so
+   date-gated queries aren't blocked forever on a fresh install) could get
+   silently stuck once real data arrived, if the real max_date happened to
+   equal the placeholder (likely right after a fresh sync) -- plain
+   dbMax-equality couldn't tell "nothing changed" from "the placeholder
+   coincidentally matched". Fixed with an explicit isPlaceholder flag on
+   the store so a placeholder->real transition always forces a fresh
+   reseed regardless of whether the value actually differs. 2 new
+   regression tests.
+
+3. The most significant fix: app/db/connection.py's get_connection() used
+   one shared global sqlite3.Connection, handing out .cursor()s from it to
+   whichever thread called it. FastAPI's sync route handlers each run in
+   their own thread (run_in_threadpool), and a single page load fires ~8
+   of them concurrently -- sharing one connection's cursors across those
+   threads made the *entire backend* intermittently and unpredictably
+   hang, including for unrelated read-only requests, until even /api/health
+   and Docker's own healthcheck stopped responding. check_same_thread=False
+   only disables Python's same-thread assertion; it does not make
+   concurrent multi-thread use of one connection's cursors safe. Rewrote
+   get_connection() to hand out a cursor from a connection unique to each
+   calling thread (threading.local()) instead -- this is what SQLite's WAL
+   mode is actually designed for (multiple independent connections
+   coexisting safely, not one shared connection object). The public
+   contract (`con = get_connection(); ...; con.close()`) is unchanged, so
+   no call site anywhere else needed to change; only test fixtures that
+   reset the connection for a new temp DB path were updated
+   (connection._CON = None -> connection._THREAD_LOCAL.con = None).
+
+Also: reverted ENABLE_SYNC_DAEMON's default from true back to false. It
+was flipped true right after the SQLite migration on the reasoning that
+there's no cross-process contention risk anymore -- true, but it missed a
+different problem: the daemon's startup catch-up runs a real, potentially
+long-running sync against live AMFI servers unconditionally on every
+container start, which is fine for the deliberate Phase 9 write-ownership
+handoff but actively destabilizing for a container rebuilt many times an
+hour during iteration. The capability is untouched; Phase 9 is where this
+flips true on purpose.
+
+Verified end-to-end live with real data (not just empty-DB checks this
+time): questionnaire renders and scores correctly (all-max answers ->
+score 30 -> Aggressive, matching a direct curl check), sleeve allocation
+displays correctly (95% equity / 0% debt / 5% gold / 0% liquid, matching
+real SLEEVE_ALLOCATIONS data), Generate triggers a real backend screening
+pass against real schemes and correctly reports "no qualifying candidate"
+(accurate: the synced data is a single-day snapshot with no scheme having
+enough historical depth yet for the 3-year track-record + volatility
+checks -- expected, not a bug). No hangs, no 500s, confirming the
+thread-local connection fix resolved the concurrency issue completely.
+64/64 backend tests, 17/17 frontend tests passing.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>

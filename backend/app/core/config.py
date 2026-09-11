@@ -2,9 +2,20 @@
 
 DB_PATH points at this backend's own SQLite file -- a clean-slate database,
 entirely separate from fetcher/'s old DuckDB file (no data was migrated; the
-AMFI sync repopulates it from scratch). Because it's a file this backend
-alone owns, ENABLE_SYNC_DAEMON defaults to True: unlike the old DuckDB setup,
-there is no second process that could ever contend for this specific file.
+AMFI sync repopulates it from scratch).
+
+ENABLE_SYNC_DAEMON defaults to False, NOT because of the old cross-process
+DuckDB safety concern (this file has no second process that could ever
+contend for it) but for a different, practical reason found the hard way:
+the daemon's startup catch-up (amfi_sync.check_and_catchup_sync(), possibly
+a real, long-running historical backfill against the live AMFI servers) runs
+unconditionally on every app startup -- fine for the deliberate write-
+ownership handoff (Phase 9 of the migration plan, where this flips true on
+purpose) but actively disruptive during iterative development, where the
+container gets rebuilt many times an hour: it made the whole backend
+unresponsive (even /api/health timing out) for minutes after an ordinary
+rebuild. Flip to true explicitly (docker-compose.yml or this default) only
+when you actually want the daemon auto-starting.
 
 AMFI_* URLs and TZ still reuse the same env var NAMES docker-compose.yml
 already defines -- pydantic-settings matches field names to env vars
@@ -23,7 +34,7 @@ class Settings(BaseSettings):
     amfi_download_page: str = "https://www.amfiindia.com/net-asset-value/nav-download"
     amfi_history_url: str = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx"
     amfi_daily_url: str = "https://portal.amfiindia.com/spages/NAVAll.txt"
-    enable_sync_daemon: bool = True
+    enable_sync_daemon: bool = False
 
 
 settings = Settings()

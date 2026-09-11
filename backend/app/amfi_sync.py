@@ -10,6 +10,7 @@ from app.amfi_client import AmfiClient
 from app.amfi_ter_client import AmfiTerClient, TER_PORTAL_PAGE_URL
 from app.core.config import settings
 from app.db import queries as db
+from app.db.connection import write_staging_table
 from app import costs_data
 
 logger = logging.getLogger("amfi_sync")
@@ -142,34 +143,36 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
 
     con = db.get_connection()
     try:
-        con.register("stg_schemes", df_stg_schemes)
-        con.register("stg_nav", df_stg_nav)
+        write_staging_table(con, "stg_schemes", df_stg_schemes)
+        write_staging_table(con, "stg_nav", df_stg_nav)
 
-        # 1. Update existing schemes with latest metadata
-        con.execute("""
+        # 1. Update existing schemes with latest metadata. Correlated subqueries, not
+        # UPDATE...FROM (portability across SQLite builds -- see db/queries.py's init_db()
+        # for the same pattern/rationale).
+        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
+        con.execute(f"""
             UPDATE schemes
-            SET scheme_name = s.scheme_name,
-                fund_house = CASE WHEN s.fund_house IS NOT NULL AND s.fund_house != '' THEN s.fund_house ELSE schemes.fund_house END,
-                category = CASE WHEN s.category IS NOT NULL AND s.category != '' THEN s.category ELSE schemes.category END,
-                plan_type = s.plan_type,
-                option_type = s.option_type,
-                isin = COALESCE(s.isin, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE s.expense_ratio END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE s.ter_status END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE s.ter_source END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE s.ter_source_url END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE s.ter_as_of_date END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE s.exit_load_pct END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE s.exit_load_days END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE s.exit_load_description END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE s.exit_rule_json END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE s.exit_rule_status END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE s.exit_rule_source END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE s.exit_rule_source_url END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE s.exit_rule_as_of_date END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE s.lock_in_years END
-            FROM stg_schemes s
-            WHERE schemes.scheme_code = s.scheme_code;
+            SET scheme_name = {_sub('scheme_name')},
+                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
+                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
+                plan_type = {_sub('plan_type')},
+                option_type = {_sub('option_type')},
+                isin = COALESCE({_sub('isin')}, schemes.isin),
+                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
+                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
+                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
+                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
+                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
+                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
+                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
+                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
+                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
+                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
+                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
+                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
+                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
+                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
+            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
         """)
 
         # 2. Insert brand new schemes
@@ -183,9 +186,11 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
         # 3. Replace matching nav_history records (to avoid duplicate keys)
         con.execute("""
             DELETE FROM nav_history
-            USING stg_nav
-            WHERE nav_history.scheme_code = stg_nav.scheme_code
-              AND nav_history.nav_date = stg_nav.nav_date;
+            WHERE EXISTS (
+                SELECT 1 FROM stg_nav
+                WHERE nav_history.scheme_code = stg_nav.scheme_code
+                  AND nav_history.nav_date = stg_nav.nav_date
+            );
         """)
 
         # 4. Insert latest daily NAV records
@@ -195,14 +200,8 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
             FROM stg_nav;
         """)
 
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_schemes")
+        con.execute("DROP TABLE IF EXISTS stg_nav")
         con.close()
 
         # Refresh materialized summary table
@@ -211,15 +210,7 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
         logger.info(msg)
         return True, msg
     except Exception as e:
-        logger.error(f"Error updating DuckDB: {e}")
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
+        logger.error(f"Error updating database: {e}")
         con.close()
         return False, str(e)
 
@@ -475,33 +466,33 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
 
     con = db.get_connection()
     try:
-        con.register("stg_schemes", df_stg_schemes)
-        con.register("stg_nav", df_stg_nav)
+        write_staging_table(con, "stg_schemes", df_stg_schemes)
+        write_staging_table(con, "stg_nav", df_stg_nav)
 
-        con.execute("""
+        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
+        con.execute(f"""
             UPDATE schemes
-            SET scheme_name = s.scheme_name,
-                fund_house = CASE WHEN s.fund_house IS NOT NULL AND s.fund_house != '' THEN s.fund_house ELSE schemes.fund_house END,
-                category = CASE WHEN s.category IS NOT NULL AND s.category != '' THEN s.category ELSE schemes.category END,
-                plan_type = s.plan_type,
-                option_type = s.option_type,
-                isin = COALESCE(s.isin, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE s.expense_ratio END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE s.ter_status END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE s.ter_source END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE s.ter_source_url END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE s.ter_as_of_date END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE s.exit_load_pct END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE s.exit_load_days END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE s.exit_load_description END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE s.exit_rule_json END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE s.exit_rule_status END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE s.exit_rule_source END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE s.exit_rule_source_url END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE s.exit_rule_as_of_date END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE s.lock_in_years END
-            FROM stg_schemes s
-            WHERE schemes.scheme_code = s.scheme_code;
+            SET scheme_name = {_sub('scheme_name')},
+                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
+                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
+                plan_type = {_sub('plan_type')},
+                option_type = {_sub('option_type')},
+                isin = COALESCE({_sub('isin')}, schemes.isin),
+                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
+                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
+                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
+                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
+                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
+                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
+                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
+                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
+                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
+                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
+                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
+                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
+                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
+                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
+            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
         """)
 
         con.execute("""
@@ -513,9 +504,11 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
 
         con.execute("""
             DELETE FROM nav_history
-            USING stg_nav
-            WHERE nav_history.scheme_code = stg_nav.scheme_code
-              AND nav_history.nav_date = stg_nav.nav_date;
+            WHERE EXISTS (
+                SELECT 1 FROM stg_nav
+                WHERE nav_history.scheme_code = stg_nav.scheme_code
+                  AND nav_history.nav_date = stg_nav.nav_date
+            );
         """)
 
         con.execute("""
@@ -524,26 +517,12 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
             FROM stg_nav;
         """)
 
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_schemes")
+        con.execute("DROP TABLE IF EXISTS stg_nav")
         con.close()
         return len(df_stg_schemes), len(df_stg_nav)
     except Exception as e:
-        logger.error(f"Error updating DuckDB for AMC {amc_name}: {e}")
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
+        logger.error(f"Error updating database for AMC {amc_name}: {e}")
         con.close()
         return 0, 0
 
@@ -789,33 +768,33 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
 
     con = db.get_connection()
     try:
-        con.register("stg_schemes", df_stg_schemes)
-        con.register("stg_nav", df_stg_nav)
+        write_staging_table(con, "stg_schemes", df_stg_schemes)
+        write_staging_table(con, "stg_nav", df_stg_nav)
 
-        con.execute("""
+        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
+        con.execute(f"""
             UPDATE schemes
-            SET scheme_name = s.scheme_name,
-                fund_house = CASE WHEN s.fund_house IS NOT NULL AND s.fund_house != '' THEN s.fund_house ELSE schemes.fund_house END,
-                category = CASE WHEN s.category IS NOT NULL AND s.category != '' THEN s.category ELSE schemes.category END,
-                plan_type = s.plan_type,
-                option_type = s.option_type,
-                isin = COALESCE(s.isin, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE s.expense_ratio END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE s.ter_status END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE s.ter_source END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE s.ter_source_url END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE s.ter_as_of_date END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE s.exit_load_pct END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE s.exit_load_days END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE s.exit_load_description END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE s.exit_rule_json END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE s.exit_rule_status END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE s.exit_rule_source END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE s.exit_rule_source_url END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE s.exit_rule_as_of_date END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE s.lock_in_years END
-            FROM stg_schemes s
-            WHERE schemes.scheme_code = s.scheme_code;
+            SET scheme_name = {_sub('scheme_name')},
+                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
+                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
+                plan_type = {_sub('plan_type')},
+                option_type = {_sub('option_type')},
+                isin = COALESCE({_sub('isin')}, schemes.isin),
+                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
+                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
+                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
+                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
+                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
+                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
+                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
+                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
+                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
+                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
+                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
+                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
+                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
+                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
+            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
         """)
 
         con.execute("""
@@ -827,9 +806,11 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
 
         con.execute("""
             DELETE FROM nav_history
-            USING stg_nav
-            WHERE nav_history.scheme_code = stg_nav.scheme_code
-              AND nav_history.nav_date = stg_nav.nav_date;
+            WHERE EXISTS (
+                SELECT 1 FROM stg_nav
+                WHERE nav_history.scheme_code = stg_nav.scheme_code
+                  AND nav_history.nav_date = stg_nav.nav_date
+            );
         """)
 
         con.execute("""
@@ -838,26 +819,12 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
             FROM stg_nav;
         """)
 
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_schemes")
+        con.execute("DROP TABLE IF EXISTS stg_nav")
         con.close()
         return len(df_stg_schemes), len(df_stg_nav)
     except Exception as e:
         logger.error(f"Error merging chunk {from_date} to {to_date}: {e}")
-        try:
-            con.unregister("stg_schemes")
-        except Exception:
-            pass
-        try:
-            con.unregister("stg_nav")
-        except Exception:
-            pass
         con.close()
         return 0, 0
 

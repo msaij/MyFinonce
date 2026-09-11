@@ -74,11 +74,21 @@ interface DateRangeState {
   end: string;
   dbMinDate: string | null;
   dbMaxDate: string | null;
+  /** True when dbMinDate/dbMaxDate came from DateRangePicker's empty-database
+   * fallback (today's date standing in for a real bound), not a real sync.
+   * See syncBounds() below for why this needs tracking explicitly. */
+  isPlaceholder: boolean;
   setPreset: (preset: Preset) => void;
   setCustomRange: (start: string, end: string) => void;
   /** Call whenever /api/meta/status is polled -- applies the live-edge-slide
-   * rule if new data has landed and the window was tracking the live edge. */
-  syncBounds: (dbMin: string, dbMax: string) => void;
+   * rule if new data has landed and the window was tracking the live edge.
+   * `isPlaceholder` (default false) marks a call seeded from the empty-
+   * database fallback rather than a real sync -- see the fallback's own
+   * comment in DateRangePicker.tsx for why plain value-equality isn't
+   * enough to detect "placeholder -> real" on its own (today's date is a
+   * perfectly plausible real max_date too, especially right after a fresh
+   * sync -- so a coincidental match must NOT be treated as "no change"). */
+  syncBounds: (dbMin: string, dbMax: string, isPlaceholder?: boolean) => void;
 }
 
 const DEFAULT_PRESET: Preset = "Past 90 Days (3M)";
@@ -91,6 +101,7 @@ export const useDateRangeStore = create<DateRangeState>()(
       end: "",
       dbMinDate: null,
       dbMaxDate: null,
+      isPlaceholder: false,
 
       setPreset: (preset) => {
         const { dbMinDate, dbMaxDate } = get();
@@ -106,20 +117,25 @@ export const useDateRangeStore = create<DateRangeState>()(
       },
 
       setCustomRange: (start, end) => {
-        set({ preset: "Custom Range", start, end });
+        set({ preset: "Custom Range", start, end, isPlaceholder: false });
       },
 
-      syncBounds: (dbMin, dbMax) => {
+      syncBounds: (dbMin, dbMax, isPlaceholder = false) => {
         const state = get();
         const prevDbMax = state.dbMaxDate;
-        const boundsMissing = !state.dbMinDate || !state.dbMaxDate;
+        // Missing bounds OR transitioning from a placeholder to a real sync both need the
+        // same "seed fresh from the current preset" treatment -- a placeholder's dbMax
+        // (today's date) can coincidentally equal a genuinely real max_date (very likely
+        // right after a fresh sync), so plain value-equality can't tell "nothing changed"
+        // from "the placeholder happened to match." The explicit flag can.
+        const needsFreshSeed = !state.dbMinDate || !state.dbMaxDate || (state.isPlaceholder && !isPlaceholder);
 
-        if (boundsMissing) {
-          // First load: seed the window from the current preset against real bounds.
+        if (needsFreshSeed) {
           const recomputed = computeRangeForPreset(state.preset, dbMin, dbMax);
           set({
             dbMinDate: dbMin,
             dbMaxDate: dbMax,
+            isPlaceholder,
             ...(recomputed ? { start: recomputed.start, end: recomputed.end } : { start: dbMin, end: dbMax }),
           });
           return;
@@ -133,10 +149,11 @@ export const useDateRangeStore = create<DateRangeState>()(
           set({
             dbMinDate: dbMin,
             dbMaxDate: dbMax,
+            isPlaceholder,
             ...(recomputed ? { start: recomputed.start, end: recomputed.end } : {}),
           });
         } else {
-          set({ dbMinDate: dbMin, dbMaxDate: dbMax });
+          set({ dbMinDate: dbMin, dbMaxDate: dbMax, isPlaceholder });
         }
       },
     }),

@@ -17,6 +17,7 @@ describe("useDateRangeStore live-edge-slide", () => {
       end: "",
       dbMinDate: null,
       dbMaxDate: null,
+      isPlaceholder: false,
     });
   });
 
@@ -60,5 +61,34 @@ describe("useDateRangeStore live-edge-slide", () => {
 
     useDateRangeStore.getState().syncBounds("2020-01-01", "2026-09-11");
     expect(useDateRangeStore.getState().end).toBe("2026-08-01"); // unchanged -- wasn't tracking live edge
+  });
+
+  it("forces a fresh reseed when transitioning from the empty-database placeholder to a real sync, even if the real max_date coincidentally equals the placeholder", () => {
+    // Regression test: found live when a real first sync happened to land on the exact
+    // same date DateRangePicker's empty-DB fallback had already seeded (today's date is
+    // a very plausible real max_date right after a fresh sync) -- plain dbMax
+    // value-equality alone couldn't tell "nothing changed" from "the placeholder just
+    // happened to match", so the window stayed stuck at a degenerate 0-day range
+    // (start === end === today) instead of expanding to a real 90-day preset window.
+    const today = "2026-09-11";
+    useDateRangeStore.getState().syncBounds(today, today, true); // DateRangePicker's placeholder fallback
+    const placeholderState = useDateRangeStore.getState();
+    expect(placeholderState.start).toBe(today);
+    expect(placeholderState.end).toBe(today); // degenerate 0-day window, as expected for a placeholder
+
+    // A real sync lands, with max_date coincidentally equal to the placeholder.
+    useDateRangeStore.getState().syncBounds("2008-10-02", today, false);
+    const after = useDateRangeStore.getState();
+    expect(after.end).toBe(today);
+    expect(after.start).toBe("2026-06-13"); // properly recomputed: 90 real days back from today
+    expect(after.isPlaceholder).toBe(false);
+  });
+
+  it("does NOT force a reseed on every call once real data is flowing (isPlaceholder stays false)", () => {
+    useDateRangeStore.getState().syncBounds("2008-10-02", "2026-09-10", false);
+    useDateRangeStore.setState({ end: "2026-08-01" }); // simulate "not tracking the live edge" again
+
+    useDateRangeStore.getState().syncBounds("2008-10-02", "2026-09-11", false);
+    expect(useDateRangeStore.getState().end).toBe("2026-08-01"); // still respects the normal slide rule
   });
 });
