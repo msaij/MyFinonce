@@ -1,0 +1,22 @@
+services:
+  dashboard:
+    build:
+      context: ./fetcher
+      dockerfile: Dockerfile
+    container_name: mf_dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - DUCKDB_PATH=/app/data/mutual_funds.duckdb
+      - TZ=Asia/Kolkata
+      - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
+      - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
+      - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
+    volumes:
+      - ./fetcher:/app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
