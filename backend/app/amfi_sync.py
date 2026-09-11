@@ -1,17 +1,16 @@
 import datetime
 import logging
-import os
-import sys
 import threading
 import time
 from typing import Tuple, Optional, List, Dict, Any
 
-import duckdb
 import pandas as pd
-from amfi_client import AmfiClient, AMFI_AMC_CATALOG
-from amfi_ter_client import AmfiTerClient, TER_PORTAL_PAGE_URL
-import db
-import costs_data
+
+from app.amfi_client import AmfiClient
+from app.amfi_ter_client import AmfiTerClient, TER_PORTAL_PAGE_URL
+from app.core.config import settings
+from app.db import queries as db
+from app import costs_data
 
 logger = logging.getLogger("amfi_sync")
 logger.setLevel(logging.INFO)
@@ -107,23 +106,23 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
     """
     client = AmfiClient()
     logger.info("Fetching daily NAV file from AMFI portal...")
-    
+
     raw_text = client.download_daily_report()
     if not raw_text or len(raw_text) < 100:
         return False, "Failed to download daily NAV file from AMFI."
-        
+
     schemes_dict = {}
     nav_rows = []
-    
+
     for scheme_meta, nav_record in client.parse_amfi_nav_lines(raw_text):
         code = scheme_meta["scheme_code"]
         if code not in schemes_dict:
             schemes_dict[code] = scheme_meta
         nav_rows.append((nav_record["scheme_code"], nav_record["nav_date"], nav_record["nav"]))
-        
+
     if not nav_rows:
         return False, "No valid NAV rows parsed from AMFI daily feed."
-        
+
     df_stg_schemes = pd.DataFrame([
         {
             "scheme_code": s["scheme_code"],
@@ -137,15 +136,15 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
         }
         for s in schemes_dict.values()
     ])
-    
+
     df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
     df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
-    
+
     con = db.get_connection()
     try:
         con.register("stg_schemes", df_stg_schemes)
         con.register("stg_nav", df_stg_nav)
-        
+
         # 1. Update existing schemes with latest metadata
         con.execute("""
             UPDATE schemes
@@ -172,7 +171,7 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
             FROM stg_schemes s
             WHERE schemes.scheme_code = s.scheme_code;
         """)
-        
+
         # 2. Insert brand new schemes
         con.execute("""
             INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
@@ -180,7 +179,7 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
             FROM stg_schemes s
             WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
         """)
-        
+
         # 3. Replace matching nav_history records (to avoid duplicate keys)
         con.execute("""
             DELETE FROM nav_history
@@ -188,14 +187,14 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
             WHERE nav_history.scheme_code = stg_nav.scheme_code
               AND nav_history.nav_date = stg_nav.nav_date;
         """)
-        
+
         # 4. Insert latest daily NAV records
         con.execute("""
             INSERT INTO nav_history (scheme_code, nav_date, nav)
             SELECT scheme_code, nav_date, nav
             FROM stg_nav;
         """)
-        
+
         try:
             con.unregister("stg_schemes")
         except Exception:
@@ -205,7 +204,7 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
         except Exception:
             pass
         con.close()
-        
+
         # Refresh materialized summary table
         db.refresh_summary_table()
         msg = f"Successfully synced {len(df_stg_nav):,} NAV records across {len(df_stg_schemes):,} schemes!"
@@ -377,16 +376,11 @@ def get_ter_backfill_status() -> dict:
 
 def stop_ter_backfill():
     """Signals a running TER backfill to halt after its in-flight month finishes — mirrors
-    stop_historical_backfill() below. A month already in progress (sync_official_ter can take
-    minutes for a high-volume month) is never aborted mid-fetch, only the *next* one is skipped.
-
-    Deliberately unconditional (no `is_running` guard): Streamlit's local-module hot-reload can
-    rebind this module's globals to fresh objects while a backfill thread started before the
-    reload is still executing against the *old* object it closed over at loop-start, which makes
-    a freshly-reloaded `TER_BACKFILL_STATE["is_running"]` read back False even while a real
-    backfill is active. Gating on that flag here would make this a silent no-op exactly when it's
-    needed. Setting should_stop=True on an actually-idle dict is harmless — the next backfill
-    start resets it to False anyway."""
+    stop_historical_backfill() below. Deliberately unconditional (no is_running guard) — see
+    fetcher/amfi_sync.py's identical function for the full rationale (a module-reload-adjacent
+    class of staleness doesn't apply here the same way FastAPI doesn't hot-reload per-request,
+    but the unconditional/harmless-when-idle behavior is kept identical on both sides so the two
+    codebases don't silently diverge in behavior during the migration)."""
     with _TER_BACKFILL_LOCK:
         TER_BACKFILL_STATE["should_stop"] = True
 
@@ -445,23 +439,23 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
     client = AmfiClient()
     today = datetime.date.today()
     from_date = today - datetime.timedelta(days=days)
-    
+
     raw_text = client.download_amc_90d_report(mf_id, from_date, today)
     if not raw_text or len(raw_text) < 100:
         return 0, 0
-        
+
     schemes_dict = {}
     nav_rows = []
-    
+
     for scheme_meta, nav_record in client.parse_amfi_nav_lines(raw_text, default_amc=amc_name):
         code = scheme_meta["scheme_code"]
         if code not in schemes_dict:
             schemes_dict[code] = scheme_meta
         nav_rows.append((nav_record["scheme_code"], nav_record["nav_date"], nav_record["nav"]))
-        
+
     if not nav_rows:
         return 0, 0
-        
+
     df_stg_schemes = pd.DataFrame([
         {
             "scheme_code": s["scheme_code"],
@@ -475,15 +469,15 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
         }
         for s in schemes_dict.values()
     ])
-    
+
     df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
     df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
-    
+
     con = db.get_connection()
     try:
         con.register("stg_schemes", df_stg_schemes)
         con.register("stg_nav", df_stg_nav)
-        
+
         con.execute("""
             UPDATE schemes
             SET scheme_name = s.scheme_name,
@@ -509,27 +503,27 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
             FROM stg_schemes s
             WHERE schemes.scheme_code = s.scheme_code;
         """)
-        
+
         con.execute("""
             INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
             SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type, s.isin, s.expense_ratio, s.ter_status, s.ter_source, s.ter_source_url, s.ter_as_of_date, s.exit_load_pct, s.exit_load_days, s.exit_load_description, s.exit_rule_json, s.exit_rule_status, s.exit_rule_source, s.exit_rule_source_url, s.exit_rule_as_of_date, s.lock_in_years
             FROM stg_schemes s
             WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
         """)
-        
+
         con.execute("""
             DELETE FROM nav_history
             USING stg_nav
             WHERE nav_history.scheme_code = stg_nav.scheme_code
               AND nav_history.nav_date = stg_nav.nav_date;
         """)
-        
+
         con.execute("""
             INSERT INTO nav_history (scheme_code, nav_date, nav)
             SELECT scheme_code, nav_date, nav
             FROM stg_nav;
         """)
-        
+
         try:
             con.unregister("stg_schemes")
         except Exception:
@@ -562,7 +556,7 @@ def get_latest_expected_trading_date() -> datetime.date:
     now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
     today = now_ist.date()
     weekday = today.weekday()  # 0=Monday, ..., 4=Friday, 5=Saturday, 6=Sunday
-    
+
     # Before 23:00 IST: today's market NAVs are not yet published; latest available is previous trading day
     if now_ist.hour < 23:
         if weekday == 0:  # Monday morning/afternoon -> Friday
@@ -617,9 +611,9 @@ def check_and_catchup_sync() -> bool:
     stale, current_max, expected = is_database_stale()
     if not stale:
         return False
-        
+
     logger.info(f"Database staleness detected! Local data is at {current_max}, expected {expected}. Initiating automatic catch-up...")
-    
+
     # If gap is more than 1 day (e.g. missed 3 days, a week, etc.), backfill the intermediate days
     if current_max and (expected - current_max).days > 1:
         gap_days = (expected - current_max).days
@@ -633,7 +627,7 @@ def check_and_catchup_sync() -> bool:
                 cur_start = cur_end + datetime.timedelta(days=1)
         except Exception as e:
             logger.error(f"Error during multi-day gap auto-backfill: {e}")
-            
+
     # Always fetch latest daily closing master feed and refresh summary table
     success, msg = sync_daily_nav(_trigger="catchup")
     logger.info(f"Daily sync completed: success={success}, msg={msg}")
@@ -646,9 +640,9 @@ def run_scheduled_sync_daemon():
     and runs hourly heartbeats so no missed syncs ever leave the database behind.
     """
     import schedule
-    
+
     logger.info("Starting AMFI daily sync daemon in background thread...")
-    
+
     # 1. Startup catch-up: If the app was opened past 12 AM (e.g. computer was turned off overnight),
     # catch up immediately in background!
     try:
@@ -675,7 +669,7 @@ def run_scheduled_sync_daemon():
 
     # 3. Hourly heartbeat catch-up: Checks every hour if data has fallen behind
     schedule.every(1).hours.do(check_and_catchup_sync)
-    
+
     while True:
         try:
             schedule.run_pending()
@@ -690,9 +684,23 @@ _SYNC_DAEMON_LOCK = threading.Lock()
 def ensure_sync_daemon_running():
     """
     Idempotent thread starter. Ensures the background sync daemon is active,
-    regardless of which page is accessed first (e.g. direct URL navigation or refresh).
+    regardless of which page/request accesses the app first.
+
+    GATED behind settings.enable_sync_daemon (default False) -- see
+    app/core/config.py and the migration plan's "DuckDB concurrency decision"
+    (../../.claude/plans/floofy-petting-mountain.md). Through most of the
+    migration, fetcher/'s still-running Streamlit app is the sole writer of
+    the shared DuckDB file; this backend only becomes a writer (and starts
+    this daemon) at the deliberate Data Management/cutover phase.
     """
     global _SYNC_DAEMON_THREAD
+    if not settings.enable_sync_daemon:
+        logger.info(
+            "Sync daemon NOT started: ENABLE_SYNC_DAEMON is false. This backend is a "
+            "read-only consumer of the shared DuckDB file during the migration -- "
+            "fetcher/ (Streamlit) remains the sole writer until the deliberate cutover phase."
+        )
+        return
     with _SYNC_DAEMON_LOCK:
         if _SYNC_DAEMON_THREAD is None or not _SYNC_DAEMON_THREAD.is_alive():
             _SYNC_DAEMON_THREAD = threading.Thread(
@@ -755,7 +763,7 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
     if not raw_text or len(raw_text) < 100:
         logger.warning(f"Empty or failed download for chunk {from_date} to {to_date}")
         return 0, 0
-        
+
     schemes_dict = {}
     nav_rows = []
     for scheme_meta, nav_record in client.parse_amfi_nav_lines(raw_text):
@@ -763,10 +771,10 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
         if code not in schemes_dict:
             schemes_dict[code] = scheme_meta
         nav_rows.append((nav_record["scheme_code"], nav_record["nav_date"], nav_record["nav"]))
-        
+
     if not nav_rows:
         return 0, 0
-        
+
     df_stg_schemes = pd.DataFrame([
         {
             "scheme_code": s["scheme_code"],
@@ -780,15 +788,15 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
         }
         for s in schemes_dict.values()
     ])
-    
+
     df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
     df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
-    
+
     con = db.get_connection()
     try:
         con.register("stg_schemes", df_stg_schemes)
         con.register("stg_nav", df_stg_nav)
-        
+
         con.execute("""
             UPDATE schemes
             SET scheme_name = s.scheme_name,
@@ -814,27 +822,27 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
             FROM stg_schemes s
             WHERE schemes.scheme_code = s.scheme_code;
         """)
-        
+
         con.execute("""
             INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
             SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type, s.isin, s.expense_ratio, s.ter_status, s.ter_source, s.ter_source_url, s.ter_as_of_date, s.exit_load_pct, s.exit_load_days, s.exit_load_description, s.exit_rule_json, s.exit_rule_status, s.exit_rule_source, s.exit_rule_source_url, s.exit_rule_as_of_date, s.lock_in_years
             FROM stg_schemes s
             WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
         """)
-        
+
         con.execute("""
             DELETE FROM nav_history
             USING stg_nav
             WHERE nav_history.scheme_code = stg_nav.scheme_code
               AND nav_history.nav_date = stg_nav.nav_date;
         """)
-        
+
         con.execute("""
             INSERT INTO nav_history (scheme_code, nav_date, nav)
             SELECT scheme_code, nav_date, nav
             FROM stg_nav;
         """)
-        
+
         try:
             con.unregister("stg_schemes")
         except Exception:
@@ -863,7 +871,7 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
     chunks = generate_backfill_chunks(start_year)
     if max_chunks:
         chunks = chunks[:max_chunks]
-        
+
     with _BACKFILL_LOCK:
         BACKFILL_STATE["is_running"] = True
         BACKFILL_STATE["should_stop"] = False
@@ -876,7 +884,7 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
         BACKFILL_STATE["finished_at"] = None
 
     logger.info(f"Starting historical backfill: {len(chunks)} chunks to process.")
-    
+
     for i, (frm, to_dt) in enumerate(chunks):
         with _BACKFILL_LOCK:
             if BACKFILL_STATE["should_stop"]:
@@ -884,7 +892,7 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
                 break
             BACKFILL_STATE["current_chunk_idx"] = i + 1
             BACKFILL_STATE["current_chunk_str"] = f"{frm.strftime('%d-%b-%Y')} to {to_dt.strftime('%d-%b-%Y')}"
-        
+
         try:
             sch_cnt, nav_cnt = backfill_single_chunk(frm, to_dt)
             with _BACKFILL_LOCK:
@@ -897,11 +905,11 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
             logger.error(f"Error processing chunk {frm} to {to_dt}: {e}")
             with _BACKFILL_LOCK:
                 BACKFILL_STATE["last_error"] = str(e)
-                
+
         time.sleep(1)
-        
+
     db.refresh_summary_table()
-    
+
     with _BACKFILL_LOCK:
         BACKFILL_STATE["is_running"] = False
         BACKFILL_STATE["finished_at"] = time.time()

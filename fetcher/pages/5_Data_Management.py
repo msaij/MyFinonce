@@ -228,6 +228,16 @@ with tab_sync:
         "back to **FY2018-19** — use this to pull in older months on demand, in the background."
     )
 
+    with st.expander("⏹️ Stop a running TER backfill", expanded=ter_b_status["is_running"]):
+        st.caption(
+            "Always available, even if the panel below says idle — a page-file edit can reset this display "
+            "without killing the actual background worker, so this button doesn't trust that flag either."
+        )
+        if st.button("⏹️ Stop TER Backfill"):
+            amfi_sync.stop_ter_backfill()
+            st.warning("Stop signal sent. If a backfill is active, it will finish the current month and halt.")
+            st.rerun()
+
     if ter_b_status["is_running"]:
         pct = int((ter_b_status["current_month_idx"] / max(1, ter_b_status["total_months"])) * 100) if ter_b_status["total_months"] else 0
         st.info(f"🔄 **TER Backfill In Progress**: Processing month {ter_b_status['current_month_idx']} of {ter_b_status['total_months']}: `{ter_b_status['current_month_str']}`")
