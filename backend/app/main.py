@@ -1,13 +1,14 @@
 """FastAPI backend entrypoint.
 
 Startup event mirrors fetcher/Overview.py's role as the Streamlit app's
-bootstrap point (db.init_db() + amfi_sync.ensure_sync_daemon_running()) --
-except ensure_sync_daemon_running() is itself gated behind
-settings.enable_sync_daemon (default False), so during the migration this
-just calls init_db()'s read side effects are harmless no-ops against an
-already-initialized DB, and the daemon genuinely does not start. See
-app/core/config.py and the migration plan's "DuckDB concurrency decision"
-(../../.claude/plans/floofy-petting-mountain.md).
+bootstrap point: db.init_db() (idempotent -- creates tables if missing) then
+amfi_sync.ensure_sync_daemon_running(). Both now run unconditionally at
+startup: this backend owns its own SQLite file exclusively (see
+app/db/connection.py's module docstring for why DuckDB's shared-file model
+was dropped), so there is no second process left to contend with the way
+Streamlit's DuckDB file once was -- ENABLE_SYNC_DAEMON stays available as an
+explicit off-switch (e.g. a read-only exploration session) but no longer
+needs to default to False for safety.
 """
 
 from fastapi import FastAPI
@@ -36,9 +37,8 @@ def on_startup() -> None:
     from app import amfi_sync
     from app.db import queries as db
 
-    if settings.enable_sync_daemon:
-        db.init_db()
-    amfi_sync.ensure_sync_daemon_running()
+    db.init_db()
+    amfi_sync.ensure_sync_daemon_running()  # itself gated on settings.enable_sync_daemon
 
 
 @app.get("/api/health")

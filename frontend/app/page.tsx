@@ -1,30 +1,39 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
-// Phase 0 scaffold placeholder -- proves the frontend container can reach
-// the backend container through the /api/* rewrite in next.config.js.
-// Replaced by the real Overview page in Phase 3 of the migration plan.
-export default function ScaffoldHome() {
-  const [health, setHealth] = useState<string>("checking...");
+import { AppShell } from "@/components/layout/AppShell";
+import { StatCard } from "@/components/shared/StatCard";
+import { getMetaStatus } from "@/lib/api/meta";
 
-  useEffect(() => {
-    fetch("/api/health")
-      .then((r) => r.json())
-      .then((data) => setHealth(JSON.stringify(data)))
-      .catch((err) => setHealth(`error: ${String(err)}`));
-  }, []);
+// Phase 2 scaffold: proves AppShell + Sidebar + DateRangePicker + StatCard +
+// react-query all work together end-to-end. The real Overview page (KPIs,
+// asset-class chart, macro trend, AMC panel, category matrix) is Phase 3.
+export default function Home() {
+  const { data: status, isLoading } = useQuery({
+    queryKey: ["meta-status"],
+    queryFn: getMetaStatus,
+    refetchInterval: 60_000,
+  });
 
   return (
-    <main className="p-8">
-      <h1 className="text-2xl font-semibold text-accent">
-        Indian Mutual Funds -- webstack scaffold
-      </h1>
-      <p className="mt-2 text-muted">
-        Phase 0: this page and the FastAPI backend are both up. Nothing else
-        is built yet -- see the migration plan for what comes next.
+    <AppShell>
+      <h1 className="mf-page-title">Indian Mutual Funds</h1>
+      <p className="mf-page-caption">
+        Phase 2: shared component library + global date-range store are wired up. The real Overview page lands in Phase 3.
       </p>
-      <p className="mt-4 font-mono text-sm">Backend /api/health -&gt; {health}</p>
-    </main>
+      <div className="grid grid-cols-4 gap-4">
+        <StatCard title="Tracked Schemes" value={isLoading ? "..." : (status?.schemes_count ?? 0).toLocaleString()} />
+        <StatCard title="Fund Houses" value={isLoading ? "..." : (status?.amc_count ?? 0).toLocaleString()} />
+        <StatCard
+          title="Latest NAV"
+          value={isLoading ? "..." : status?.max_date ?? "-"}
+          tone={status?.is_stale ? "warn" : "pos"}
+          sub={status?.is_stale ? "Sync pending" : "Live"}
+          subTone={status?.is_stale ? "neg" : "pos"}
+        />
+        <StatCard title="DB Size" value={isLoading ? "..." : `${status?.file_size_mb ?? 0} MB`} />
+      </div>
+    </AppShell>
   );
 }

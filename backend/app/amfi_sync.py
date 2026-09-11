@@ -686,20 +686,15 @@ def ensure_sync_daemon_running():
     Idempotent thread starter. Ensures the background sync daemon is active,
     regardless of which page/request accesses the app first.
 
-    GATED behind settings.enable_sync_daemon (default False) -- see
-    app/core/config.py and the migration plan's "DuckDB concurrency decision"
-    (../../.claude/plans/floofy-petting-mountain.md). Through most of the
-    migration, fetcher/'s still-running Streamlit app is the sole writer of
-    the shared DuckDB file; this backend only becomes a writer (and starts
-    this daemon) at the deliberate Data Management/cutover phase.
+    GATED behind settings.enable_sync_daemon (default True) -- see
+    app/core/config.py. This backend owns its SQLite file exclusively (no
+    other process ever touches it -- see app/db/connection.py's module
+    docstring), so the flag is no longer a cross-process safety guard; it's
+    just an explicit off-switch for e.g. a read-only exploration session.
     """
     global _SYNC_DAEMON_THREAD
     if not settings.enable_sync_daemon:
-        logger.info(
-            "Sync daemon NOT started: ENABLE_SYNC_DAEMON is false. This backend is a "
-            "read-only consumer of the shared DuckDB file during the migration -- "
-            "fetcher/ (Streamlit) remains the sole writer until the deliberate cutover phase."
-        )
+        logger.info("Sync daemon NOT started: ENABLE_SYNC_DAEMON is false.")
         return
     with _SYNC_DAEMON_LOCK:
         if _SYNC_DAEMON_THREAD is None or not _SYNC_DAEMON_THREAD.is_alive():

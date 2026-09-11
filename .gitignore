@@ -2,6 +2,11 @@
 fetcher/data/*.duckdb
 fetcher/data/*.duckdb.wal
 fetcher/data/user_filters.json
+backend/data/*.sqlite3
+backend/data/*.sqlite3-wal
+backend/data/*.sqlite3-shm
+# amfi_ter_data.csv is bundled reference data, not runtime-generated -- keep it tracked
+!backend/data/amfi_ter_data.csv
 
 # Python
 __pycache__/

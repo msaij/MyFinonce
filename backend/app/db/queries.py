@@ -1,17 +1,37 @@
-"""DuckDB query functions for the FastAPI backend.
+"""SQLite query functions for the FastAPI backend.
 
-Ported ~verbatim from fetcher/db.py (the Streamlit app's DB-access module) --
-same SQL query strings, same logic, same public-wrapper-takes-WRITE_LOCK /
-private-_impl-does-the-work structure. Connection/lock/retry/data-version
-machinery (get_connection, WRITE_LOCK, _execute_with_conflict_retry,
-bump_data_version, get_data_version, DB_PATH) lives in app.db.connection
-instead of here -- see that module. Every Streamlit cache_data decorator
-(600s TTL, no spinner) became ``@cached(ttl=600)`` from app.core.cache.
+Originally ported ~verbatim from fetcher/db.py (the Streamlit app's DuckDB-
+based DB-access module); rewritten from DuckDB's SQL dialect to SQLite's
+after DuckDB's cross-process file locking caused repeated failures during
+the migration itself (see app.db.connection's module docstring). Same
+overall logic, same public-wrapper-takes-WRITE_LOCK / private-_impl-does-
+the-work structure -- only the SQL strings and a few dialect-driven
+mechanics (below) changed. Connection/lock/retry/data-version machinery
+(get_connection, WRITE_LOCK, _execute_with_conflict_retry, bump_data_version,
+get_data_version, DB_PATH) lives in app.db.connection instead of here -- see
+that module. Every Streamlit cache_data decorator (600s TTL, no spinner)
+became ``@cached(ttl=600)`` from app.core.cache.
+
+Dialect notes (SQLite has no equivalent of these DuckDB features):
+- ``.fetchdf()`` -> ``_fetchdf(cursor)`` below (builds a DataFrame from
+  plain fetchall() + cursor.description).
+- ``con.register(name, df)`` (DuckDB: query a DataFrame directly as a table)
+  -> ``_write_staging_table(con, name, df)`` below (writes a real, connection-
+  scoped TEMP TABLE, since SQLite has no virtual-DataFrame registration).
+- ``MEDIAN(x)`` / ``STDDEV(x)`` -> custom aggregates registered in
+  app.db.connection._connect(), so the SQL itself is unchanged at call sites.
+- ``x - INTERVAL 'N days'`` -> ``date(x, '-N days')``; ``DATE_DIFF('day', a, b)``
+  -> ``(julianday(b) - julianday(a))``.
+- ``CREATE OR REPLACE TABLE x AS ...`` -> ``DROP TABLE IF EXISTS x`` then
+  ``CREATE TABLE x AS ...`` (two statements).
+- ``DELETE ... USING`` -> ``DELETE ... WHERE EXISTS (...)``.
+- ``ARG_MAX``/``ARG_MIN`` -> rewritten as a plain ``ORDER BY ... LIMIT 1``.
 """
 
 import datetime
 import os
 import re
+import sqlite3
 from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
@@ -27,6 +47,52 @@ from app.db.connection import (
     DB_PATH,
 )
 from app.core.cache import cached
+
+
+def _fetchdf(cursor: sqlite3.Cursor) -> pd.DataFrame:
+    """DuckDB's cursor.fetchdf() equivalent for the stdlib sqlite3 API."""
+    cols = [d[0] for d in cursor.description] if cursor.description else []
+    return pd.DataFrame(cursor.fetchall(), columns=cols)
+
+
+def _pyval(v: Any) -> Any:
+    """Normalizes a pandas/numpy scalar to a type sqlite3's parameter binder
+    accepts natively (it only knows None/int/float/str/bytes) -- mirrors
+    core/serialize.py's sanitize_floats(), but at the DB-write boundary
+    instead of the JSON-response boundary."""
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        f = float(v)
+        return None if f != f else f  # NaN != NaN
+    if isinstance(v, pd.Timestamp):
+        return v.date().isoformat()
+    if isinstance(v, datetime.datetime):
+        return v.isoformat(sep=" ")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    if isinstance(v, np.bool_):
+        return bool(v)
+    return v
+
+
+def _write_staging_table(con: sqlite3.Cursor, table_name: str, df: pd.DataFrame) -> None:
+    """Writes a DataFrame to a connection-scoped TEMP TABLE for use in
+    UPDATE...FROM / INSERT...SELECT / DELETE...WHERE EXISTS patterns --
+    SQLite has no DuckDB-style register()-a-DataFrame-directly. Caller is
+    responsible for dropping it when done (mirrors the old unregister() step)."""
+    con.execute(f"DROP TABLE IF EXISTS {table_name}")
+    cols = list(df.columns)
+    col_defs = ", ".join(f'"{c}"' for c in cols)
+    con.execute(f"CREATE TEMP TABLE {table_name} ({col_defs})")
+    placeholders = ", ".join(["?"] * len(cols))
+    rows = [tuple(_pyval(v) for v in row) for row in df.itertuples(index=False, name=None)]
+    if rows:
+        con.executemany(f"INSERT INTO {table_name} VALUES ({placeholders})", rows)
 
 # A fund occasionally resets its face value by a clean factor (e.g. a Liquid/Overnight
 # fund rebasing from Rs 1000 to Rs 100 per unit, or an ETF splitting units to track its
@@ -60,15 +126,16 @@ def _normalize_nav_splits_impl() -> int:
     by a precisely measured factor; never invents a value. Idempotent: once adjusted, the
     boundary ratio settles near 1.0 and is never re-flagged on a later run."""
     con = get_connection()
-    df = con.execute("SELECT scheme_code, nav_date, nav FROM nav_history ORDER BY scheme_code, nav_date").fetchdf()
+    df = _fetchdf(con.execute("SELECT scheme_code, nav_date, nav FROM nav_history ORDER BY scheme_code, nav_date"))
     # A "segregated portfolio" (a side-pocket created when a debt scheme's underlying paper
     # defaults) settles with a final lump-sum recovery distribution that can coincidentally
     # land near a clean ratio — that's a one-time debt recovery, not a unit-price
     # redenomination, and back-adjusting it would fabricate a fake continuous history.
     # These are also already excluded from "current" returns by the is_active staleness
     # guard in summary_table; exclude them here too so raw nav_history charts stay honest.
+    # (SQLite's LIKE is ASCII case-insensitive by default, same effect as DuckDB's ILIKE here.)
     segregated_codes = set(
-        con.execute("SELECT scheme_code FROM schemes WHERE scheme_name ILIKE '%segregat%'").fetchdf()["scheme_code"]
+        _fetchdf(con.execute("SELECT scheme_code FROM schemes WHERE scheme_name LIKE '%segregat%'"))["scheme_code"]
     )
     con.close()
     if df.empty:
@@ -95,17 +162,17 @@ def _normalize_nav_splits_impl() -> int:
     con = get_connection()
     try:
         staging = changed[["scheme_code", "nav_date", "nav"]]
-        con.register("stg_nav_adjust", staging)
+        _write_staging_table(con, "stg_nav_adjust", staging)
         con.execute("""
             UPDATE nav_history
-            SET nav = s.nav
-            FROM stg_nav_adjust s
-            WHERE nav_history.scheme_code = s.scheme_code AND nav_history.nav_date = s.nav_date;
+            SET nav = (SELECT s.nav FROM stg_nav_adjust s
+                       WHERE s.scheme_code = nav_history.scheme_code AND s.nav_date = nav_history.nav_date)
+            WHERE EXISTS (
+                SELECT 1 FROM stg_nav_adjust s
+                WHERE s.scheme_code = nav_history.scheme_code AND s.nav_date = nav_history.nav_date
+            );
         """)
-        try:
-            con.unregister("stg_nav_adjust")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_nav_adjust")
     finally:
         con.close()
     print(f"NAV split normalization: adjusted {len(changed):,} historical NAV rows across {logger_msg_schemes} scheme(s).")
@@ -120,8 +187,66 @@ def refresh_summary_table():
 
 def _refresh_summary_table_impl():
     con = get_connection()
+    con.execute("DROP TABLE IF EXISTS summary_table")
+    # Explicit schema (not `CREATE TABLE ... AS SELECT`) is deliberate: SQLite's CTAS does
+    # NOT propagate the source columns' declared types (e.g. DATE) onto the new table, which
+    # would silently break the sqlite3.PARSE_DECLTYPES auto-conversion that turns
+    # latest_date/ter_as_of_date/etc. back into datetime.date objects on every later SELECT
+    # from summary_table. Declaring the schema up front, then INSERT INTO ... SELECT, keeps
+    # that conversion working the same way it does for the base tables in init_db().
+    con.execute("""
+        CREATE TABLE summary_table (
+            scheme_code BIGINT,
+            scheme_name VARCHAR,
+            fund_house VARCHAR,
+            category VARCHAR,
+            broad_category VARCHAR,
+            plan_type VARCHAR,
+            option_type VARCHAR,
+            isin VARCHAR,
+            expense_ratio DOUBLE,
+            ter_status VARCHAR,
+            ter_source VARCHAR,
+            ter_source_url VARCHAR,
+            ter_as_of_date DATE,
+            ter_base_expense_ratio DOUBLE,
+            ter_brokerage_cost_pct DOUBLE,
+            ter_transaction_cost_pct DOUBLE,
+            ter_statutory_levies_pct DOUBLE,
+            exit_load_pct DOUBLE,
+            exit_load_days INTEGER,
+            exit_load_description VARCHAR,
+            exit_rule_json VARCHAR,
+            exit_rule_status VARCHAR,
+            exit_rule_source VARCHAR,
+            exit_rule_source_url VARCHAR,
+            exit_rule_as_of_date DATE,
+            lock_in_years INTEGER,
+            latest_date DATE,
+            latest_nav DOUBLE,
+            is_active INTEGER,
+            change_1d_pct DOUBLE,
+            return_7d_pct DOUBLE,
+            return_30d_pct DOUBLE,
+            return_90d_pct DOUBLE,
+            return_1y_pct DOUBLE,
+            high_52w DOUBLE,
+            low_52w DOUBLE,
+            dist_from_52w_high_pct DOUBLE
+        )
+    """)
     _summary_sql = """
-        CREATE OR REPLACE TABLE summary_table AS
+        INSERT INTO summary_table (
+            scheme_code, scheme_name, fund_house, category, broad_category, plan_type,
+            option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url,
+            ter_as_of_date, ter_base_expense_ratio, ter_brokerage_cost_pct,
+            ter_transaction_cost_pct, ter_statutory_levies_pct, exit_load_pct,
+            exit_load_days, exit_load_description, exit_rule_json, exit_rule_status,
+            exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years,
+            latest_date, latest_nav, is_active, change_1d_pct, return_7d_pct,
+            return_30d_pct, return_90d_pct, return_1y_pct, high_52w, low_52w,
+            dist_from_52w_high_pct
+        )
         WITH ranked_nav AS (
             SELECT
                 scheme_code,
@@ -144,9 +269,9 @@ def _refresh_summary_table_impl():
             SELECT scheme_code, nav as nav_7d_ago
             FROM (
                 SELECT scheme_code, nav,
-                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(DATE_DIFF('day', nav_date, (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '7 days'))) as rn_7d
+                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(julianday(nav_date) - julianday(date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-7 days')))) as rn_7d
                 FROM nav_history ranked_nav
-                WHERE nav_date <= (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '5 days'
+                WHERE nav_date <= date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-5 days')
             ) t
             WHERE rn_7d = 1
         ),
@@ -154,9 +279,9 @@ def _refresh_summary_table_impl():
             SELECT scheme_code, nav as nav_30d_ago
             FROM (
                 SELECT scheme_code, nav,
-                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(DATE_DIFF('day', nav_date, (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '30 days'))) as rn_30d
+                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(julianday(nav_date) - julianday(date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-30 days')))) as rn_30d
                 FROM nav_history ranked_nav
-                WHERE nav_date <= (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '25 days'
+                WHERE nav_date <= date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-25 days')
             ) t
             WHERE rn_30d = 1
         ),
@@ -164,9 +289,9 @@ def _refresh_summary_table_impl():
             SELECT scheme_code, nav as nav_90d_ago
             FROM (
                 SELECT scheme_code, nav,
-                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(DATE_DIFF('day', nav_date, (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '90 days'))) as rn_90d
+                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(julianday(nav_date) - julianday(date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-90 days')))) as rn_90d
                 FROM nav_history ranked_nav
-                WHERE nav_date <= (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '75 days'
+                WHERE nav_date <= date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-75 days')
             ) t
             WHERE rn_90d = 1
         ),
@@ -174,9 +299,9 @@ def _refresh_summary_table_impl():
             SELECT scheme_code, nav as nav_1y_ago
             FROM (
                 SELECT scheme_code, nav,
-                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(DATE_DIFF('day', nav_date, (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '365 days'))) as rn_1y
+                       ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY ABS(julianday(nav_date) - julianday(date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-365 days')))) as rn_1y
                 FROM nav_history ranked_nav
-                WHERE nav_date <= (SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code) - INTERVAL '330 days'
+                WHERE nav_date <= date((SELECT latest_date FROM latest_nav l WHERE l.scheme_code = ranked_nav.scheme_code), '-330 days')
             ) t
             WHERE rn_1y = 1
         ),
@@ -233,16 +358,16 @@ def _refresh_summary_table_impl():
             s.lock_in_years,
             l.latest_date,
             l.latest_nav,
-            (l.latest_date >= f.global_max_date - INTERVAL '30 days') as is_active,
-            CASE WHEN l.latest_date >= f.global_max_date - INTERVAL '30 days'
+            (l.latest_date >= date(f.global_max_date, '-30 days')) as is_active,
+            CASE WHEN l.latest_date >= date(f.global_max_date, '-30 days')
                  THEN ROUND(((l.latest_nav - n1.nav_1d_ago) / NULLIF(n1.nav_1d_ago, 0) * 100.0), 4) END as change_1d_pct,
-            CASE WHEN l.latest_date >= f.global_max_date - INTERVAL '30 days'
+            CASE WHEN l.latest_date >= date(f.global_max_date, '-30 days')
                  THEN ROUND(((l.latest_nav - n7.nav_7d_ago) / NULLIF(n7.nav_7d_ago, 0) * 100.0), 4) END as return_7d_pct,
-            CASE WHEN l.latest_date >= f.global_max_date - INTERVAL '30 days'
+            CASE WHEN l.latest_date >= date(f.global_max_date, '-30 days')
                  THEN ROUND(((l.latest_nav - n30.nav_30d_ago) / NULLIF(n30.nav_30d_ago, 0) * 100.0), 4) END as return_30d_pct,
-            CASE WHEN l.latest_date >= f.global_max_date - INTERVAL '30 days'
+            CASE WHEN l.latest_date >= date(f.global_max_date, '-30 days')
                  THEN ROUND(((l.latest_nav - n90.nav_90d_ago) / NULLIF(n90.nav_90d_ago, 0) * 100.0), 4) END as return_90d_pct,
-            CASE WHEN l.latest_date >= f.global_max_date - INTERVAL '30 days'
+            CASE WHEN l.latest_date >= date(f.global_max_date, '-30 days')
                  THEN ROUND(((l.latest_nav - n1y.nav_1y_ago) / NULLIF(n1y.nav_1y_ago, 0) * 100.0), 4) END as return_1y_pct,
             st.high_52w,
             st.low_52w,
@@ -270,7 +395,11 @@ def _refresh_summary_table_impl():
 def init_db():
     """Initializes tables, views, columns, and cost profiles if they do not exist."""
     con = get_connection()
-    con.execute("""
+    # executescript(), not execute(): sqlite3's execute() only accepts a single statement
+    # (unlike DuckDB's, which ran a whole semicolon-separated block). executescript() also
+    # implicitly commits first, which is harmless here since this only ever runs at startup
+    # before any other write is in flight.
+    con.executescript("""
         CREATE TABLE IF NOT EXISTS schemes (
             scheme_code BIGINT PRIMARY KEY,
             scheme_name VARCHAR,
@@ -302,7 +431,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS nav_history (
             scheme_code BIGINT,
             nav_date DATE,
-            nav DECIMAL(14,4),
+            -- REAL, not DECIMAL(14,4): "DECIMAL" doesn't match any of SQLite's
+            -- type-affinity substrings (INT/CHAR/TEXT/REAL/FLOA/DOUB), so it falls
+            -- through to NUMERIC affinity -- which silently stores a whole-number
+            -- float (e.g. 100.0) as an INTEGER. That single-scheme-code-away bug
+            -- turned every (end_nav - start_nav) / start_nav return calculation
+            -- into integer division (truncating to 0 whenever the difference is
+            -- smaller than the divisor, which is nearly always). REAL affinity
+            -- never does this silent downcast.
+            nav REAL,
             PRIMARY KEY (scheme_code, nav_date)
         );
         -- Full dated history of official AMFI TER-portal disclosures (Regulation 66), one row
@@ -349,7 +486,9 @@ def init_db():
         ("exit_rule_as_of_date", "DATE")
     ]:
         try:
-            con.execute(f"ALTER TABLE schemes ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+            # SQLite's ADD COLUMN has no IF NOT EXISTS clause -- rely on the existing
+            # try/except to swallow the "duplicate column name" error on later runs instead.
+            con.execute(f"ALTER TABLE schemes ADD COLUMN {col_name} {col_type};")
         except Exception:
             pass
 
@@ -381,30 +520,29 @@ def init_db():
                         "lock_in_years": c_specs["lock_in_years"]
                     })
                 df_stg_costs = pd.DataFrame(cost_records)
-                con.register("stg_costs", df_stg_costs)
+                _write_staging_table(con, "stg_costs", df_stg_costs)
+                # Correlated subqueries, not UPDATE...FROM: portable across SQLite versions
+                # without depending on the 3.33+ UPDATE...FROM extension being present in
+                # whatever build the base image ships.
                 con.execute("""
                     UPDATE schemes
-                    SET expense_ratio = c.expense_ratio,
-                        ter_status = c.ter_status,
-                        ter_source = c.ter_source,
-                        ter_source_url = c.ter_source_url,
-                        ter_as_of_date = c.ter_as_of_date,
-                        exit_load_pct = c.exit_load_pct,
-                        exit_load_days = c.exit_load_days,
-                        exit_load_description = c.exit_load_description,
-                        exit_rule_json = c.exit_rule_json,
-                        exit_rule_status = c.exit_rule_status,
-                        exit_rule_source = c.exit_rule_source,
-                        exit_rule_source_url = c.exit_rule_source_url,
-                        exit_rule_as_of_date = c.exit_rule_as_of_date,
-                        lock_in_years = c.lock_in_years
-                    FROM stg_costs c
-                    WHERE schemes.scheme_code = c.scheme_code;
+                    SET expense_ratio = (SELECT c.expense_ratio FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        ter_status = (SELECT c.ter_status FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        ter_source = (SELECT c.ter_source FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        ter_source_url = (SELECT c.ter_source_url FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        ter_as_of_date = (SELECT c.ter_as_of_date FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_load_pct = (SELECT c.exit_load_pct FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_load_days = (SELECT c.exit_load_days FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_load_description = (SELECT c.exit_load_description FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_rule_json = (SELECT c.exit_rule_json FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_rule_status = (SELECT c.exit_rule_status FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_rule_source = (SELECT c.exit_rule_source FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_rule_source_url = (SELECT c.exit_rule_source_url FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        exit_rule_as_of_date = (SELECT c.exit_rule_as_of_date FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code),
+                        lock_in_years = (SELECT c.lock_in_years FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code)
+                    WHERE EXISTS (SELECT 1 FROM stg_costs c WHERE c.scheme_code = schemes.scheme_code);
                 """)
-                try:
-                    con.unregister("stg_costs")
-                except Exception:
-                    pass
+                con.execute("DROP TABLE IF EXISTS stg_costs")
                 con.execute("INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('cost_data_version', ?);", [costs_data.COST_DATA_VERSION])
                 con.close()
                 refresh_summary_table()
@@ -465,7 +603,7 @@ def get_market_overview_stats() -> Dict[str, Any]:
     date_row = con.execute("SELECT min(nav_date), max(nav_date) FROM nav_history;").fetchone()
 
     # Asset class distribution with multi-horizon returns
-    asset_dist = con.execute("""
+    asset_dist = _fetchdf(con.execute("""
         SELECT broad_category, count(*) as count,
                ROUND(AVG(change_1d_pct), 4) as avg_1d,
                ROUND(AVG(return_7d_pct), 4) as avg_7d,
@@ -477,10 +615,10 @@ def get_market_overview_stats() -> Dict[str, Any]:
         FROM summary_table
         GROUP BY broad_category
         ORDER BY count DESC;
-    """).fetchdf()
+    """))
 
     # Top 15 AMCs by scheme volume and average returns
-    top_amcs = con.execute("""
+    top_amcs = _fetchdf(con.execute("""
         SELECT
             s.fund_house,
             count(*) as schemes_count,
@@ -493,7 +631,7 @@ def get_market_overview_stats() -> Dict[str, Any]:
         GROUP BY s.fund_house
         ORDER BY schemes_count DESC
         LIMIT 15;
-    """).fetchdf()
+    """))
 
     # Best performing category (30D)
     best_cat = con.execute("""
@@ -525,7 +663,7 @@ def get_category_performance_matrix(broad_category: str = "All") -> pd.DataFrame
     if broad_category and broad_category != "All":
         where_sql = "AND broad_category = ?"
         params = [broad_category]
-    df = con.execute(f"""
+    df = _fetchdf(con.execute(f"""
         SELECT
             broad_category AS "Asset Class",
             category AS "Category",
@@ -544,7 +682,7 @@ def get_category_performance_matrix(broad_category: str = "All") -> pd.DataFrame
         WHERE category IS NOT NULL {where_sql}
         GROUP BY broad_category, category
         ORDER BY "Avg 30D %" DESC NULLS LAST;
-    """, params).fetchdf()
+    """, params))
     con.close()
     return df
 
@@ -589,7 +727,7 @@ def get_macro_asset_class_trend(start_date: datetime.date, end_date: datetime.da
     """
     params = [start_date, end_date] + plan_params
     try:
-        df = con.execute(sql, params).fetchdf()
+        df = _fetchdf(con.execute(sql, params))
     except Exception:
         df = pd.DataFrame(columns=["nav_date", "Asset Class", "Indexed Performance"])
     con.close()
@@ -640,7 +778,7 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                     WHERE nav_date >= ? AND nav_date <= ?
                 ) WHERE rn = 1
             ),
-            period_calc AS (
+            period_calc AS MATERIALIZED (
                 SELECT s.scheme_name, s.broad_category, s.category,
                        ROUND(((pe.end_nav - ps.start_nav) / NULLIF(ps.start_nav, 0) * 100.0), 4) as period_return_pct
                 FROM summary_table s
@@ -649,9 +787,9 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                 {where_sql}
             )
             SELECT
-                ARG_MAX(scheme_name, period_return_pct) as top_name,
+                (SELECT scheme_name FROM period_calc WHERE period_return_pct IS NOT NULL ORDER BY period_return_pct DESC LIMIT 1) as top_name,
                 MAX(period_return_pct) as top_return,
-                ARG_MIN(scheme_name, period_return_pct) as lag_name,
+                (SELECT scheme_name FROM period_calc WHERE period_return_pct IS NOT NULL ORDER BY period_return_pct ASC LIMIT 1) as lag_name,
                 MIN(period_return_pct) as lag_return,
                 COUNT(CASE WHEN period_return_pct > 0 THEN 1 END) as advancers,
                 COUNT(CASE WHEN period_return_pct < 0 THEN 1 END) as decliners,
@@ -712,18 +850,22 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
             best_cat = {"name": bcat_row[0], "return_pct": bcat_row[1]}
     else:
         sql_summary_kpi = f"""
+            WITH filtered AS MATERIALIZED (
+                SELECT s.scheme_name, s.return_30d_pct
+                FROM summary_table s
+                {where_sql} {'AND' if where_sql else 'WHERE'} s.return_30d_pct IS NOT NULL
+            )
             SELECT
-                ARG_MAX(scheme_name, return_30d_pct) as top_name,
+                (SELECT scheme_name FROM filtered ORDER BY return_30d_pct DESC LIMIT 1) as top_name,
                 MAX(return_30d_pct) as top_return,
-                ARG_MIN(scheme_name, return_30d_pct) as lag_name,
+                (SELECT scheme_name FROM filtered ORDER BY return_30d_pct ASC LIMIT 1) as lag_name,
                 MIN(return_30d_pct) as lag_return,
                 COUNT(CASE WHEN return_30d_pct > 0 THEN 1 END) as advancers,
                 COUNT(CASE WHEN return_30d_pct < 0 THEN 1 END) as decliners,
                 COUNT(CASE WHEN return_30d_pct = 0 THEN 1 END) as unchanged,
                 ROUND(MEDIAN(return_30d_pct), 4) as median_return,
                 ROUND(AVG(return_30d_pct), 4) as avg_return
-            FROM summary_table s
-            {where_sql} {'AND' if where_sql else 'WHERE'} s.return_30d_pct IS NOT NULL;
+            FROM filtered;
         """
         kpi_row = con.execute(sql_summary_kpi, params).fetchone()
         if kpi_row and kpi_row[0] is not None:
@@ -917,7 +1059,7 @@ def get_screener_dataframe(
             {limit_clause};
         """
         all_params = [start_date, end_date, start_date, end_date] + params
-        df = con.execute(sql, all_params).fetchdf()
+        df = _fetchdf(con.execute(sql, all_params))
     else:
         sql = f"""
             SELECT
@@ -956,7 +1098,7 @@ def get_screener_dataframe(
             ORDER BY {sort_col} {order_dir} NULLS LAST
             {limit_clause};
         """
-        df = con.execute(sql, params).fetchdf()
+        df = _fetchdf(con.execute(sql, params))
     con.close()
     return df
 
@@ -1051,7 +1193,7 @@ def get_nav_history_dataframe(scheme_codes: List[int], start_date=None, end_date
         {date_sql}
         ORDER BY n.nav_date ASC;
     """
-    df = con.execute(sql, params).fetchdf()
+    df = _fetchdf(con.execute(sql, params))
     con.close()
     if not df.empty:
         df["base_scheme_name"] = df["raw_scheme_name"]
@@ -1142,8 +1284,8 @@ def get_gainers_losers(
             LIMIT {top_n};
         """
         all_p = [start_date, end_date, start_date, end_date] + params
-        df_gainers = con.execute(sql_gainers, all_p).fetchdf()
-        df_losers = con.execute(sql_losers, all_p).fetchdf()
+        df_gainers = _fetchdf(con.execute(sql_gainers, all_p))
+        df_losers = _fetchdf(con.execute(sql_losers, all_p))
     else:
         valid_cols = ["change_1d_pct", "return_7d_pct", "return_30d_pct", "return_90d_pct", "return_1y_pct"]
         if period_col not in valid_cols:
@@ -1157,7 +1299,7 @@ def get_gainers_losers(
             ORDER BY s.{period_col} DESC
             LIMIT {top_n};
         """
-        df_gainers = con.execute(sql_gainers, params).fetchdf()
+        df_gainers = _fetchdf(con.execute(sql_gainers, params))
 
         sql_losers = f"""
             SELECT s.scheme_code, s.scheme_name, s.plan_type, s.option_type, s.fund_house, s.category, s.{period_col} as return_pct
@@ -1166,7 +1308,7 @@ def get_gainers_losers(
             ORDER BY s.{period_col} ASC
             LIMIT {top_n};
         """
-        df_losers = con.execute(sql_losers, params).fetchdf()
+        df_losers = _fetchdf(con.execute(sql_losers, params))
 
     con.close()
     if not df_gainers.empty:
@@ -1269,7 +1411,7 @@ def get_advanced_leaders_dataframe(
             WHERE period_return_pct IS NOT NULL;
         """
         all_p = [start_date, end_date, start_date, end_date, start_date, end_date] + params
-        df = con.execute(sql, all_p).fetchdf()
+        df = _fetchdf(con.execute(sql, all_p))
 
         # True peer-category median: scoped only by broad/sub-category (which is what "category"
         # means) and NOT by the Plan/Option filters above, so toggling e.g. "Direct only" can't
@@ -1303,7 +1445,7 @@ def get_advanced_leaders_dataframe(
             GROUP BY s.category;
         """
         cat_median_params = [start_date, end_date, start_date, end_date] + params_cat
-        df_cat_median = con.execute(cat_median_sql, cat_median_params).fetchdf()
+        df_cat_median = _fetchdf(con.execute(cat_median_sql, cat_median_params))
         df_cat_median = pd.DataFrame(columns=["category", "true_cat_median"])
     else:
         filter_cond = f"{where_sql} {'AND' if where_sql else 'WHERE'} s.return_30d_pct IS NOT NULL"
@@ -1326,13 +1468,13 @@ def get_advanced_leaders_dataframe(
                 s.high_52w,
                 s.low_52w,
                 s.return_30d_pct as period_return_pct,
-                CAST(NULL AS DOUBLE) as annualized_vol_pct,
+                CAST(NULL AS REAL) as annualized_vol_pct,
                 0 as n_trading_days,
                 50.0 as win_rate_pct
             FROM summary_table s
             {filter_cond};
         """
-        df = con.execute(sql, params).fetchdf()
+        df = _fetchdf(con.execute(sql, params))
         df_cat_median = pd.DataFrame(columns=["category", "true_cat_median"])
 
     con.close()
@@ -1380,10 +1522,10 @@ def get_advanced_leaders_dataframe(
 @cached(ttl=600)
 def get_scheme_profile(scheme_code: int) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     con = get_connection()
-    summary = con.execute("SELECT * FROM summary_table WHERE scheme_code = ?", [scheme_code]).fetchdf()
+    summary = _fetchdf(con.execute("SELECT * FROM summary_table WHERE scheme_code = ?", [scheme_code]))
     if summary.empty:
-        summary = con.execute("SELECT * FROM schemes WHERE scheme_code = ?", [scheme_code]).fetchdf()
-    history = con.execute("SELECT nav_date, nav FROM nav_history WHERE scheme_code = ? ORDER BY nav_date DESC", [scheme_code]).fetchdf()
+        summary = _fetchdf(con.execute("SELECT * FROM schemes WHERE scheme_code = ?", [scheme_code]))
+    history = _fetchdf(con.execute("SELECT nav_date, nav FROM nav_history WHERE scheme_code = ? ORDER BY nav_date DESC", [scheme_code]))
     con.close()
 
     profile = summary.to_dict(orient="records")[0] if not summary.empty else None
@@ -1483,26 +1625,30 @@ def _import_official_cost_records_impl(records: pd.DataFrame) -> Dict[str, Any]:
     con = get_connection()
     try:
         staging = pd.DataFrame(accepted)
-        con.register("stg_official_costs", staging)
-        updated = con.execute("""
+        _write_staging_table(con, "stg_official_costs", staging)
+        # Correlated subqueries, not UPDATE...FROM (portability -- see init_db()). The ::DATE
+        # casts are dropped: _write_staging_table()/_pyval() already normalized any date value
+        # to a plain ISO string before it went into the staging table, so no cast is needed.
+        _sub = lambda col: f"(SELECT c.{col} FROM stg_official_costs c WHERE c.scheme_code = schemes.scheme_code)"
+        _stat = lambda status_col: f"(SELECT c.{status_col} FROM stg_official_costs c WHERE c.scheme_code = schemes.scheme_code)"
+        updated = con.execute(f"""
             UPDATE schemes
-            SET expense_ratio = CASE WHEN c.ter_status = 'official' THEN c.expense_ratio ELSE schemes.expense_ratio END,
-                ter_status = CASE WHEN c.ter_status = 'official' THEN c.ter_status ELSE schemes.ter_status END,
-                ter_source = CASE WHEN c.ter_status = 'official' THEN c.ter_source ELSE schemes.ter_source END,
-                ter_source_url = CASE WHEN c.ter_status = 'official' THEN c.ter_source_url ELSE schemes.ter_source_url END,
-                ter_as_of_date = CASE WHEN c.ter_status = 'official' THEN c.ter_as_of_date::DATE ELSE schemes.ter_as_of_date END,
-                exit_rule_json = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_rule_json ELSE schemes.exit_rule_json END,
-                exit_rule_status = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_rule_status ELSE schemes.exit_rule_status END,
-                exit_rule_source = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_rule_source ELSE schemes.exit_rule_source END,
-                exit_rule_source_url = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_rule_source_url ELSE schemes.exit_rule_source_url END,
-                exit_rule_as_of_date = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_rule_as_of_date::DATE ELSE schemes.exit_rule_as_of_date END,
-                exit_load_description = CASE WHEN c.exit_rule_status = 'official' THEN c.exit_load_description ELSE schemes.exit_load_description END,
-                lock_in_years = CASE WHEN c.exit_rule_status = 'official' THEN c.lock_in_years ELSE schemes.lock_in_years END
-            FROM stg_official_costs c
-            WHERE schemes.scheme_code = c.scheme_code
+            SET expense_ratio = CASE WHEN {_stat('ter_status')} = 'official' THEN {_sub('expense_ratio')} ELSE schemes.expense_ratio END,
+                ter_status = CASE WHEN {_stat('ter_status')} = 'official' THEN {_sub('ter_status')} ELSE schemes.ter_status END,
+                ter_source = CASE WHEN {_stat('ter_status')} = 'official' THEN {_sub('ter_source')} ELSE schemes.ter_source END,
+                ter_source_url = CASE WHEN {_stat('ter_status')} = 'official' THEN {_sub('ter_source_url')} ELSE schemes.ter_source_url END,
+                ter_as_of_date = CASE WHEN {_stat('ter_status')} = 'official' THEN {_sub('ter_as_of_date')} ELSE schemes.ter_as_of_date END,
+                exit_rule_json = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_rule_json')} ELSE schemes.exit_rule_json END,
+                exit_rule_status = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_rule_status')} ELSE schemes.exit_rule_status END,
+                exit_rule_source = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_rule_source')} ELSE schemes.exit_rule_source END,
+                exit_rule_source_url = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_rule_source_url')} ELSE schemes.exit_rule_source_url END,
+                exit_rule_as_of_date = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_rule_as_of_date')} ELSE schemes.exit_rule_as_of_date END,
+                exit_load_description = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('exit_load_description')} ELSE schemes.exit_load_description END,
+                lock_in_years = CASE WHEN {_stat('exit_rule_status')} = 'official' THEN {_sub('lock_in_years')} ELSE schemes.lock_in_years END
+            WHERE EXISTS (SELECT 1 FROM stg_official_costs c WHERE c.scheme_code = schemes.scheme_code)
             RETURNING schemes.scheme_code;
         """).fetchall()
-        con.unregister("stg_official_costs")
+        con.execute("DROP TABLE IF EXISTS stg_official_costs")
     finally:
         con.close()
     refresh_summary_table()
@@ -1595,7 +1741,7 @@ def get_scheme_identity_map() -> pd.DataFrame:
     never for UI display, so it deliberately reads the base table rather than the cached,
     @cached-wrapped summary_table view."""
     con = get_connection()
-    df = con.execute("SELECT scheme_code, scheme_name, plan_type FROM schemes;").fetchdf()
+    df = _fetchdf(con.execute("SELECT scheme_code, scheme_name, plan_type FROM schemes;"))
     con.close()
     return df
 
@@ -1605,7 +1751,7 @@ def get_scheme_ter_history(scheme_code: int) -> pd.DataFrame:
     """Full dated Regulation 66 TER disclosure history for one scheme, oldest first —
     only populated once amfi_sync.sync_official_ter has matched that scheme at least once."""
     con = get_connection()
-    df = con.execute(
+    df = _fetchdf(con.execute(
         """
         SELECT ter_date, base_expense_ratio_pct, brokerage_cost_pct, transaction_cost_pct,
                statutory_levies_pct, total_ter_pct, source_url
@@ -1614,7 +1760,7 @@ def get_scheme_ter_history(scheme_code: int) -> pd.DataFrame:
         ORDER BY ter_date ASC;
         """,
         [scheme_code],
-    ).fetchdf()
+    ))
     con.close()
     return df
 
@@ -1630,11 +1776,13 @@ def _upsert_ter_history_impl(records: pd.DataFrame) -> int:
         return 0
     con = get_connection()
     try:
-        con.register("stg_ter_history", records)
+        _write_staging_table(con, "stg_ter_history", records)
         con.execute("""
             DELETE FROM ter_history
-            USING stg_ter_history s
-            WHERE ter_history.scheme_code = s.scheme_code AND ter_history.ter_date = s.ter_date;
+            WHERE EXISTS (
+                SELECT 1 FROM stg_ter_history s
+                WHERE ter_history.scheme_code = s.scheme_code AND ter_history.ter_date = s.ter_date
+            );
         """)
         con.execute("""
             INSERT INTO ter_history (
@@ -1645,10 +1793,7 @@ def _upsert_ter_history_impl(records: pd.DataFrame) -> int:
                    transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url
             FROM stg_ter_history;
         """)
-        try:
-            con.unregister("stg_ter_history")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_ter_history")
     finally:
         con.close()
     return len(records)
@@ -1673,27 +1818,27 @@ def _apply_latest_official_ter_impl(records: pd.DataFrame) -> Dict[str, Any]:
     try:
         staging = records.copy()
         staging["ter_status"] = costs_data.STATUS_OFFICIAL
-        con.register("stg_latest_ter", staging)
-        updated = con.execute("""
+        _write_staging_table(con, "stg_latest_ter", staging)
+        # Correlated subqueries, not UPDATE...FROM (portability -- see init_db()); ::DATE casts
+        # dropped since the staging table already holds plain ISO date strings (see
+        # import_official_cost_records for the same pattern).
+        _sub = lambda col: f"(SELECT c.{col} FROM stg_latest_ter c WHERE c.scheme_code = schemes.scheme_code)"
+        updated = con.execute(f"""
             UPDATE schemes
-            SET expense_ratio = c.total_ter_pct,
-                ter_base_expense_ratio = c.base_expense_ratio_pct,
-                ter_brokerage_cost_pct = c.brokerage_cost_pct,
-                ter_transaction_cost_pct = c.transaction_cost_pct,
-                ter_statutory_levies_pct = c.statutory_levies_pct,
-                ter_status = c.ter_status,
-                ter_source = c.ter_source,
-                ter_source_url = c.source_url,
-                ter_as_of_date = c.ter_date::DATE
-            FROM stg_latest_ter c
-            WHERE schemes.scheme_code = c.scheme_code
-              AND (schemes.ter_as_of_date IS NULL OR schemes.ter_as_of_date <= c.ter_date::DATE)
+            SET expense_ratio = {_sub('total_ter_pct')},
+                ter_base_expense_ratio = {_sub('base_expense_ratio_pct')},
+                ter_brokerage_cost_pct = {_sub('brokerage_cost_pct')},
+                ter_transaction_cost_pct = {_sub('transaction_cost_pct')},
+                ter_statutory_levies_pct = {_sub('statutory_levies_pct')},
+                ter_status = {_sub('ter_status')},
+                ter_source = {_sub('ter_source')},
+                ter_source_url = {_sub('source_url')},
+                ter_as_of_date = {_sub('ter_date')}
+            WHERE EXISTS (SELECT 1 FROM stg_latest_ter c WHERE c.scheme_code = schemes.scheme_code)
+              AND (schemes.ter_as_of_date IS NULL OR schemes.ter_as_of_date <= {_sub('ter_date')})
             RETURNING schemes.scheme_code;
         """).fetchall()
-        try:
-            con.unregister("stg_latest_ter")
-        except Exception:
-            pass
+        con.execute("DROP TABLE IF EXISTS stg_latest_ter")
     finally:
         con.close()
     refresh_summary_table()

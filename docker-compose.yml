@@ -22,10 +22,13 @@ services:
       retries: 3
 
   # --- Webstack migration (see .claude/plans/floofy-petting-mountain.md) ---
-  # backend/frontend run ALONGSIDE dashboard, not replacing it, until the
-  # final cutover phase. `dashboard` above stays the sole DB writer for the
-  # whole migration; backend only gets write access when ENABLE_SYNC_DAEMON
-  # is flipped true at the Data Management/cutover phase.
+  # backend/frontend run ALONGSIDE dashboard (kept as a legacy reference/
+  # fallback), not replacing it yet, until the final cutover phase. backend
+  # now runs on its own SQLite file (see app/db/connection.py) -- a clean
+  # slate, no data carried over from dashboard's old DuckDB file -- so it
+  # owns that file exclusively and is its own sole writer from the start;
+  # the AMFI sync re-populates it from scratch (POST /api/admin/sync/* once
+  # Phase 9 lands, or trigger amfi_sync directly in the meantime).
   backend:
     build:
       context: ./backend
@@ -35,18 +38,17 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DUCKDB_PATH=/app/data/mutual_funds.duckdb
+      - DB_PATH=/app/data/mutual_funds.sqlite3
       - TZ=Asia/Kolkata
       - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
       - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
       - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
-      - ENABLE_SYNC_DAEMON=false
+      - ENABLE_SYNC_DAEMON=true
     volumes:
       - ./backend:/app
-      # Read-only: this container must never write the DB Streamlit owns
-      # until the deliberate write-ownership handoff (see plan). Docker-level
-      # :ro is a second, OS-enforced guard on top of ENABLE_SYNC_DAEMON.
-      - ./fetcher/data:/app/data:ro
+      # Read-write: this is backend's own, exclusively-owned data directory
+      # (not shared with dashboard/fetcher's data dir at all anymore).
+      - ./backend/data:/app/data
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
       interval: 10s

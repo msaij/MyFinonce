@@ -6,10 +6,10 @@ The original derived the bundled CSV's path relative to its OWN file
 location (fetcher/costs_data.py -> fetcher/data/amfi_ter_data.csv), which
 broke once this module moved into the `app/` subpackage (its __file__ is
 now a directory below the mounted data dir, not a sibling of it). Instead,
-this derives the CSV's path from the same settings.duckdb_path the rest of
-the backend already uses -- both files live in the same mounted data
-directory (see docker-compose.yml's `./fetcher/data:/app/data:ro` mount),
-so this is the correct fix, not a workaround.
+this derives the CSV's path from the same settings.db_path the rest of
+the backend already uses -- both files live in the same data directory (see
+docker-compose.yml's `./backend/data:/app/data` mount), so this is the
+correct fix, not a workaround.
 
 NAV data identifies a scheme, but it does not contain its current TER or its
 scheme-specific exit-load terms. This module deliberately keeps unavailable
@@ -37,7 +37,7 @@ _TER_CACHE: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 def _get_legacy_ter_csv_path() -> str:
-    data_dir = os.path.dirname(os.path.abspath(settings.duckdb_path))
+    data_dir = os.path.dirname(os.path.abspath(settings.db_path))
     return os.path.join(data_dir, "amfi_ter_data.csv")
 
 
