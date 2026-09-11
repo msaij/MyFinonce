@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import meta, schemes, screener
+from app.routers import meta, overview, schemes, screener
 
 app = FastAPI(title="Indian Mutual Funds API", version="0.1.0")
 
@@ -28,6 +28,7 @@ app.add_middleware(
 )
 
 app.include_router(meta.router)
+app.include_router(overview.router)
 app.include_router(schemes.router)
 app.include_router(screener.router)
 
