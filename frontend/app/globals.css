@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens ported verbatim from fetcher/theme.py's inject_theme() --
+ * keep these two files in sync manually until the Streamlit app is retired
+ * (final cutover phase in ../../.claude/plans/floofy-petting-mountain.md).
+ * Do not "improve" these colors independently of theme.py while both UIs
+ * are running side by side for verification.
+ */
+:root {
+  --mf-success: #059669;
+  --mf-success-bg: rgba(5, 150, 105, 0.12);
+  --mf-danger: #DC2626;
+  --mf-danger-bg: rgba(220, 38, 38, 0.12);
+  --mf-warning: #D97706;
+  --mf-warning-bg: rgba(217, 119, 6, 0.12);
+  --mf-accent: #2563EB;
+  --mf-accent-bg: rgba(37, 99, 235, 0.12);
+  --mf-muted: #64748B;
+  --mf-border: rgba(128, 128, 128, 0.25);
+  --mf-card-bg: rgba(128, 128, 128, 0.04);
+
+  --mf-bg: #ffffff;
+  --mf-fg: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mf-success: #34D399;
+    --mf-success-bg: rgba(52, 211, 153, 0.14);
+    --mf-danger: #F87171;
+    --mf-danger-bg: rgba(248, 113, 113, 0.14);
+    --mf-warning: #FBBF24;
+    --mf-warning-bg: rgba(251, 191, 36, 0.14);
+    --mf-accent: #60A5FA;
+    --mf-accent-bg: rgba(96, 165, 250, 0.14);
+    --mf-muted: #94A3B8;
+    --mf-border: rgba(148, 163, 184, 0.28);
+    --mf-card-bg: rgba(148, 163, 184, 0.06);
+
+    --mf-bg: #0b1120;
+    --mf-fg: #e2e8f0;
+  }
+}
+
+/*
+ * Chart data-series palette -- NEW, consolidating what used to be hardcoded
+ * hex literals scattered across every page's Plotly configs in the old app
+ * (see the migration plan's design-tokens section). Referenced from
+ * lib/format.ts / chart-building code, not from Tailwind classes.
+ */
+:root {
+  --mf-chart-1: #2563EB;
+  --mf-chart-2: #059669;
+  --mf-chart-3: #DC2626;
+  --mf-chart-4: #D97706;
+  --mf-chart-5: #7C3AED;
+  --mf-chart-6: #0EA5E9;
+}
+
+body {
+  background: var(--mf-bg);
+  color: var(--mf-fg);
+}

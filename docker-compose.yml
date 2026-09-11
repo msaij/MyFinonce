@@ -20,3 +20,52 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # --- Webstack migration (see .claude/plans/floofy-petting-mountain.md) ---
+  # backend/frontend run ALONGSIDE dashboard, not replacing it, until the
+  # final cutover phase. `dashboard` above stays the sole DB writer for the
+  # whole migration; backend only gets write access when ENABLE_SYNC_DAEMON
+  # is flipped true at the Data Management/cutover phase.
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mf_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DUCKDB_PATH=/app/data/mutual_funds.duckdb
+      - TZ=Asia/Kolkata
+      - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
+      - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
+      - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
+      - ENABLE_SYNC_DAEMON=false
+    volumes:
+      - ./backend:/app
+      # Read-only: this container must never write the DB Streamlit owns
+      # until the deliberate write-ownership handoff (see plan). Docker-level
+      # :ro is a second, OS-enforced guard on top of ENABLE_SYNC_DAEMON.
+      - ./fetcher/data:/app/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mf_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
