@@ -27,6 +27,9 @@ export const PRESET_OPTIONS = [
   "Past 7 Days (1W)",
   "Past 180 Days (6M)",
   "Past 1 Year (12M)",
+  "Past 3 Years (3Y)",
+  "Past 5 Years (5Y)",
+  "Past 10 Years (10Y)",
   "Since 2020",
   "All Available",
   "Custom Range",
@@ -59,6 +62,12 @@ export function computeRangeForPreset(
       return { start: maxIso(dbMin, minusDays(180)), end: dbMax };
     case "Past 1 Year (12M)":
       return { start: maxIso(dbMin, minusDays(365)), end: dbMax };
+    case "Past 3 Years (3Y)":
+      return { start: maxIso(dbMin, minusDays(3 * 365)), end: dbMax };
+    case "Past 5 Years (5Y)":
+      return { start: maxIso(dbMin, minusDays(5 * 365)), end: dbMax };
+    case "Past 10 Years (10Y)":
+      return { start: maxIso(dbMin, minusDays(10 * 365)), end: dbMax };
     case "Since 2020":
       return { start: maxIso(dbMin, "2020-01-01"), end: dbMax };
     case "All Available":
@@ -68,10 +77,18 @@ export function computeRangeForPreset(
   }
 }
 
+export const PLAN_TYPE_OPTIONS = ["All Plans", "Direct", "Regular"] as const;
+export type PlanType = (typeof PLAN_TYPE_OPTIONS)[number];
+
+export const OPTION_TYPE_OPTIONS = ["All Options", "Growth", "IDCW"] as const;
+export type OptionType = (typeof OPTION_TYPE_OPTIONS)[number];
+
 interface DateRangeState {
   preset: Preset;
   start: string;
   end: string;
+  planType: PlanType;
+  optionType: OptionType;
   dbMinDate: string | null;
   dbMaxDate: string | null;
   /** True when dbMinDate/dbMaxDate came from DateRangePicker's empty-database
@@ -80,6 +97,8 @@ interface DateRangeState {
   isPlaceholder: boolean;
   setPreset: (preset: Preset) => void;
   setCustomRange: (start: string, end: string) => void;
+  setPlanType: (plan: PlanType) => void;
+  setOptionType: (option: OptionType) => void;
   /** Call whenever /api/meta/status is polled -- applies the live-edge-slide
    * rule if new data has landed and the window was tracking the live edge.
    * `isPlaceholder` (default false) marks a call seeded from the empty-
@@ -99,9 +118,14 @@ export const useDateRangeStore = create<DateRangeState>()(
       preset: DEFAULT_PRESET,
       start: "",
       end: "",
+      planType: "All Plans",
+      optionType: "All Options",
       dbMinDate: null,
       dbMaxDate: null,
       isPlaceholder: false,
+
+      setPlanType: (planType) => set({ planType }),
+      setOptionType: (optionType) => set({ optionType }),
 
       setPreset: (preset) => {
         const { dbMinDate, dbMaxDate } = get();
@@ -128,15 +152,18 @@ export const useDateRangeStore = create<DateRangeState>()(
         // (today's date) can coincidentally equal a genuinely real max_date (very likely
         // right after a fresh sync), so plain value-equality can't tell "nothing changed"
         // from "the placeholder happened to match." The explicit flag can.
-        const needsFreshSeed = !state.dbMinDate || !state.dbMaxDate || (state.isPlaceholder && !isPlaceholder);
+        const needsFreshSeed = !state.dbMinDate || !state.dbMaxDate || !state.start || !state.end || (state.isPlaceholder && !isPlaceholder);
 
         if (needsFreshSeed) {
           const recomputed = computeRangeForPreset(state.preset, dbMin, dbMax);
+          const fallback = state.preset === "Custom Range" && state.start && state.end
+            ? { start: state.start, end: state.end }
+            : { start: dbMin, end: dbMax };
           set({
             dbMinDate: dbMin,
             dbMaxDate: dbMax,
             isPlaceholder,
-            ...(recomputed ? { start: recomputed.start, end: recomputed.end } : { start: dbMin, end: dbMax }),
+            ...(recomputed ? { start: recomputed.start, end: recomputed.end } : fallback),
           });
           return;
         }
@@ -157,6 +184,15 @@ export const useDateRangeStore = create<DateRangeState>()(
         }
       },
     }),
-    { name: "mf-date-range" }
+    {
+      name: "mf-date-range",
+      // See filters.ts's matching skipHydration comment -- same SSR/hydration-mismatch fix,
+      // same reason (this store's start/end/preset/dbMinDate etc. are read directly during
+      // render by every page via useDateRangeStore(), not just inside a useState initializer,
+      // so the risk is identical). Rehydrated manually, once, in lib/providers.tsx.
+      skipHydration: true,
+    }
   )
 );
+
+export const useGlobalFilterStore = useDateRangeStore;

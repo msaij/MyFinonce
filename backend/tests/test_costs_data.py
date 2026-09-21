@@ -4,39 +4,25 @@ from app import costs_data
 
 
 class CostDataTests(unittest.TestCase):
-    def test_unavailable_rule_cannot_calculate_redemption(self):
-        result = costs_data.calculate_redemption_from_lots(
-            [{"purchase_date": "2026-01-01", "units": 10}],
-            "2026-01-10",
-            5,
-            100,
-            None,
-            "2026-01-01",
-        )
-        self.assertFalse(result["calculable"])
-
-    def test_fifo_redemption_applies_each_lot_rule(self):
-        rule = '{"rules": [{"start_day": 0, "end_day": 30, "rate_pct": 1.0}, {"start_day": 31, "rate_pct": 0.0}]}'
-        result = costs_data.calculate_redemption_from_lots(
-            [
-                {"purchase_date": "2026-01-01", "units": 10},
-                {"purchase_date": "2026-02-01", "units": 10},
-            ],
-            "2026-02-15",
-            15,
-            100,
-            rule,
-            "2026-01-01",
-        )
-        self.assertTrue(result["calculable"])
-        self.assertEqual(result["gross_redemption_value"], 1500)
-        self.assertEqual(result["exit_load_penalty_amount"], 5)
-        self.assertEqual(result["net_redemption_value"], 1495)
-
     def test_legacy_ter_is_not_marked_official(self):
         specs = costs_data.get_scheme_cost_specs(1, "360 One Balanced Hybrid Fund", "", "Direct")
         self.assertEqual(specs["ter_status"], costs_data.STATUS_LEGACY)
-        self.assertEqual(specs["exit_rule_status"], costs_data.STATUS_UNKNOWN)
+
+    def test_unmatched_scheme_ter_is_unknown(self):
+        specs = costs_data.get_scheme_cost_specs(2, "Definitely Not A Real Scheme Name Xyz", "", "Direct")
+        self.assertIsNone(specs["expense_ratio"])
+        self.assertEqual(specs["ter_status"], costs_data.STATUS_UNKNOWN)
+
+    def test_estimate_current_ter_drag(self):
+        # Average holding value * TER% * (days / 365.25) -- 365.25, not 365, so 365
+        # days is very slightly under "1 year" and the result is a hair below the
+        # naive 105000 * 1% = 1050.0.
+        drag = costs_data.estimate_current_ter_drag(100000, 110000, 365, 1.0)
+        expected = 105000 * 0.01 * (365 / 365.25)
+        self.assertAlmostEqual(drag, expected, places=6)
+
+    def test_estimate_current_ter_drag_requires_a_ter(self):
+        self.assertIsNone(costs_data.estimate_current_ter_drag(100000, 110000, 365, None))
 
 
 if __name__ == "__main__":

@@ -84,6 +84,17 @@ class TestMinTradingDaysGuard:
         assert excluded == 0
         assert filtered.empty
 
+    def test_all_rows_below_threshold_retained_with_vol_nulled(self):
+        df = pd.DataFrame({
+            "annualized_vol_pct": [10.5, 14.2],
+            "n_trading_days": [4, 4],
+            "period_return_pct": [1.5, -0.8],
+        })
+        filtered, excluded = leaders.apply_min_trading_days_guard(df)
+        assert excluded == 0
+        assert len(filtered) == 2
+        assert filtered["annualized_vol_pct"].isna().all()
+
 
 class TestApplyKeywordFilter:
     def _sample_df(self):

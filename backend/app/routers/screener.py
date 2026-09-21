@@ -27,6 +27,7 @@ class ScreenerFilters:
         end: Optional[datetime.date] = None,
         scheme_code: Optional[int] = None,
         max_expense_ratio: Optional[float] = None,
+        official_ter_only: bool = False,
     ):
         self.amc = amc
         self.broad_cat = broad_cat
@@ -38,13 +39,19 @@ class ScreenerFilters:
         self.end = end
         self.scheme_code = scheme_code
         self.max_expense_ratio = max_expense_ratio
+        self.official_ter_only = official_ter_only
 
     def as_kwargs(self) -> dict:
+        start = self.start
+        end = self.end
+        if start and end and start > end:
+            start, end = end, start
         return dict(
             amc=self.amc, broad_cat=self.broad_cat, sub_cat=self.sub_cat,
             plan_type=self.plan_type, option_type=self.option_type,
-            search_term=self.search_term, start_date=self.start, end_date=self.end,
+            search_term=self.search_term, start_date=start, end_date=end,
             scheme_code=self.scheme_code, max_expense_ratio=self.max_expense_ratio,
+            official_ter_only=self.official_ter_only,
         )
 
 

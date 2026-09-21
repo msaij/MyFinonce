@@ -28,10 +28,11 @@ def stats() -> OverviewStats:
 @router.get("/kpis", response_model=OverviewKpis)
 def kpis(
     plan_type: str = "All Plans",
+    option_type: str = "All Options",
     start_date: Optional[datetime.date] = None,
     end_date: Optional[datetime.date] = None,
 ) -> OverviewKpis:
-    k = db.get_kpis(plan_type=plan_type, start_date=start_date, end_date=end_date)
+    k = db.get_kpis(plan_type=plan_type, option_type=option_type, start_date=start_date, end_date=end_date)
     return OverviewKpis(**sanitize_floats(k))
 
 
@@ -40,8 +41,9 @@ def macro_trend(
     start_date: datetime.date,
     end_date: datetime.date,
     plan_type: str = "All Plans",
+    option_type: str = "All Options",
 ) -> list[dict]:
-    df = db.get_macro_asset_class_trend(start_date, end_date, plan_type=plan_type)
+    df = db.get_macro_asset_class_trend(start_date, end_date, plan_type=plan_type, option_type=option_type)
     return df_to_records(df)
 
 

@@ -66,6 +66,7 @@ export interface BacktestResultRow {
 
 export interface AdvisorBacktest {
   error?: string;
+  sample?: "is" | "oos";
   final_value?: number;
   total_invested?: number;
   n_contributions?: number;
@@ -75,15 +76,31 @@ export interface AdvisorBacktest {
     sharpe_ratio: number | null;
     max_drawdown_pct: number | null;
     vol_annualized_pct: number | null;
+    costs_model?: string;
   };
   df_result?: BacktestResultRow[];
+}
+
+export interface SuggestWindows {
+  construction_start: string;
+  construction_end: string;
+  test_start_effective: string;
+  test_end: string;
+  construction_interval: string;
+  test_interval: string;
+  sample: "is" | "oos";
 }
 
 export interface SuggestResponse {
   rules_result: PortfolioBuildResult;
   mvo_result: PortfolioBuildResult | null;
+  hrp_result: PortfolioBuildResult | null;
   rules_backtest: AdvisorBacktest | null;
   mvo_backtest: AdvisorBacktest | null;
+  hrp_backtest: AdvisorBacktest | null;
+  risk_budgeting?: Record<string, unknown> | null;
+  warnings?: string[];
+  windows?: SuggestWindows;
 }
 
 export interface SuggestRequest {
@@ -94,6 +111,32 @@ export interface SuggestRequest {
   sip_amount: number;
   start_date: string;
   end_date: string;
+  construction_start?: string;
+  construction_end?: string;
+  test_start?: string;
+  test_end?: string;
+  holdout?: boolean;
 }
 
 export const suggestPortfolio = (req: SuggestRequest) => apiPost<SuggestResponse>("/api/portfolio-advisor/suggest", req);
+
+export interface BlackLittermanRequest {
+  scheme_codes?: number[];
+  asset_names?: string[];
+  prior_weights?: number[];
+  views_matrix_P: number[][];
+  views_returns_Q: number[];
+  views_confidences?: number[];
+  start_date?: string;
+  end_date?: string;
+}
+
+export const runBlackLitterman = (req: BlackLittermanRequest) =>
+  apiPost<Record<string, unknown>>("/api/portfolio-advisor/black-litterman", req);
+
+export const getEfficientFrontier = (params: {
+  risk_tier: string;
+  construction_start?: string;
+  construction_end?: string;
+  scheme_codes?: string;
+}) => apiGet<Record<string, unknown>>("/api/portfolio-advisor/efficient-frontier", params);

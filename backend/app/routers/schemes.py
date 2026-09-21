@@ -51,6 +51,48 @@ def ter_history(scheme_code: int) -> list[dict]:
     return df_to_records(df)
 
 
+@router.get("/{scheme_code}/profile")
+def get_scheme_profile(scheme_code: int) -> dict:
+    profile = db.get_scheme_profile_only(scheme_code)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Scheme {scheme_code} not found")
+    return sanitize_floats(profile)
+
+
+@router.get("/{scheme_code}/fee-drag")
+def fee_drag_attribution(
+    scheme_code: int,
+    paired_scheme_code: Optional[int] = Query(None),
+    initial_capital: float = Query(100000.0, ge=0.0),
+    horizons: Optional[str] = Query(None),
+) -> dict:
+    from app.services import fee_drag, plan_matcher
+
+    profile, _ = db.get_scheme_profile(scheme_code)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Scheme {scheme_code} not found")
+
+    target_paired = paired_scheme_code or plan_matcher.find_paired_scheme(scheme_code)
+    plan_type = str(profile.get("plan_type") or "").strip().lower()
+    scheme_name = str(profile.get("scheme_name") or "").strip().lower()
+    is_direct = "direct" in plan_type or "direct" in scheme_name
+
+    d_code = scheme_code if is_direct else target_paired
+    r_code = target_paired if is_direct else scheme_code
+
+    h_list = [h.strip().upper() for h in horizons.split(",")] if horizons else ["1Y", "3Y", "5Y", "10Y"]
+    res = fee_drag.compute_fee_drag_attribution(
+        direct_scheme_code=d_code,
+        regular_scheme_code=r_code,
+        horizons=h_list,
+        initial_capital=initial_capital,
+    )
+    res["is_direct"] = is_direct
+    res["queried_scheme_code"] = scheme_code
+    res["paired_scheme_code"] = target_paired
+    return sanitize_floats(res)
+
+
 @router.get("/{scheme_code}")
 def get_scheme(scheme_code: int) -> dict:
     profile, nav_history_df = db.get_scheme_profile(scheme_code)

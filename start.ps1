@@ -34,29 +34,33 @@ try {
 
 Write-Host "Docker engine is running." -ForegroundColor Green
 
-# Build and start the service
-Write-Host "`n[2/3] Starting Streamlit + DuckDB Analytics Dashboard..." -ForegroundColor Yellow
+# Build and start the services
+Write-Host "`n[2/3] Starting FastAPI backend + Next.js frontend..." -ForegroundColor Yellow
 docker compose up -d
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Failed to start Docker Compose service." -ForegroundColor Red
+    Write-Host "Failed to start Docker Compose services." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "`n[3/3] Waiting for dashboard to initialize..." -ForegroundColor Yellow
+Write-Host "`n[3/3] Waiting for services to initialize..." -ForegroundColor Yellow
 Start-Sleep -Seconds 3
 
 Write-Host "`n========================================================" -ForegroundColor Cyan
 Write-Host "   DASHBOARD IS UP AND RUNNING!" -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Cyan
-Write-Host "Dashboard URL : http://localhost:8501" -ForegroundColor White
-Write-Host "Database      : DuckDB (embedded in fetcher/data/mutual_funds.duckdb)" -ForegroundColor Gray
+Write-Host "App URL       : http://localhost:3000" -ForegroundColor White
+Write-Host "API           : http://localhost:8000 (FastAPI, /api/health)" -ForegroundColor Gray
+Write-Host "Database      : PostgreSQL 16 (compose project indian-mutual-funds)" -ForegroundColor Gray
+Write-Host "Frontend rebuild after UI changes: docker compose up -d --build frontend" -ForegroundColor Gray
+Write-Host "Backend reload: `$env:DEV_RELOAD='true'; docker compose up -d backend" -ForegroundColor Gray
 Write-Host "AMFI Schemes  : growing daily via official AMFI sync" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Helpful Commands:" -ForegroundColor Cyan
-Write-Host "  View dashboard logs  : docker compose logs -f" -ForegroundColor Gray
-Write-Host "  Stop dashboard       : docker compose down" -ForegroundColor Gray
+Write-Host "  View backend logs    : docker compose logs -f backend" -ForegroundColor Gray
+Write-Host "  View frontend logs   : docker compose logs -f frontend" -ForegroundColor Gray
+Write-Host "  Stop everything      : docker compose down" -ForegroundColor Gray
 Write-Host "========================================================`n" -ForegroundColor Cyan
 
 # Open in browser automatically
-Start-Process "http://localhost:8501"
+Start-Process "http://localhost:3000"

@@ -3,46 +3,54 @@
 @tailwind utilities;
 
 /*
- * Design tokens ported verbatim from fetcher/theme.py's inject_theme() --
- * keep these two files in sync manually until the Streamlit app is retired
- * (final cutover phase in ../../.claude/plans/floofy-petting-mountain.md).
- * Do not "improve" these colors independently of theme.py while both UIs
- * are running side by side for verification.
+ * Design tokens -- originally ported from the retired Streamlit app's
+ * theme.py (removed at Final Cutover; see git history if it's ever needed
+ * again). This file is now the single source of truth for the app's design
+ * tokens -- no other file to keep in sync with.
  */
 :root {
-  --mf-success: #059669;
+  color-scheme: light;
+  --mf-success: #047857;
   --mf-success-bg: rgba(5, 150, 105, 0.12);
-  --mf-danger: #DC2626;
+  --mf-danger: #b91c1c;
   --mf-danger-bg: rgba(220, 38, 38, 0.12);
-  --mf-warning: #D97706;
-  --mf-warning-bg: rgba(217, 119, 6, 0.12);
-  --mf-accent: #2563EB;
+  --mf-warning: #92400e;
+  --mf-warning-bg: rgba(180, 83, 9, 0.12);
+  --mf-accent: #1d4ed8;
   --mf-accent-bg: rgba(37, 99, 235, 0.12);
-  --mf-muted: #64748B;
-  --mf-border: rgba(128, 128, 128, 0.25);
-  --mf-card-bg: rgba(128, 128, 128, 0.04);
+  /* #334155 (slate-700) provides >10:1 contrast on white and card backgrounds,
+     ensuring secondary text, metric titles, subtitles, and captions are crisp and legible. */
+  --mf-muted: #334155;
+  --mf-border: rgba(100, 116, 139, 0.25);
+  --mf-card-bg: rgba(248, 250, 252, 0.8);
 
   --mf-bg: #ffffff;
   --mf-fg: #0f172a;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --mf-success: #34D399;
-    --mf-success-bg: rgba(52, 211, 153, 0.14);
-    --mf-danger: #F87171;
-    --mf-danger-bg: rgba(248, 113, 113, 0.14);
-    --mf-warning: #FBBF24;
-    --mf-warning-bg: rgba(251, 191, 36, 0.14);
-    --mf-accent: #60A5FA;
-    --mf-accent-bg: rgba(96, 165, 250, 0.14);
-    --mf-muted: #94A3B8;
-    --mf-border: rgba(148, 163, 184, 0.28);
-    --mf-card-bg: rgba(148, 163, 184, 0.06);
+.dark {
+  color-scheme: dark;
+  --mf-bg: #0b0f19;
+  --mf-card-bg: #1e293b;
+  --mf-border: rgba(148, 163, 184, 0.2);
+  --mf-fg: #f8fafc;
+  --mf-muted: #94a3b8;
 
-    --mf-bg: #0b1120;
-    --mf-fg: #e2e8f0;
-  }
+  --mf-success: #34d399;
+  --mf-success-bg: rgba(52, 211, 153, 0.12);
+  --mf-danger: #f87171;
+  --mf-danger-bg: rgba(248, 113, 113, 0.10);
+  --mf-warning: #fbbf24;
+  --mf-warning-bg: rgba(251, 191, 36, 0.12);
+  --mf-accent: #60a5fa;
+  --mf-accent-bg: rgba(96, 165, 250, 0.12);
+
+  --mf-chart-1: #60A5FA;
+  --mf-chart-2: #34D399;
+  --mf-chart-3: #F87171;
+  --mf-chart-4: #FBBF24;
+  --mf-chart-5: #A78BFA;
+  --mf-chart-6: #38BDF8;
 }
 
 /*
@@ -65,11 +73,31 @@ body {
   color: var(--mf-fg);
 }
 
+select option {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+.dark select option {
+  background-color: #1e293b;
+  color: #f8fafc;
+}
+
+.dark .info-icon .tooltip-box {
+  background-color: #1e293b;
+  color: #f8fafc;
+  border-color: #334155;
+}
+
+.dark .info-icon .tooltip-box::after {
+  border-color: #1e293b transparent transparent transparent;
+}
+
 /*
- * Component classes ported verbatim from fetcher/theme.py's inject_theme()
- * -- StatCard/Banner/StatusPill/FormulaTooltip (components/shared/) apply
- * these class names rather than reimplementing the CSS, for guaranteed
- * visual parity with the still-running Streamlit app during the migration.
+ * Shared component classes -- StatCard/Banner/StatusPill/FormulaTooltip
+ * (components/shared/) apply these class names rather than each
+ * reimplementing their own CSS, so every page's cards/banners/pills stay
+ * visually identical by construction.
  */
 .mf-page-title {
   font-size: 2.1rem;
@@ -123,6 +151,7 @@ body {
 .metric-value.mf-pos { color: var(--mf-success); }
 .metric-value.mf-neg { color: var(--mf-danger); }
 .metric-value.mf-warn { color: var(--mf-warning); }
+.metric-value.mf-accent { color: var(--mf-accent); }
 .metric-sub {
   font-size: 0.8rem;
   color: var(--mf-muted);
@@ -176,19 +205,24 @@ body {
   border: 1px solid var(--mf-border);
   border-radius: 10px;
   padding: 12px 16px;
+  position: relative;
+  transition: border-color 0.15s ease;
+}
+.filter-box:focus-within {
+  z-index: 40;
 }
 
 .info-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
-  background-color: rgba(100, 116, 139, 0.25);
-  color: var(--mf-muted);
-  font-size: 10px;
-  font-weight: 700;
+  background-color: rgba(71, 85, 105, 0.15);
+  color: #334155;
+  font-size: 11px;
+  font-weight: 800;
   cursor: help;
   margin-left: 6px;
   position: relative;
@@ -203,9 +237,10 @@ body {
 .info-icon .tooltip-box {
   visibility: hidden;
   opacity: 0;
-  width: 280px;
-  background-color: #0F172A;
-  color: #F8FAFC;
+  width: 320px;
+  max-width: 90vw;
+  background-color: #FFFFFF;
+  color: #0F172A;
   text-align: left;
   border-radius: 8px;
   padding: 10px 14px;
@@ -217,8 +252,8 @@ body {
   bottom: 140%;
   left: 50%;
   transform: translateX(-50%);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45), 0 4px 10px rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.15);
+  border: 1px solid #cbd5e1;
   pointer-events: none;
   transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s ease;
   white-space: normal;
@@ -232,7 +267,7 @@ body {
   margin-left: -6px;
   border-width: 6px;
   border-style: solid;
-  border-color: #0F172A transparent transparent transparent;
+  border-color: #FFFFFF transparent transparent transparent;
 }
 .info-icon:hover .tooltip-box { visibility: visible; opacity: 1; }
 .info-icon.tooltip-align-left .tooltip-box { left: -12px; transform: none; }

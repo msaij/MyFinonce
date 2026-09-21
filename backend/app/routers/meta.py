@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from app.core.config import product_flags
 from app.db import queries as db
 from app.db.connection import get_data_version
 from app import amfi_sync
@@ -25,7 +26,15 @@ def status() -> MetaStatus:
         db_path=stats["db_path"],
         is_stale=is_stale,
         expected_date=expected,
+        ter_records_count=stats.get("ter_count", 0),
+        ter_official_schemes=stats.get("ter_official_schemes", 0),
+        flags=product_flags(),
     )
+
+
+@router.get("/data-quality")
+def data_quality() -> dict:
+    return db.get_data_quality()
 
 
 @router.get("/filters", response_model=MetaFilters)

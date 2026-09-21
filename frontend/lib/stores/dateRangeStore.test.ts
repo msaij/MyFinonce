@@ -91,4 +91,15 @@ describe("useDateRangeStore live-edge-slide", () => {
     useDateRangeStore.getState().syncBounds("2008-10-02", "2026-09-11", false);
     expect(useDateRangeStore.getState().end).toBe("2026-08-01"); // still respects the normal slide rule
   });
+
+  it("preserves custom range set before first syncBounds (e.g. from bookmarked URL)", () => {
+    useDateRangeStore.getState().setCustomRange("2024-03-01", "2024-09-01");
+    useDateRangeStore.getState().syncBounds("2020-01-01", "2026-09-10");
+    const state = useDateRangeStore.getState();
+    expect(state.preset).toBe("Custom Range");
+    expect(state.start).toBe("2024-03-01");
+    expect(state.end).toBe("2024-09-01");
+    expect(state.dbMinDate).toBe("2020-01-01");
+    expect(state.dbMaxDate).toBe("2026-09-10");
+  });
 });

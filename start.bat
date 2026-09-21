@@ -11,11 +11,13 @@ echo.
 echo ========================================================
 echo    DASHBOARD IS UP AND RUNNING!
 echo ========================================================
-echo Dashboard URL : http://localhost:8501
-echo Database      : DuckDB (embedded in fetcher/data/mutual_funds.duckdb)
+echo App URL       : http://localhost:3000
+echo API           : http://localhost:8000 (FastAPI, /api/health)
+echo Database      : PostgreSQL 16 (compose project indian-mutual-funds)
+echo Frontend rebuild after UI changes: docker compose up -d --build frontend
 echo AMFI Schemes  : growing daily via official AMFI sync
 echo ========================================================
 echo.
 
-start http://localhost:8501
+start http://localhost:3000
 pause

@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useQuery, useQueries } from "@tanstack/react-query";
+import { useMemo, useState, Suspense } from "react";
+import { useQuery, useQueries, keepPreviousData } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { StatCard } from "@/components/shared/StatCard";
@@ -9,7 +10,10 @@ import { DataTable, ColumnConfig } from "@/components/shared/DataTable";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { Banner } from "@/components/shared/Banner";
-import { formatSignedPct, formatInr, toneOf } from "@/lib/format";
+import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
+import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
+import { formatSignedPct, formatInr, toneOf, CHART_MUTED_COLOR } from "@/lib/format";
+import { useUrlSync } from "@/lib/hooks";
 import { useDateRangeStore } from "@/lib/stores/dateRange";
 import { useFilterStore } from "@/lib/stores/filters";
 import { getNavHistory, getScheme, type NavHistoryPoint } from "@/lib/api/schemes";
@@ -42,13 +46,38 @@ const COMPARE_TABLE_COLUMNS: ColumnConfig[] = [
 ];
 
 export default function ComparePage() {
-  const { start, end } = useDateRangeStore();
+  return (
+    <Suspense fallback={<div className="p-6 text-sm">Loading Compare & Backtest...</div>}>
+      <CompareContent />
+    </Suspense>
+  );
+}
+
+function CompareContent() {
+  const searchParams = useSearchParams();
+  const { start, end, planType, optionType } = useDateRangeStore();
   const getFilter = useFilterStore((s) => s.getFilter);
   const setFilter = useFilterStore((s) => s.setFilter);
 
-  const [selectedCodes, setSelectedCodesState] = useState<number[]>(() => getFilter(SECTION, "selected_scheme_codes", DEFAULT_SCHEME_CODES));
-  const [investmentAmount, setInvestmentAmountState] = useState<number>(() => getFilter(SECTION, "investment_amount", 10000));
-  const [activeTab, setActiveTab] = useState<"compare" | "backtest">("compare");
+  const rawCodes = searchParams.get("codes");
+  const initialCodes: number[] = rawCodes
+    ? rawCodes
+        .split(",")
+        .map(Number)
+        .filter((c) => !Number.isNaN(c) && c > 0)
+    : getFilter(SECTION, "selected_scheme_codes", DEFAULT_SCHEME_CODES);
+
+  const paramTab = searchParams.get("tab");
+  const initialTab: "compare" | "backtest" = paramTab === "backtest" ? "backtest" : "compare";
+
+  const paramAmount = searchParams.get("amount");
+  const initialAmount = paramAmount && !Number.isNaN(Number(paramAmount))
+    ? Number(paramAmount)
+    : getFilter(SECTION, "investment_amount", 10000);
+
+  const [selectedCodes, setSelectedCodesState] = useState<number[]>(() => initialCodes.length > 0 ? initialCodes : DEFAULT_SCHEME_CODES);
+  const [investmentAmount, setInvestmentAmountState] = useState<number>(() => initialAmount);
+  const [activeTab, setActiveTab] = useState<"compare" | "backtest">(() => initialTab);
   const [chartTab, setChartTab] = useState<"growth" | "normalized" | "nav">("growth");
   const [backtestChartTab, setBacktestChartTab] = useState<"growth" | "alloc" | "breakdown">("growth");
 
@@ -85,6 +114,7 @@ export default function ComparePage() {
     queryKey: ["compare-nav", selectedCodes, start, end],
     queryFn: () => getNavHistory(selectedCodes, start || undefined, end || undefined),
     enabled: selectedCodes.length > 0 && !!start && !!end,
+    placeholderData: keepPreviousData,
   });
 
   const span = start && end ? Math.round((new Date(end).getTime() - new Date(start).getTime()) / 86400000) : 0;
@@ -142,6 +172,7 @@ export default function ComparePage() {
       layout: {
         height: 460,
         hovermode: "x unified",
+        hoversort: "value descending",
         yaxis: chartTab === "normalized" ? { ticksuffix: "%", showgrid: true } : { showgrid: true },
         legend: { orientation: "h", yanchor: "bottom", y: -0.3, xanchor: "left", x: 0 },
       },
@@ -158,7 +189,6 @@ export default function ComparePage() {
       plan_type: p.plan_type,
       expense_ratio: terVal,
       ter_status: p.ter_status,
-      exit_load_description: p.exit_load_description ?? "Unavailable",
       nominal_value: nominalValue,
       ter_estimate: terEstimate,
       window_return_pct: win?.pct ?? null,
@@ -166,15 +196,69 @@ export default function ComparePage() {
   });
 
   // --- Tab 2: Portfolio Backtest ---
+  const paramWeights = searchParams.get("weights");
+  const parsedWeights: Record<number, number> = {};
+  if (paramWeights) {
+    paramWeights.split(",").forEach((pair) => {
+      const [k, v] = pair.split(":");
+      const code = Number(k);
+      const val = Number(v);
+      if (!Number.isNaN(code) && !Number.isNaN(val)) {
+        parsedWeights[code] = val;
+      }
+    });
+  }
+
   const [weights, setWeightsState] = useState<Record<number, number>>(() => {
     const w: Record<number, number> = {};
-    for (const c of selectedCodes) w[c] = getFilter("portfolio_weights", String(c), Number((100 / selectedCodes.length).toFixed(2)));
+    for (const c of selectedCodes) {
+      if (parsedWeights[c] !== undefined) {
+        w[c] = parsedWeights[c];
+      } else {
+        w[c] = getFilter("portfolio_weights", String(c), Number((100 / selectedCodes.length).toFixed(2)));
+      }
+    }
     return w;
   });
-  const [invMode, setInvModeState] = useState<"Lump Sum" | "SIP (Monthly)">(() => getFilter("portfolio_config", "mode", "Lump Sum"));
-  const [lumpSum, setLumpSumState] = useState<number>(() => getFilter("portfolio_config", "lump_sum_amount", 100000));
-  const [sipAmount, setSipAmountState] = useState<number>(() => getFilter("portfolio_config", "sip_amount", 5000));
-  const [rebalanceFreq, setRebalanceFreqState] = useState<string>(() => getFilter("portfolio_config", "rebalance", "None"));
+  const paramMode = searchParams.get("mode") as "Lump Sum" | "SIP (Monthly)" | null;
+  const paramRebal = searchParams.get("rebalance");
+  const paramLumpSum = searchParams.get("lump_sum");
+  const paramSipAmount = searchParams.get("sip_amount");
+
+  const [invMode, setInvModeState] = useState<"Lump Sum" | "SIP (Monthly)">(
+    () => (paramMode === "Lump Sum" || paramMode === "SIP (Monthly)" ? paramMode : getFilter("portfolio_config", "mode", "Lump Sum"))
+  );
+  const [lumpSum, setLumpSumState] = useState<number>(() =>
+    paramLumpSum && !Number.isNaN(Number(paramLumpSum))
+      ? Number(paramLumpSum)
+      : getFilter("portfolio_config", "lump_sum_amount", 100000)
+  );
+  const [sipAmount, setSipAmountState] = useState<number>(() =>
+    paramSipAmount && !Number.isNaN(Number(paramSipAmount))
+      ? Number(paramSipAmount)
+      : getFilter("portfolio_config", "sip_amount", 5000)
+  );
+  const [rebalanceFreq, setRebalanceFreqState] = useState<string>(
+    () => (paramRebal ? paramRebal : getFilter("portfolio_config", "rebalance", "None"))
+  );
+
+  const serializedWeights = useMemo(() => {
+    const keys = Object.keys(weights);
+    if (keys.length === 0) return undefined;
+    return Object.entries(weights).map(([k, v]) => `${k}:${v}`).join(",");
+  }, [weights]);
+
+  // Synchronize state with URL query parameters for direct link sharing & bookmarking
+  useUrlSync({
+    codes: selectedCodes.length > 0 ? selectedCodes.join(",") : undefined,
+    tab: activeTab !== "compare" ? activeTab : undefined,
+    amount: investmentAmount !== 10000 ? investmentAmount : undefined,
+    mode: invMode !== "Lump Sum" ? invMode : undefined,
+    rebalance: rebalanceFreq !== "None" ? rebalanceFreq : undefined,
+    lump_sum: invMode === "Lump Sum" && lumpSum !== 100000 ? lumpSum : undefined,
+    sip_amount: invMode === "SIP (Monthly)" && sipAmount !== 5000 ? sipAmount : undefined,
+    weights: serializedWeights,
+  });
 
   function setWeight(code: number, v: number) {
     const next = { ...weights, [code]: v };
@@ -236,10 +320,10 @@ export default function ComparePage() {
           name: "Capital Invested",
           x: rows.map((r) => r.nav_date),
           y: rows.map((r) => r.total_invested),
-          line: { color: "#94A3B8", width: 1.5, dash: "dash" },
+          line: { color: CHART_MUTED_COLOR, width: 1.5, dash: "dash" },
         },
       ],
-      layout: { height: 460, hovermode: "x unified", yaxis: { showgrid: true }, legend: { orientation: "h", yanchor: "bottom", y: 1.02, xanchor: "right", x: 1 } },
+      layout: { height: 460, hovermode: "x unified", hoversort: "value descending", yaxis: { showgrid: true }, legend: { orientation: "h", yanchor: "bottom", y: 1.02, xanchor: "right", x: 1 } },
     };
   }, [btResultOk]);
 
@@ -255,7 +339,7 @@ export default function ComparePage() {
     });
     return {
       data: traces,
-      layout: { height: 440, hovermode: "x unified", yaxis: { ticksuffix: "%", range: [0, 100] }, legend: { orientation: "h", yanchor: "bottom", y: 1.02, xanchor: "right", x: 1 } },
+      layout: { height: 440, hovermode: "x unified", hoversort: "value descending", yaxis: { ticksuffix: "%", range: [0, 100] }, legend: { orientation: "h", yanchor: "bottom", y: 1.02, xanchor: "right", x: 1 } },
     };
   }, [btResultOk, selectedCodes, schemeNames]);
 
@@ -277,6 +361,9 @@ export default function ComparePage() {
   return (
     <AppShell pageContext={selectedCodes.length ? { label: "Selected Funds", value: String(selectedCodes.length) } : undefined}>
       <h1 className="mf-page-title">Compare & Simulate</h1>
+      <div className="mt-3">
+        <NonAdviceDisclaimer compact />
+      </div>
       <p className="mf-page-caption">Compare mutual fund schemes side-by-side, then backtest the same funds together as a weighted portfolio.</p>
 
       {/* --- Shared fund selector --- */}
@@ -284,12 +371,22 @@ export default function ComparePage() {
         <div className="mb-2 flex items-center justify-between">
           <span className="text-sm" style={{ color: "var(--mf-muted)" }}>
             Select up to {MAX_SCHEMES} funds -- shared by both tabs below.
+            <span className="ml-2 inline-flex items-center gap-1.5 text-xs font-semibold" style={{ color: "var(--mf-accent)" }}>
+              • Universe: {planType} / {optionType}
+            </span>
           </span>
-          <button type="button" onClick={resetSelection} className="rounded-lg border px-3 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--mf-border)" }}>
+          <button type="button" onClick={resetSelection} className="rounded-lg border px-3 py-1.5 text-xs font-semibold hover:bg-slate-50 transition-colors" style={{ borderColor: "var(--mf-border)", color: "var(--mf-fg)" }}>
             Reset Selection
           </button>
         </div>
-        <SearchCombobox placeholder="Search & add a fund..." onSelect={(s) => addScheme(s.scheme_code)} />
+        <SearchCombobox
+          placeholder="Search & add a fund (filtered by header Plan/Option)..."
+          extraParams={{
+            plan_type: planType !== "All Plans" ? planType : undefined,
+            option_type: optionType !== "All Options" ? optionType : undefined,
+          }}
+          onSelect={(s) => addScheme(s.scheme_code)}
+        />
         <div className="mt-2 flex flex-wrap gap-2">
           {selectedCodes.map((code) => (
             <span key={code} className="mf-pill mf-pill-neutral">
@@ -373,7 +470,7 @@ export default function ComparePage() {
               </div>
 
               <h2 className="mt-6 text-lg font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
-                Cost Data and Redemption Readiness
+                Cost Data (TER)
               </h2>
               <p className="mf-page-caption">NAV returns are net of TER. This page does not infer a redemption payout from the chart period.</p>
               <div className="mt-2">
@@ -383,7 +480,6 @@ export default function ComparePage() {
                     { key: "plan_type", label: "Plan" },
                     { key: "expense_ratio", label: "TER %", format: "signed_pct" },
                     { key: "ter_status", label: "TER Confidence" },
-                    { key: "exit_load_description", label: "Exit Rule" },
                     { key: "nominal_value", label: "NAV Value (not redemption payout)", format: "inr" },
                     { key: "ter_estimate", label: "Current-TER Illustration", format: "inr" },
                     { key: "window_return_pct", label: "NAV Return %", format: "signed_pct" },
@@ -403,10 +499,10 @@ export default function ComparePage() {
               </Banner>
 
               <div className="mt-4">
-                <div className="text-sm font-semibold">Target Allocation Weights (auto-normalized to 100%)</div>
+                <div className="text-sm font-semibold" style={{ color: "var(--mf-fg)" }}>Target Allocation Weights (auto-normalized to 100%)</div>
                 <div className="mt-2 grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
                   {selectedCodes.map((code) => (
-                    <label key={code} className="flex flex-col gap-1 text-xs" style={{ color: "var(--mf-muted)" }} title={schemeNames.get(code)}>
+                    <label key={code} className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }} title={schemeNames.get(code)}>
                       {(schemeNames.get(code) ?? String(code)).slice(0, 24)}
                       <input
                         type="number"
@@ -426,8 +522,8 @@ export default function ComparePage() {
                     At least one fund needs a positive weight.
                   </p>
                 ) : Math.abs(weightSum - 100) > 0.5 ? (
-                  <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
-                    Weights sum to {weightSum.toFixed(1)}% -- normalized proportionally to 100% for the simulation.
+                  <p className="mt-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+                    Weights sum to <b style={{ color: "var(--mf-fg)" }}>{weightSum.toFixed(1)}%</b> -- normalized proportionally to 100% for the simulation.
                   </p>
                 ) : null}
               </div>
@@ -441,8 +537,8 @@ export default function ComparePage() {
                     className="rounded-lg border px-2 py-1.5 text-sm"
                     style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
                   >
-                    <option>Lump Sum</option>
-                    <option>SIP (Monthly)</option>
+                    <option className="bg-white text-slate-900">Lump Sum</option>
+                    <option className="bg-white text-slate-900">SIP (Monthly)</option>
                   </select>
                 </label>
                 {invMode === "Lump Sum" ? (
@@ -481,7 +577,7 @@ export default function ComparePage() {
                     style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
                   >
                     {portfolio_sim_REBALANCE.map((r) => (
-                      <option key={r} value={r}>
+                      <option key={r} value={r} className="bg-white text-slate-900">
                         {r}
                       </option>
                     ))}
@@ -513,13 +609,65 @@ export default function ComparePage() {
                       value={btResultOk.money_weighted_xirr_pct !== null && btResultOk.money_weighted_xirr_pct !== undefined ? formatSignedPct(btResultOk.money_weighted_xirr_pct) : "N/A"}
                       sub="Actual annualized return given contribution timing"
                       tone={toneOf(btResultOk.money_weighted_xirr_pct ?? null)}
+                      tooltip={
+                        <FormulaTooltip
+                          label="XIRR"
+                          formula="\sum_{i=1}^n \frac{C_i}{(1 + r)^{t_i}} = 0"
+                          description="Internal Rate of Return taking into account the exact dates and amounts of every cash flow inflow/outflow."
+                        />
+                      }
                     />
                   </div>
                   <div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-4">
-                    <StatCard title="Time-Weighted CAGR" value={formatSignedPct(btResultOk.twr_metrics?.cagr_pct ?? null)} sub="Strategy return, excludes contribution timing" tone={toneOf(btResultOk.twr_metrics?.cagr_pct ?? null)} />
-                    <StatCard title="Sharpe Ratio (TWR)" value={btResultOk.twr_metrics?.sharpe_ratio !== null && btResultOk.twr_metrics?.sharpe_ratio !== undefined ? btResultOk.twr_metrics.sharpe_ratio.toFixed(4) : "N/A"} sub="Risk-adjusted return" />
-                    <StatCard title="Max Drawdown (TWR)" value={btResultOk.twr_metrics?.max_drawdown_pct !== null && btResultOk.twr_metrics?.max_drawdown_pct !== undefined ? `${btResultOk.twr_metrics.max_drawdown_pct.toFixed(4)}%` : "N/A"} sub="Deepest peak-to-trough decline" />
-                    <StatCard title="Volatility (TWR, Ann.)" value={btResultOk.twr_metrics?.vol_annualized_pct !== null && btResultOk.twr_metrics?.vol_annualized_pct !== undefined ? `${btResultOk.twr_metrics.vol_annualized_pct.toFixed(4)}%` : "N/A"} sub="Annualized standard deviation" />
+                    <StatCard
+                      title="Time-Weighted CAGR"
+                      value={formatSignedPct(btResultOk.twr_metrics?.cagr_pct ?? null)}
+                      sub="Strategy return, excludes contribution timing"
+                      tone={toneOf(btResultOk.twr_metrics?.cagr_pct ?? null)}
+                      tooltip={
+                        <FormulaTooltip
+                          label="TWR CAGR"
+                          formula="\left(\prod (1 + R_t)\right)^{\frac{365.25}{\text{Days}}} - 1"
+                          description="Compound Annual Growth Rate of the strategy portfolio, isolating underlying asset performance from investor deposit timing."
+                        />
+                      }
+                    />
+                    <StatCard
+                      title="Sharpe Ratio (TWR)"
+                      value={btResultOk.twr_metrics?.sharpe_ratio !== null && btResultOk.twr_metrics?.sharpe_ratio !== undefined ? btResultOk.twr_metrics.sharpe_ratio.toFixed(4) : "N/A"}
+                      sub="Risk-adjusted return"
+                      tooltip={
+                        <FormulaTooltip
+                          label="Sharpe Ratio"
+                          formula="\frac{R_p - R_f}{\sigma_p}"
+                          description="Excess annual portfolio return over risk-free rate divided by annualized portfolio volatility."
+                        />
+                      }
+                    />
+                    <StatCard
+                      title="Max Drawdown (TWR)"
+                      value={btResultOk.twr_metrics?.max_drawdown_pct !== null && btResultOk.twr_metrics?.max_drawdown_pct !== undefined ? `${btResultOk.twr_metrics.max_drawdown_pct.toFixed(4)}%` : "N/A"}
+                      sub="Deepest peak-to-trough decline"
+                      tooltip={
+                        <FormulaTooltip
+                          label="Max Drawdown"
+                          formula="\min_t \left(\frac{V_t - \max_{\tau \le t} V_\tau}{\max_{\tau \le t} V_\tau}\right)"
+                          description="Deepest historical portfolio peak-to-trough drop before establishing a new high."
+                        />
+                      }
+                    />
+                    <StatCard
+                      title="Volatility (TWR, Ann.)"
+                      value={btResultOk.twr_metrics?.vol_annualized_pct !== null && btResultOk.twr_metrics?.vol_annualized_pct !== undefined ? `${btResultOk.twr_metrics.vol_annualized_pct.toFixed(4)}%` : "N/A"}
+                      sub="Annualized standard deviation"
+                      tooltip={
+                        <FormulaTooltip
+                          label="Annualized Volatility"
+                          formula="\sigma_{\text{daily}} \times \sqrt{252}"
+                          description="Standard deviation of daily portfolio returns scaled by square root of 252 trading days."
+                        />
+                      }
+                    />
                   </div>
 
                   <div className="mt-6 flex gap-1.5">

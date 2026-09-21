@@ -1,9 +1,15 @@
 import datetime
+import math
+import threading
 import numpy as np
 import pandas as pd
+import scipy.stats as stats
 from typing import Dict, Any, Optional, Tuple, List
 from app.core.cache import cached
 from app.db.connection import get_connection, fetchdf
+
+_ts_cache: Dict[Tuple, Tuple[pd.DataFrame, Dict[str, Any]]] = {}
+_ts_cache_lock = threading.Lock()
 
 def calendar_day_cagr(cum_return: float, start_date, end_date) -> float:
     """Annualizes a cumulative return over its actual calendar-day span. Compounds for spans
@@ -56,6 +62,27 @@ def prepare_fund_timeseries(
     """
     if df_raw.empty or len(df_raw) < 2:
         return pd.DataFrame(), {"has_data": False}
+
+    try:
+        cache_key = (
+            len(df_raw),
+            str(df_raw["nav_date"].iloc[0]),
+            str(df_raw["nav_date"].iloc[-1]),
+            round(float(df_raw["nav"].iloc[0]), 4),
+            round(float(df_raw["nav"].iloc[-1]), 4),
+            str(start_date),
+            str(end_date),
+            rolling_window,
+            round(risk_free_rate_ann, 6),
+        )
+    except Exception:
+        cache_key = None
+
+    if cache_key is not None:
+        with _ts_cache_lock:
+            if cache_key in _ts_cache:
+                df_res, cov = _ts_cache[cache_key]
+                return df_res.copy(), dict(cov)
 
     df = df_raw.copy()
     df["nav_date"] = pd.to_datetime(df["nav_date"])
@@ -114,7 +141,179 @@ def prepare_fund_timeseries(
         "is_partial": is_partial
     }
 
+    if cache_key is not None:
+        with _ts_cache_lock:
+            if len(_ts_cache) > 200:
+                _ts_cache.clear()
+            _ts_cache[cache_key] = (df_window.copy(), dict(coverage))
+
     return df_window, coverage
+
+
+def cornish_fisher_var(returns: np.ndarray, alpha: float = 0.05) -> float:
+    """
+    Computes Cornish-Fisher expansion adjusted Value at Risk return quantile.
+    Adjusts standard Gaussian VaR quantile for sample skewness and excess kurtosis:
+      w_alpha = z_alpha + (z^2 - 1)*S/6 + (z^3 - 3z)*K/24 - (2z^3 - 5z)*S^2/36
+      VaR_CF = mu + w_alpha * sigma
+    Returns daily return quantile as a float (e.g. -0.018 for -1.8%).
+    """
+    if len(returns) < 3:
+        return 0.0
+    mu = float(np.mean(returns))
+    sigma = float(np.std(returns, ddof=1))
+    if sigma < 1e-12:
+        return mu
+
+    ret_s = pd.Series(returns)
+    s = float(ret_s.skew()) if not np.isnan(ret_s.skew()) else 0.0
+    k = float(ret_s.kurtosis()) if not np.isnan(ret_s.kurtosis()) else 0.0
+
+    z = float(stats.norm.ppf(alpha))
+    w = (
+        z
+        + ((z ** 2 - 1.0) * s) / 6.0
+        + ((z ** 3 - 3.0 * z) * k) / 24.0
+        - ((2.0 * z ** 3 - 5.0 * z) * (s ** 2)) / 36.0
+    )
+    if alpha < 0.5 and s < 0 and w >= z:
+        # Under extreme moments where quadratic terms invert the expansion (w >= z when skewness is negative),
+        # fall back to the linear skewness expansion so tail losses cannot become gains.
+        w = z + ((z ** 2 - 1.0) * s) / 6.0
+    return float(mu + w * sigma)
+
+
+def compute_drawdown_duration_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Computes comprehensive drawdown duration and recovery metrics:
+    - max_drawdown_pct: peak-to-trough worst drop percentage
+    - max_drawdown_peak_date, max_drawdown_trough_date, max_drawdown_recovery_date
+    - max_drawdown_peak_nav, max_drawdown_trough_nav
+    - drawdown_decline_days: calendar days from peak to trough
+    - drawdown_recovery_days: calendar days from trough to recovery (or None)
+    - drawdown_total_duration_days: calendar days from peak to recovery (or current)
+    - recovered: bool indicating if peak was restored
+    - longest_underwater_days: longest calendar-day underwater spell in history
+    - current_underwater_days: calendar days currently below high watermark
+    - is_currently_underwater: bool
+    """
+    if df.empty or len(df) < 2:
+        return {
+            "max_drawdown_pct": 0.0,
+            "max_drawdown_peak_date": None,
+            "max_drawdown_trough_date": None,
+            "max_drawdown_recovery_date": None,
+            "max_drawdown_peak_nav": None,
+            "max_drawdown_trough_nav": None,
+            "drawdown_decline_days": 0,
+            "drawdown_recovery_days": None,
+            "drawdown_total_duration_days": 0,
+            "recovered": True,
+            "longest_underwater_days": 0,
+            "current_underwater_days": 0,
+            "is_currently_underwater": False,
+        }
+
+    d = df.copy()
+    d["nav_date"] = pd.to_datetime(d["nav_date"])
+    d["nav"] = d["nav"].astype(float)
+    d = d.sort_values("nav_date").reset_index(drop=True)
+
+    d["peak_nav"] = d["nav"].cummax()
+    d["dd"] = (d["nav"] - d["peak_nav"]) / d["peak_nav"]
+
+    # Maximum drawdown trough
+    mdd_idx = int(d["dd"].idxmin())
+    mdd_val = float(d.loc[mdd_idx, "dd"])
+
+    if mdd_val >= -1e-6:
+        start_date_str = d["nav_date"].iloc[0].strftime("%Y-%m-%d")
+        end_date_str = d["nav_date"].iloc[-1].strftime("%Y-%m-%d")
+        first_nav = float(d["nav"].iloc[0])
+        return {
+            "max_drawdown_pct": 0.0,
+            "max_drawdown_peak_date": start_date_str,
+            "max_drawdown_trough_date": start_date_str,
+            "max_drawdown_recovery_date": end_date_str,
+            "max_drawdown_peak_nav": round(first_nav, 4),
+            "max_drawdown_trough_nav": round(first_nav, 4),
+            "drawdown_decline_days": 0,
+            "drawdown_recovery_days": 0,
+            "drawdown_total_duration_days": 0,
+            "recovered": True,
+            "longest_underwater_days": 0,
+            "current_underwater_days": 0,
+            "is_currently_underwater": False,
+        }
+
+    trough_date = d.loc[mdd_idx, "nav_date"]
+    trough_nav = float(d.loc[mdd_idx, "nav"])
+    peak_nav = float(d.loc[mdd_idx, "peak_nav"])
+
+    # Locate peak date before or at mdd_idx
+    prior_peaks = d.loc[:mdd_idx][d.loc[:mdd_idx, "nav"] >= peak_nav - 1e-6]
+    peak_date = prior_peaks.iloc[-1]["nav_date"] if not prior_peaks.empty else d.loc[0, "nav_date"]
+
+    # Locate recovery date after mdd_idx
+    post_recovery = d.loc[mdd_idx:][d.loc[mdd_idx:, "nav"] >= peak_nav - 1e-6]
+    if not post_recovery.empty:
+        recovery_date = post_recovery.iloc[0]["nav_date"]
+        recovered = True
+        recovery_days = int((recovery_date - trough_date).days)
+        total_duration = int((recovery_date - peak_date).days)
+        rec_str = recovery_date.strftime("%Y-%m-%d")
+    else:
+        recovery_date = None
+        recovered = False
+        recovery_days = None
+        total_duration = int((d["nav_date"].iloc[-1] - peak_date).days)
+        rec_str = None
+
+    decline_days = int((trough_date - peak_date).days)
+
+    # Underwater spells across entire history
+    longest_underwater_days = 0
+    current_episode_start = None
+    running_peak_val = -1.0
+    running_peak_dt = None
+
+    for i in range(len(d)):
+        cur_nav = float(d.loc[i, "nav"])
+        cur_dt = d.loc[i, "nav_date"]
+        if cur_nav >= running_peak_val - 1e-6:
+            if current_episode_start is not None and running_peak_dt is not None:
+                ep_days = int((cur_dt - running_peak_dt).days)
+                if ep_days > longest_underwater_days:
+                    longest_underwater_days = ep_days
+                current_episode_start = None
+            running_peak_val = cur_nav
+            running_peak_dt = cur_dt
+        else:
+            if current_episode_start is None:
+                current_episode_start = running_peak_dt
+
+    is_currently_underwater = current_episode_start is not None
+    current_underwater_days = 0
+    if is_currently_underwater and running_peak_dt is not None:
+        current_underwater_days = int((d["nav_date"].iloc[-1] - running_peak_dt).days)
+        if current_underwater_days > longest_underwater_days:
+            longest_underwater_days = current_underwater_days
+
+    return {
+        "max_drawdown_pct": round(mdd_val * 100.0, 4),
+        "max_drawdown_peak_date": peak_date.strftime("%Y-%m-%d"),
+        "max_drawdown_trough_date": trough_date.strftime("%Y-%m-%d"),
+        "max_drawdown_recovery_date": rec_str,
+        "max_drawdown_peak_nav": round(peak_nav, 4),
+        "max_drawdown_trough_nav": round(trough_nav, 4),
+        "drawdown_decline_days": decline_days,
+        "drawdown_recovery_days": recovery_days,
+        "drawdown_total_duration_days": total_duration,
+        "recovered": recovered,
+        "longest_underwater_days": longest_underwater_days,
+        "current_underwater_days": current_underwater_days,
+        "is_currently_underwater": is_currently_underwater,
+    }
 
 
 def compute_risk_adjusted_metrics(
@@ -161,7 +360,10 @@ def compute_risk_adjusted_metrics(
         downside_dev_ann = 1e-6
 
     # Sortino Ratio
-    sortino = (cagr - risk_free_rate_ann) / downside_dev_ann if downside_dev_ann > 1e-8 else 0.0
+    if vol_daily < 1e-8:
+        sortino = 0.0
+    else:
+        sortino = (cagr - risk_free_rate_ann) / downside_dev_ann if downside_dev_ann > 1e-8 else 0.0
 
     # Maximum Drawdown
     drawdown = df_clean["drawdown"].values
@@ -176,10 +378,21 @@ def compute_risk_adjusted_metrics(
     var_95_daily = np.percentile(returns, 5.0)
     var_99_daily = np.percentile(returns, 1.0)
     var_95_ann = var_95_daily * np.sqrt(252.0)
+    var_99_ann = var_99_daily * np.sqrt(252.0)
 
     tail_95 = returns[returns <= var_95_daily]
     cvar_95_daily = np.mean(tail_95) if len(tail_95) > 0 else var_95_daily
     cvar_95_ann = cvar_95_daily * np.sqrt(252.0)
+
+    tail_99 = returns[returns <= var_99_daily]
+    cvar_99_daily = np.mean(tail_99) if len(tail_99) > 0 else var_99_daily
+    cvar_99_ann = cvar_99_daily * np.sqrt(252.0)
+
+    # Cornish-Fisher Expansion Adjusted VaR
+    cf_var_95_daily = cornish_fisher_var(returns, 0.05)
+    cf_var_95_ann = cf_var_95_daily * np.sqrt(252.0)
+    cf_var_99_daily = cornish_fisher_var(returns, 0.01)
+    cf_var_99_ann = cf_var_99_daily * np.sqrt(252.0)
 
     # Higher Moments & Tail Risk
     ret_series = pd.Series(returns)
@@ -221,8 +434,15 @@ def compute_risk_adjusted_metrics(
         "var_95_daily_pct": var_95_daily * 100.0,
         "var_95_ann_pct": var_95_ann * 100.0,
         "var_99_daily_pct": var_99_daily * 100.0,
+        "var_99_ann_pct": float(round(var_99_ann * 100.0, 4)),
         "cvar_95_daily_pct": cvar_95_daily * 100.0,
         "cvar_95_ann_pct": cvar_95_ann * 100.0,
+        "cvar_99_daily_pct": float(round(cvar_99_daily * 100.0, 4)),
+        "cvar_99_ann_pct": float(round(cvar_99_ann * 100.0, 4)),
+        "cf_var_95_daily_pct": float(round(cf_var_95_daily * 100.0, 4)),
+        "cf_var_95_ann_pct": float(round(cf_var_95_ann * 100.0, 4)),
+        "cf_var_99_daily_pct": float(round(cf_var_99_daily * 100.0, 4)),
+        "cf_var_99_ann_pct": float(round(cf_var_99_ann * 100.0, 4)),
         "skewness": round(skew, 4),
         "kurtosis": round(kurt, 4),
         "win_rate_pct": round(win_rate, 2),
@@ -261,6 +481,7 @@ def compute_benchmark_relative_metrics(
     # Linear Regression (Beta and Alpha)
     cov_mat = np.cov(r_fund, r_bench)
     var_bench = cov_mat[1, 1]
+    bench_vol = np.sqrt(var_bench) * np.sqrt(252.0) * 100.0 if var_bench > 0 else 0.0
     cov_fb = cov_mat[0, 1]
 
     beta = cov_fb / var_bench if var_bench > 1e-10 else 1.0
@@ -323,6 +544,7 @@ def compute_benchmark_relative_metrics(
         "down_market_capture_pct": round(down_capture, 2),
         "capture_ratio": round(capture_ratio, 2) if not np.isnan(capture_ratio) else None,
         "benchmark_cagr_pct": round(bench_cagr * 100.0, 4),
+        "benchmark_vol_annualized_pct": round(bench_vol, 4),
         "excess_cagr_pct": round((fund_cagr - bench_cagr) * 100.0, 4),
         "common_trading_days": n_days,
         "regression_points": merged
@@ -370,7 +592,7 @@ def run_monte_carlo_simulation(
     calibrated on the scheme's empirical drift and volatility.
     Projects portfolio values for ₹100,000 initial capital over 252 trading days.
     """
-    if len(returns) < 10:
+    if len(returns) < 60:
         return {}
 
     mu = np.mean(returns)
@@ -431,14 +653,12 @@ def run_monte_carlo_simulation(
 def get_synthetic_category_benchmark(
     category: str,
     start_date: Optional[datetime.date] = None,
-    end_date: Optional[datetime.date] = None
+    end_date: Optional[datetime.date] = None,
+    exclude_scheme_code: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Synthesizes an institutional Category Benchmark by aggregating the daily average returns
-    of schemes within the exact same AMFI fund category.
-    Computes daily returns from a short lookback before start_date (so day 1 of the window still
-    has a valid day-over-day return) and stops at end_date, instead of scanning full multi-year
-    history for up to 50 schemes on every call.
+    of up to 50 Direct-Growth schemes in the same AMFI category, excluding the analysed scheme.
     """
     if not category:
         return pd.DataFrame()
@@ -449,11 +669,17 @@ def get_synthetic_category_benchmark(
     lookback_start = None
     if start_date:
         lookback_start = start_date - datetime.timedelta(days=10)
-    sql = """
+    exclude_clause = ""
+    params: list = [category]
+    if exclude_scheme_code is not None:
+        exclude_clause = "AND scheme_code <> %s"
+        params.append(int(exclude_scheme_code))
+    sql = f"""
         WITH category_schemes AS (
             SELECT scheme_code
             FROM schemes
-            WHERE category = ?
+            WHERE category = %s
+            {exclude_clause}
             ORDER BY
                 CASE WHEN plan_type = 'Direct' THEN 0 ELSE 1 END,
                 CASE WHEN option_type = 'Growth' THEN 0 ELSE 1 END
@@ -465,7 +691,7 @@ def get_synthetic_category_benchmark(
                    NULLIF(LAG(n.nav) OVER (PARTITION BY n.scheme_code ORDER BY n.nav_date), 0) as ret
             FROM nav_history n
             JOIN category_schemes cs ON n.scheme_code = cs.scheme_code
-            WHERE (? IS NULL OR n.nav_date >= ?) AND (? IS NULL OR n.nav_date <= ?)
+            WHERE (%s IS NULL OR n.nav_date >= %s) AND (%s IS NULL OR n.nav_date <= %s)
         )
         SELECT nav_date, AVG(ret) as daily_return
         FROM daily_diff
@@ -474,7 +700,7 @@ def get_synthetic_category_benchmark(
         ORDER BY nav_date ASC;
     """
     try:
-        df_bench = fetchdf(con.execute(sql, [category, lookback_start, lookback_start, end_date, end_date]))
+        df_bench = fetchdf(con.execute(sql, params + [lookback_start, lookback_start, end_date, end_date]))
     except Exception:
         df_bench = pd.DataFrame()
     finally:
@@ -492,3 +718,227 @@ def get_synthetic_category_benchmark(
             df_bench["cum_return"] = (df_bench["nav"] / df_bench["nav"].iloc[0]) - 1.0
             df_bench = compute_daily_returns(df_bench)
     return df_bench
+
+
+def compute_tail_risk_metrics(
+    df_fund: pd.DataFrame,
+    df_bench: Optional[pd.DataFrame] = None,
+    risk_free_rate_ann: float = 0.065,
+) -> Dict[str, Any]:
+    """
+    Institutional tail risk analytics suite:
+    - Parametric and Cornish-Fisher 95% & 99% VaR (daily & annualized)
+    - 95% & 99% Expected Shortfall (CVaR) (daily & annualized)
+    - Peak-to-trough-to-recovery drawdown metrics & underwater statistics
+    - Downside deviation & Sortino ratio
+    - Downside capture efficiency & capture ratios (if benchmark supplied)
+    """
+    if df_fund.empty:
+        return {}
+
+    df_clean = df_fund.dropna(subset=["daily_return"]).copy()
+    if len(df_clean) < 3:
+        return {}
+
+    returns = df_clean["daily_return"].values.astype(float)
+    navs = df_clean["nav"].values.astype(float)
+    n_days = len(returns)
+
+    rf_daily = (1.0 + risk_free_rate_ann) ** (1.0 / 252.0) - 1.0
+
+    # Empirical VaR and CVaR
+    var_95_daily = float(np.percentile(returns, 5.0))
+    var_99_daily = float(np.percentile(returns, 1.0))
+    var_95_ann = var_95_daily * np.sqrt(252.0)
+    var_99_ann = var_99_daily * np.sqrt(252.0)
+
+    tail_95 = returns[returns <= var_95_daily]
+    cvar_95_daily = float(np.mean(tail_95)) if len(tail_95) > 0 else var_95_daily
+    cvar_95_ann = cvar_95_daily * np.sqrt(252.0)
+
+    tail_99 = returns[returns <= var_99_daily]
+    cvar_99_daily = float(np.mean(tail_99)) if len(tail_99) > 0 else var_99_daily
+    cvar_99_ann = cvar_99_daily * np.sqrt(252.0)
+
+    # Cornish-Fisher adjusted VaR
+    cf_var_95_daily = cornish_fisher_var(returns, 0.05)
+    cf_var_99_daily = cornish_fisher_var(returns, 0.01)
+    cf_var_95_ann = cf_var_95_daily * np.sqrt(252.0)
+    cf_var_99_ann = cf_var_99_daily * np.sqrt(252.0)
+
+    # Higher moments
+    ret_series = pd.Series(returns)
+    skew = float(ret_series.skew()) if not np.isnan(ret_series.skew()) else 0.0
+    kurt = float(ret_series.kurtosis()) if not np.isnan(ret_series.kurtosis()) else 0.0
+
+    # Downside deviation & Sortino
+    downside_diff = returns[returns < rf_daily] - rf_daily
+    if len(downside_diff) > 0:
+        downside_dev_daily = float(np.sqrt(np.sum(downside_diff ** 2) / n_days))
+        downside_dev_ann = downside_dev_daily * np.sqrt(252.0)
+    else:
+        downside_dev_ann = 1e-6
+
+    total_ret = float((navs[-1] - navs[0]) / navs[0])
+    cagr = calendar_day_cagr(total_ret, df_clean["nav_date"].iloc[0], df_clean["nav_date"].iloc[-1])
+    sortino = (cagr - risk_free_rate_ann) / downside_dev_ann if downside_dev_ann > 1e-8 else 0.0
+
+    # Drawdown duration & recovery metrics
+    dd_metrics = compute_drawdown_duration_metrics(df_clean)
+
+    # Benchmark relative downside capture
+    bench_metrics = {}
+    if df_bench is not None and not df_bench.empty:
+        rel = compute_benchmark_relative_metrics(df_clean, df_bench, risk_free_rate_ann=risk_free_rate_ann)
+        if rel:
+            up_cap = rel.get("up_market_capture_pct", 100.0)
+            dn_cap = rel.get("down_market_capture_pct", 100.0)
+            cap_ratio = rel.get("capture_ratio")
+            dce = (up_cap / dn_cap) if dn_cap and abs(dn_cap) > 1e-6 else None
+            bench_metrics = {
+                "up_market_capture_pct": up_cap,
+                "down_market_capture_pct": dn_cap,
+                "capture_ratio": cap_ratio,
+                "downside_capture_efficiency": round(dce, 4) if dce is not None else None,
+                "beta": rel.get("beta"),
+                "tracking_error_pct": rel.get("tracking_error_pct"),
+            }
+
+    return {
+        "n_trading_days": n_days,
+        "skewness": round(skew, 4),
+        "kurtosis": round(kurt, 4),
+        "var_95_daily_pct": round(var_95_daily * 100.0, 4),
+        "var_95_ann_pct": round(var_95_ann * 100.0, 4),
+        "var_99_daily_pct": round(var_99_daily * 100.0, 4),
+        "var_99_ann_pct": round(var_99_ann * 100.0, 4),
+        "cvar_95_daily_pct": round(cvar_95_daily * 100.0, 4),
+        "cvar_95_ann_pct": round(cvar_95_ann * 100.0, 4),
+        "cvar_99_daily_pct": round(cvar_99_daily * 100.0, 4),
+        "cvar_99_ann_pct": round(cvar_99_ann * 100.0, 4),
+        "cf_var_95_daily_pct": round(cf_var_95_daily * 100.0, 4),
+        "cf_var_95_ann_pct": round(cf_var_95_ann * 100.0, 4),
+        "cf_var_99_daily_pct": round(cf_var_99_daily * 100.0, 4),
+        "cf_var_99_ann_pct": round(cf_var_99_ann * 100.0, 4),
+        "downside_dev_ann_pct": round(downside_dev_ann * 100.0, 4),
+        "sortino_ratio": round(sortino, 4),
+        "drawdown": dd_metrics,
+        "benchmark_capture": bench_metrics,
+    }
+
+
+def compute_cornish_fisher_var(
+    returns: np.ndarray,
+    confidence_levels: List[float] = [0.95, 0.99],
+) -> Dict[str, float]:
+    """Cornish-Fisher expansion adjusting VaR for skewness and excess kurtosis."""
+    clean = returns[~np.isnan(returns)]
+    if len(clean) < 5:
+        raise ValueError("Insufficient return data for Cornish-Fisher VaR calculation (need >= 5)")
+
+    mu = float(np.mean(clean))
+    sigma = float(np.std(clean, ddof=1))
+    if sigma < 1e-12:
+        return {f"var_{int(round(c * 100))}_cf_daily_pct": 0.0 for c in confidence_levels}
+
+    ret_s = pd.Series(clean)
+    s = float(ret_s.skew()) if not np.isnan(ret_s.skew()) else 0.0
+    k = float(ret_s.kurtosis()) if not np.isnan(ret_s.kurtosis()) else 0.0
+
+    out = {
+        "skewness": round(s, 4),
+        "kurtosis": round(k, 4),
+        "mean_daily_pct": round(mu * 100.0, 4),
+        "vol_daily_pct": round(sigma * 100.0, 4),
+    }
+
+    for alpha_conf in confidence_levels:
+        tag = int(round(alpha_conf * 100))
+        p = 1.0 - alpha_conf
+        z = float(stats.norm.ppf(p))
+        var_cf_raw = cornish_fisher_var(clean, alpha=p)
+        var_cf_daily = -var_cf_raw
+        var_cf_ann = var_cf_daily * math.sqrt(252.0)
+        var_gaussian = -(mu + z * sigma)
+
+        out[f"var_{tag}_cf_daily_pct"] = round(float(var_cf_daily * 100.0), 4)
+        out[f"var_{tag}_cf_ann_pct"] = round(float(var_cf_ann * 100.0), 4)
+        out[f"var_{tag}_gaussian_daily_pct"] = round(float(var_gaussian * 100.0), 4)
+        out[f"var_{tag}_conservative_premium_pct"] = round(float((var_cf_daily - var_gaussian) * 100.0), 4)
+
+    return out
+
+
+def compute_expected_shortfall_and_capture(
+    fund_returns: np.ndarray,
+    bench_returns: Optional[np.ndarray] = None,
+    nav_series: Optional[pd.Series] = None,
+    confidence_level: float = 0.99,
+) -> Dict[str, Any]:
+    """Calculates 99% CVaR (Expected Shortfall), drawdown duration/recovery, and downside capture efficiency."""
+    clean_f = fund_returns[~np.isnan(fund_returns)]
+    if len(clean_f) < 5:
+        raise ValueError("Insufficient data points for CVaR")
+
+    # 1. CVaR / Expected Shortfall
+    p_cutoff = (1.0 - confidence_level) * 100.0
+    var_threshold = float(np.percentile(clean_f, p_cutoff))
+    tail = clean_f[clean_f <= var_threshold]
+    cvar_daily = float(np.mean(tail)) if len(tail) > 0 else var_threshold
+    cvar_ann = cvar_daily * math.sqrt(252.0)
+
+    # 2. Maximum Drawdown duration & recovery if nav_series given
+    dd_metrics = {
+        "max_drawdown_pct": 0.0,
+        "drawdown_duration_days": 0,
+        "recovery_duration_days": None,
+        "peak_date": None,
+        "trough_date": None,
+    }
+    if nav_series is not None and len(nav_series) > 2:
+        df_nav = pd.DataFrame({"nav_date": pd.to_datetime(nav_series.index), "nav": nav_series.values})
+        dd_res = compute_drawdown_duration_metrics(df_nav)
+        dd_metrics = {
+            "max_drawdown_pct": dd_res["max_drawdown_pct"],
+            "drawdown_duration_days": dd_res["drawdown_decline_days"],
+            "recovery_duration_days": dd_res["drawdown_recovery_days"],
+            "peak_date": dd_res["max_drawdown_peak_date"],
+            "trough_date": dd_res["max_drawdown_trough_date"],
+        }
+
+    # 3. Downside capture efficiency
+    capture_metrics = {
+        "downside_capture_ratio": 1.0,
+        "upside_capture_ratio": 1.0,
+        "capture_efficiency": 1.0,
+    }
+    if bench_returns is not None and len(bench_returns) == len(clean_f):
+        df_cb = pd.DataFrame({"fund": clean_f, "bench": bench_returns}).dropna()
+        down_days = df_cb[df_cb["bench"] < 0]
+        up_days = df_cb[df_cb["bench"] > 0]
+
+        if len(down_days) > 0:
+            fund_down_comp = float(np.prod(1.0 + down_days["fund"]) - 1.0)
+            bench_down_comp = float(np.prod(1.0 + down_days["bench"]) - 1.0)
+            if abs(bench_down_comp) > 1e-8:
+                capture_metrics["downside_capture_ratio"] = round((fund_down_comp / bench_down_comp) * 100.0, 2)
+
+        if len(up_days) > 0:
+            fund_up_comp = float(np.prod(1.0 + up_days["fund"]) - 1.0)
+            bench_up_comp = float(np.prod(1.0 + up_days["bench"]) - 1.0)
+            if abs(bench_up_comp) > 1e-8:
+                capture_metrics["upside_capture_ratio"] = round((fund_up_comp / bench_up_comp) * 100.0, 2)
+
+        if capture_metrics["downside_capture_ratio"] > 1e-4:
+            capture_metrics["capture_efficiency"] = round(
+                capture_metrics["upside_capture_ratio"] / capture_metrics["downside_capture_ratio"], 4
+            )
+
+    return {
+        "cvar_99_daily_pct": round(float(cvar_daily * 100.0), 4),
+        "cvar_99_ann_pct": round(float(cvar_ann * 100.0), 4),
+        "var_99_daily_pct": round(float(var_threshold * 100.0), 4),
+        "drawdown_metrics": dd_metrics,
+        "capture_metrics": capture_metrics,
+    }
+

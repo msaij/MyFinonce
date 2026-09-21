@@ -9,12 +9,134 @@ import pandas as pd
 from app.amfi_client import AmfiClient
 from app.amfi_ter_client import AmfiTerClient, TER_PORTAL_PAGE_URL
 from app.core.config import settings
+from app.db import bulk
 from app.db import queries as db
-from app.db.connection import write_staging_table
 from app import costs_data
 
 logger = logging.getLogger("amfi_sync")
 logger.setLevel(logging.INFO)
+
+# --- The one AMFI merge path ------------------------------------------------
+# Every AMFI feed (daily NAVAll.txt, a historical backfill chunk, a single AMC's
+# 90-day history) parses into the same shape -- scheme metadata plus NAV points --
+# so all three share one merge, rather than the three byte-identical copies of a
+# staging-table merge they each used to carry.
+
+SCHEME_COLUMNS = [
+    "scheme_code", "scheme_name", "fund_house", "category", "plan_type",
+    "option_type", "isin", "expense_ratio", "ter_status", "ter_source",
+    "ter_source_url", "ter_as_of_date",
+]
+
+# How an existing scheme row is reconciled with a freshly-downloaded one. Two
+# rules matter here and both are load-bearing:
+#   * AMFI's per-file headers don't always carry fund_house/category (a chunk
+#     download can omit the AMC banner lines), so a blank incoming value must
+#     not erase a good stored one.
+#   * An 'official' TER comes from AMFI's dated Regulation 66 disclosure portal;
+#     the value derived from scheme name/category is a fallback. Official must
+#     never be overwritten by derived.
+# Expressed as ON CONFLICT DO UPDATE expressions, this handles insert-or-update
+# in one statement -- replacing the old UPDATE-then-INSERT-what's-missing pair.
+SCHEME_UPDATE = {
+    "scheme_name": "excluded.scheme_name",
+    "fund_house": "CASE WHEN excluded.fund_house IS NOT NULL AND excluded.fund_house != ''"
+                  " THEN excluded.fund_house ELSE schemes.fund_house END",
+    "category": "CASE WHEN excluded.category IS NOT NULL AND excluded.category != ''"
+                " THEN excluded.category ELSE schemes.category END",
+    "plan_type": "excluded.plan_type",
+    "option_type": "excluded.option_type",
+    "isin": "COALESCE(excluded.isin, schemes.isin)",
+    "expense_ratio": "CASE WHEN schemes.ter_status = 'official'"
+                     " THEN schemes.expense_ratio ELSE excluded.expense_ratio END",
+    "ter_status": "CASE WHEN schemes.ter_status = 'official'"
+                  " THEN schemes.ter_status ELSE excluded.ter_status END",
+    "ter_source": "CASE WHEN schemes.ter_status = 'official'"
+                  " THEN schemes.ter_source ELSE excluded.ter_source END",
+    "ter_source_url": "CASE WHEN schemes.ter_status = 'official'"
+                      " THEN schemes.ter_source_url ELSE excluded.ter_source_url END",
+    "ter_as_of_date": "CASE WHEN schemes.ter_status = 'official'"
+                      " THEN schemes.ter_as_of_date ELSE excluded.ter_as_of_date END",
+}
+
+
+def _scheme_rows(schemes_dict: Dict[int, dict]) -> List[tuple]:
+    """Flattens parsed scheme metadata into SCHEME_COLUMNS order, merging in the
+    derived cost specs. Plain tuples, not a DataFrame: these go straight into
+    executemany, and the DataFrame round-trip in between bought nothing."""
+    rows = []
+    for s in schemes_dict.values():
+        specs = costs_data.get_scheme_cost_specs(
+            s["scheme_code"], s["scheme_name"], s["category"], s["plan_type"]
+        )
+        rows.append((
+            s["scheme_code"], s["scheme_name"], s["fund_house"], s["category"],
+            s["plan_type"], s["option_type"], s["isin"],
+            specs.get("expense_ratio"), specs.get("ter_status"),
+            specs.get("ter_source"), specs.get("ter_source_url"),
+            specs.get("ter_as_of_date"),
+        ))
+    return rows
+
+
+def _dedupe_nav(nav_rows: List[tuple]) -> List[tuple]:
+    """Collapses duplicate (scheme_code, nav_date) points -- last one wins, matching
+    the previous drop_duplicates() -- and returns them sorted by primary key.
+
+    The sort is not cosmetic: rows arrive grouped by AMC, so NAV points for one
+    scheme are scattered across the file by date. Feeding them to the upsert in
+    primary-key order turns what would be random probes all over the nav_history
+    B-tree into a near-sequential walk, so the pages a batch touches stay hot in
+    the page cache instead of being faulted in and out one row at a time. Costs a
+    fraction of a second in Python; saves far more than that in page churn on a
+    table heading for millions of rows."""
+    deduped = {(code, date): (code, date, nav) for code, date, nav in nav_rows}
+    return sorted(deduped.values())
+
+
+def _merge_amfi_payload(
+    schemes_dict: Dict[int, dict],
+    nav_rows: List[tuple],
+    label: str,
+    should_stop: Optional[Any] = None,
+) -> Tuple[int, int]:
+    """Merges one parsed AMFI payload into schemes + nav_history.
+
+    Two primary-key upserts, no staging tables, no joins -- see db/bulk.py for
+    why the staging-table merge this replaced was quadratic. Returns
+    (schemes written, NAV rows written)."""
+    scheme_rows = _scheme_rows(schemes_dict)
+    nav_final = _dedupe_nav(nav_rows)
+
+    con = db.get_connection()
+    try:
+        sch = bulk.upsert(
+            con,
+            table="schemes",
+            columns=SCHEME_COLUMNS,
+            conflict_columns=["scheme_code"],
+            rows=scheme_rows,
+            update=SCHEME_UPDATE,
+            label=f"{label} schemes",
+        )
+        nav = bulk.upsert(
+            con,
+            table="nav_history",
+            columns=["scheme_code", "nav_date", "nav"],
+            conflict_columns=["scheme_code", "nav_date"],
+            rows=nav_final,
+            # A re-downloaded NAV point should reflect AMFI's current value (they
+            # do restate), but re-writing an identical value would still dirty the
+            # page and grow the WAL -- so skip the no-op case. IS DISTINCT FROM
+            # correctly handles NULLs and is valid PostgreSQL syntax.
+            update={"nav": "excluded.nav"},
+            update_where="nav_history.nav IS DISTINCT FROM excluded.nav",
+            label=f"{label} nav",
+            should_stop=should_stop,
+        )
+        return sch.rows_written, nav.rows_written
+    finally:
+        con.close()
 
 # --- SYNC HEALTH HISTORY (surfaced on the Data Management page) ---
 _SYNC_HISTORY_LOCK = threading.Lock()
@@ -124,107 +246,29 @@ def _sync_daily_nav_impl() -> Tuple[bool, str]:
     if not nav_rows:
         return False, "No valid NAV rows parsed from AMFI daily feed."
 
-    df_stg_schemes = pd.DataFrame([
-        {
-            "scheme_code": s["scheme_code"],
-            "scheme_name": s["scheme_name"],
-            "fund_house": s["fund_house"],
-            "category": s["category"],
-            "plan_type": s["plan_type"],
-            "option_type": s["option_type"],
-            "isin": s["isin"],
-            **costs_data.get_scheme_cost_specs(s["scheme_code"], s["scheme_name"], s["category"], s["plan_type"])
-        }
-        for s in schemes_dict.values()
-    ])
-
-    df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
-    df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
-
-    con = db.get_connection()
     try:
-        write_staging_table(con, "stg_schemes", df_stg_schemes)
-        write_staging_table(con, "stg_nav", df_stg_nav)
-
-        # 1. Update existing schemes with latest metadata. Correlated subqueries, not
-        # UPDATE...FROM (portability across SQLite builds -- see db/queries.py's init_db()
-        # for the same pattern/rationale).
-        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
-        con.execute(f"""
-            UPDATE schemes
-            SET scheme_name = {_sub('scheme_name')},
-                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
-                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
-                plan_type = {_sub('plan_type')},
-                option_type = {_sub('option_type')},
-                isin = COALESCE({_sub('isin')}, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
-            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
-        """)
-
-        # 2. Insert brand new schemes
-        con.execute("""
-            INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
-            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type, s.isin, s.expense_ratio, s.ter_status, s.ter_source, s.ter_source_url, s.ter_as_of_date, s.exit_load_pct, s.exit_load_days, s.exit_load_description, s.exit_rule_json, s.exit_rule_status, s.exit_rule_source, s.exit_rule_source_url, s.exit_rule_as_of_date, s.lock_in_years
-            FROM stg_schemes s
-            WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
-        """)
-
-        # 3. Replace matching nav_history records (to avoid duplicate keys)
-        con.execute("""
-            DELETE FROM nav_history
-            WHERE EXISTS (
-                SELECT 1 FROM stg_nav
-                WHERE nav_history.scheme_code = stg_nav.scheme_code
-                  AND nav_history.nav_date = stg_nav.nav_date
-            );
-        """)
-
-        # 4. Insert latest daily NAV records
-        con.execute("""
-            INSERT INTO nav_history (scheme_code, nav_date, nav)
-            SELECT scheme_code, nav_date, nav
-            FROM stg_nav;
-        """)
-
-        con.execute("DROP TABLE IF EXISTS stg_schemes")
-        con.execute("DROP TABLE IF EXISTS stg_nav")
-        con.close()
-
-        # Refresh materialized summary table
-        db.refresh_summary_table()
-        msg = f"Successfully synced {len(df_stg_nav):,} NAV records across {len(df_stg_schemes):,} schemes!"
-        logger.info(msg)
-        return True, msg
+        n_schemes, n_nav = _merge_amfi_payload(schemes_dict, nav_rows, label="daily")
     except Exception as e:
         logger.error(f"Error updating database: {e}")
-        con.close()
         return False, str(e)
+
+    # Refresh materialized summary table
+    db.refresh_summary_table()
+    msg = f"Successfully synced {n_nav:,} NAV records across {n_schemes:,} schemes!"
+    logger.info(msg)
+    return True, msg
 
 
 def sync_official_ter(_trigger: str = "manual", months: Optional[List[str]] = None) -> Tuple[bool, str]:
     """Fetches AMFI's official, dated TER-portal disclosure (SEBI Regulation 66) and promotes
-    matched schemes' current TER to 'official' status — the automated, continuously-refreshed
-    counterpart to the manual CSV importer, run on the same daily cadence as sync_daily_nav().
+    matched schemes' current TER to 'official' status, run on the same daily cadence as
+    sync_daily_nav().
 
     Unlike sync_daily_nav(), this does NOT hold db.WRITE_LOCK for its whole duration: the
     AMFI TER API caps pageSize at 100, so covering one calendar month can take hundreds of
     sequential HTTP requests (multiple minutes by month-end) — holding WRITE_LOCK across all
-    of that would block every other writer (a manual "Sync Now" click, a cost import) for the
-    whole fetch. Only the two actual DB-mutating calls inside (db.upsert_ter_history,
+    of that would block every other writer (a manual "Sync Now" click) for the whole fetch.
+    Only the two actual DB-mutating calls inside (db.upsert_ter_history,
     db.apply_latest_official_ter) take WRITE_LOCK, and only for their own brief duration.
     """
     try:
@@ -236,12 +280,26 @@ def sync_official_ter(_trigger: str = "manual", months: Optional[List[str]] = No
     return success, msg
 
 def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, str]:
-    months = months or [AmfiTerClient.current_month_str()]
     client = AmfiTerClient()
+    recent = AmfiTerClient.recent_months(2)
+    if months is None:
+        con = db.get_connection()
+        try:
+            has_recent_ter = con.execute(
+                "SELECT 1 FROM ter_history WHERE ter_date >= (CURRENT_DATE - INTERVAL '60 days') LIMIT 1;"
+            ).fetchone() is not None
+        except Exception:
+            has_recent_ter = False
+        finally:
+            con.close()
+        months_to_try = [recent[0]] if has_recent_ter else recent
+    else:
+        months_to_try = months
 
     # 1. Fetch and validate every row across the requested months.
     parsed_rows: List[Dict[str, Any]] = []
-    for month in months:
+    months_fetched: List[str] = []
+    for month in months_to_try:
         month_count = 0
         for raw_row in client.fetch_month(month):
             parsed = AmfiTerClient.parse_row(raw_row)
@@ -249,28 +307,70 @@ def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, s
                 parsed_rows.append(parsed)
                 month_count += 1
         logger.info(f"AMFI TER portal: fetched {month_count:,} valid rows for {month}.")
+        if month_count > 0:
+            months_fetched.append(month)
+
+    # Fallback to previous month if single current-month fetch was empty (e.g. 1st/2nd of month)
+    if not parsed_rows and months is None and len(months_to_try) == 1:
+        fallback_month = recent[1]
+        logger.info(f"Current month {months_to_try[0]} had no disclosures; falling back to {fallback_month}...")
+        for raw_row in client.fetch_month(fallback_month):
+            parsed = AmfiTerClient.parse_row(raw_row)
+            if parsed:
+                parsed_rows.append(parsed)
+        if parsed_rows:
+            months_fetched.append(fallback_month)
 
     if not parsed_rows:
         return False, "AMFI TER portal returned no usable data (fetch failed, or empty response)."
 
-    # 2. Group by the underlying scheme (NSDL code) and compute its normalized name — the
-    # same normalization costs_data.py already applies to the bundled legacy CSV.
-    by_nsdl: Dict[str, List[Dict[str, Any]]] = {}
+    # 2. Group by underlying scheme: use NSDL code when present, or normalized scheme name
+    # when missing (June 2018 - Oct 2024 historical disclosures lacked NSDL codes).
+    by_scheme_key: Dict[str, List[Dict[str, Any]]] = {}
     for row in parsed_rows:
-        by_nsdl.setdefault(row["nsdl_scheme_code"], []).append(row)
+        nsdl = (row.get("nsdl_scheme_code") or "").strip()
+        if nsdl:
+            key = f"NSDL:{nsdl}"
+        else:
+            norm_name = costs_data.normalize_scheme_name(row["scheme_name"])
+            key = f"NAME:{norm_name}"
+        by_scheme_key.setdefault(key, []).append(row)
 
-    name_to_nsdl: Dict[str, set] = {}
-    for nsdl_code, rows in by_nsdl.items():
+    name_to_keys: Dict[str, set] = {}
+    for key, rows in by_scheme_key.items():
         name = costs_data.normalize_scheme_name(rows[0]["scheme_name"])
         if name:
-            name_to_nsdl.setdefault(name, set()).add(nsdl_code)
+            name_to_keys.setdefault(name, set()).add(key)
 
-    # Only accept a name AMFI's own portal reports as exactly one distinct scheme — the same
-    # "unambiguous match or skip" discipline costs_data._unique_legacy_ter() already applies.
-    unambiguous_names = {name for name, codes in name_to_nsdl.items() if len(codes) == 1}
-    ambiguous_count = len(name_to_nsdl) - len(unambiguous_names)
+    # Accept unambiguous names, as well as names where multiple option codes (e.g. Growth & IDCW)
+    # report identical/consistent TER disclosures, or historical transitions from name to NSDL code.
+    unambiguous_names = set()
+    for name, keys in name_to_keys.items():
+        if len(keys) == 1:
+            unambiguous_names.add(name)
+        else:
+            # Check for conflict across keys on any shared/overlapping dates
+            date_to_ters: Dict[datetime.date, Tuple[float, float]] = {}
+            is_consistent = True
+            for k in keys:
+                for r in by_scheme_key[k]:
+                    dt = r["ter_date"]
+                    cur_ters = (r.get("d_ter", 0.0), r.get("r_ter", 0.0))
+                    if dt in date_to_ters:
+                        prev_ters = date_to_ters[dt]
+                        if abs(prev_ters[0] - cur_ters[0]) > 0.005 or abs(prev_ters[1] - cur_ters[1]) > 0.005:
+                            is_consistent = False
+                            break
+                    else:
+                        date_to_ters[dt] = cur_ters
+                if not is_consistent:
+                    break
+            if is_consistent:
+                unambiguous_names.add(name)
+
+    ambiguous_count = len(name_to_keys) - len(unambiguous_names)
     if ambiguous_count:
-        logger.info(f"AMFI TER sync: skipping {ambiguous_count} scheme name(s) that were ambiguous on AMFI's own portal.")
+        logger.info(f"AMFI TER sync: skipping {ambiguous_count} scheme name(s) with conflicting disclosures on AMFI's portal.")
 
     # 3. Match against our own scheme universe by the same normalized name.
     identity = db.get_scheme_identity_map()
@@ -288,14 +388,18 @@ def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, s
         our_matches = our_groups.get(name)
         if our_matches is None or our_matches.empty:
             continue
-        nsdl_code = next(iter(name_to_nsdl[name]))
-        date_rows = sorted(by_nsdl[nsdl_code], key=lambda r: r["ter_date"])
+        merged_by_date = {}
+        for key in name_to_keys[name]:
+            for dr in by_scheme_key[key]:
+                merged_by_date[dr["ter_date"]] = dr
+        date_rows = sorted(merged_by_date.values(), key=lambda r: r["ter_date"])
 
         for _, our_row in our_matches.iterrows():
-            plan = (our_row["plan_type"] or "").strip().lower()
-            if plan == "direct":
+            raw_plan = str(our_row["plan_type"] or "").strip().lower()
+            raw_name = str(our_row["scheme_name"] or "").strip().lower()
+            if "direct" in raw_plan or "direct" in raw_name:
                 prefix = "d_"
-            elif plan == "regular":
+            elif "regular" in raw_plan or "regular" in raw_name:
                 prefix = "r_"
             else:
                 continue  # Unrecognized plan type — never guess which column applies.
@@ -316,7 +420,7 @@ def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, s
 
             latest = date_rows[-1]
             existing = latest_by_scheme.get(scheme_code)
-            if existing is None or latest["ter_date"] > existing["ter_date"]:
+            if existing is None or latest["ter_date"] >= existing["ter_date"]:
                 latest_by_scheme[scheme_code] = {
                     "scheme_code": scheme_code,
                     "ter_date": latest["ter_date"],
@@ -339,8 +443,8 @@ def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, s
     result = db.apply_latest_official_ter(df_latest)
 
     msg = (
-        f"Matched {len(matched_scheme_codes):,} schemes across {len(months)} month(s) "
-        f"({', '.join(months)}); stored {n_history:,} dated TER records; "
+        f"Matched {len(matched_scheme_codes):,} schemes across {len(months_fetched)} month(s) "
+        f"({', '.join(months_fetched)}); stored {n_history:,} dated TER records; "
         f"refreshed current TER for {result['updated']:,} schemes."
     )
     logger.info(f"AMFI TER sync: {msg}")
@@ -349,12 +453,16 @@ def _sync_official_ter_impl(months: Optional[List[str]] = None) -> Tuple[bool, s
 
 # --- HISTORICAL TER BACKFILL (deeper reach than the daily current-month sync) ---
 
+TER_BACKFILL_JOB = "historical_ter_backfill"
+
 TER_BACKFILL_STATE = {
     "is_running": False,
     "should_stop": False,
     "total_months": 0,
     "current_month_idx": 0,
     "current_month_str": "",
+    "skipped_months": 0,
+    "records_added": 0,
     "last_error": None,
     "started_at": None,
     "finished_at": None,
@@ -367,52 +475,110 @@ def get_ter_backfill_status() -> dict:
 
 def stop_ter_backfill():
     """Signals a running TER backfill to halt after its in-flight month finishes — mirrors
-    stop_historical_backfill() below. Deliberately unconditional (no is_running guard) — see
-    fetcher/amfi_sync.py's identical function for the full rationale (a module-reload-adjacent
-    class of staleness doesn't apply here the same way FastAPI doesn't hot-reload per-request,
-    but the unconditional/harmless-when-idle behavior is kept identical on both sides so the two
-    codebases don't silently diverge in behavior during the migration)."""
+    stop_historical_backfill() below. Deliberately unconditional (no is_running guard)."""
     with _TER_BACKFILL_LOCK:
         TER_BACKFILL_STATE["should_stop"] = True
 
-def _ter_backfill_worker(n_months: int):
+def clear_ter_backfill_checkpoints() -> int:
+    """Clears all historical TER backfill checkpoints so the next run reprocesses all months."""
+    con = db.get_connection()
+    try:
+        return bulk.clear_checkpoints(con, TER_BACKFILL_JOB)
+    finally:
+        con.close()
+
+def _ter_backfill_worker(n_months: int, resume: bool = True):
     global TER_BACKFILL_STATE
-    months = AmfiTerClient.recent_months(n_months)
+    all_months = AmfiTerClient.recent_months(n_months)
+
+    con = db.get_connection()
+    try:
+        completed = bulk.completed_units(con, TER_BACKFILL_JOB) if resume else set()
+    finally:
+        con.close()
+
+    pending = [m for m in all_months if m not in completed]
+    skipped = len(all_months) - len(pending)
+
     with _TER_BACKFILL_LOCK:
         TER_BACKFILL_STATE.update({
-            "is_running": True, "should_stop": False, "total_months": len(months), "current_month_idx": 0,
-            "last_error": None, "started_at": time.time(), "finished_at": None,
+            "is_running": True,
+            "should_stop": False,
+            "total_months": len(all_months),
+            "current_month_idx": 0,
+            "current_month_str": "",
+            "skipped_months": skipped,
+            "records_added": 0,
+            "last_error": None,
+            "started_at": time.time(),
+            "finished_at": None,
         })
+
+    if skipped:
+        logger.info(f"Starting historical TER backfill: {len(pending)} month(s) to process "
+                    f"({skipped} already completed in previous run -- resuming, not redoing).")
+    else:
+        logger.info(f"Starting historical TER backfill: {len(pending)} month(s) to process.")
+
     stopped_early = False
-    for i, month in enumerate(months):
+    for i, month in enumerate(pending):
         with _TER_BACKFILL_LOCK:
             if TER_BACKFILL_STATE["should_stop"]:
                 stopped_early = True
                 break
             TER_BACKFILL_STATE["current_month_idx"] = i + 1
             TER_BACKFILL_STATE["current_month_str"] = month
+
         try:
-            sync_official_ter(_trigger="backfill", months=[month])
+            success, msg = sync_official_ter(_trigger="backfill", months=[month])
+            stopped = False
+            with _TER_BACKFILL_LOCK:
+                stopped = TER_BACKFILL_STATE["should_stop"]
+
+            if success and not stopped:
+                con = db.get_connection()
+                try:
+                    bulk.checkpoint_mark(con, TER_BACKFILL_JOB, month, "done")
+                finally:
+                    con.close()
+            elif not success:
+                con = db.get_connection()
+                try:
+                    bulk.checkpoint_mark(con, TER_BACKFILL_JOB, month, "failed", detail=msg[:500])
+                finally:
+                    con.close()
         except Exception as e:
             logger.error(f"Error backfilling TER for {month}: {e}")
             with _TER_BACKFILL_LOCK:
                 TER_BACKFILL_STATE["last_error"] = str(e)
+            try:
+                con = db.get_connection()
+                try:
+                    bulk.checkpoint_mark(con, TER_BACKFILL_JOB, month, "failed", detail=str(e)[:500])
+                finally:
+                    con.close()
+            except Exception:
+                pass
+
+        time.sleep(0.2)
+
     with _TER_BACKFILL_LOCK:
         TER_BACKFILL_STATE["is_running"] = False
         TER_BACKFILL_STATE["finished_at"] = time.time()
-    if stopped_early:
-        logger.info(f"TER historical backfill stopped by user request after {TER_BACKFILL_STATE['current_month_idx']} of {len(months)} month(s).")
-    else:
-        logger.info(f"TER historical backfill completed for {len(months)} month(s).")
 
-def start_ter_backfill(n_months: int = 12) -> bool:
-    """Launches a deeper historical TER backfill (default: the trailing 12 calendar months,
-    AMFI's portal reaches back to FY2018-19) in a background worker thread — the daily sync
-    only ever covers the current month, so this is how older months get filled in on demand."""
+    if stopped_early:
+        logger.info(f"TER historical backfill stopped by user request after {TER_BACKFILL_STATE['current_month_idx']} of {len(pending)} month(s).")
+    else:
+        logger.info(f"TER historical backfill completed for {len(pending)} month(s).")
+
+def start_ter_backfill(n_months: int = 12, resume: bool = True) -> bool:
+    """Launches a deeper historical TER backfill in a background worker thread with durable checkpointing."""
     with _TER_BACKFILL_LOCK:
         if TER_BACKFILL_STATE["is_running"]:
             return False
-    t = threading.Thread(target=_ter_backfill_worker, args=(n_months,), daemon=True)
+    if not resume:
+        clear_ter_backfill_checkpoints()
+    t = threading.Thread(target=_ter_backfill_worker, args=(n_months, resume), daemon=True)
     t.start()
     return True
 
@@ -447,83 +613,10 @@ def _sync_amc_90d_history_impl(mf_id: int, amc_name: str, days: int = 90) -> Tup
     if not nav_rows:
         return 0, 0
 
-    df_stg_schemes = pd.DataFrame([
-        {
-            "scheme_code": s["scheme_code"],
-            "scheme_name": s["scheme_name"],
-            "fund_house": s["fund_house"],
-            "category": s["category"],
-            "plan_type": s["plan_type"],
-            "option_type": s["option_type"],
-            "isin": s["isin"],
-            **costs_data.get_scheme_cost_specs(s["scheme_code"], s["scheme_name"], s["category"], s["plan_type"])
-        }
-        for s in schemes_dict.values()
-    ])
-
-    df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
-    df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
-
-    con = db.get_connection()
     try:
-        write_staging_table(con, "stg_schemes", df_stg_schemes)
-        write_staging_table(con, "stg_nav", df_stg_nav)
-
-        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
-        con.execute(f"""
-            UPDATE schemes
-            SET scheme_name = {_sub('scheme_name')},
-                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
-                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
-                plan_type = {_sub('plan_type')},
-                option_type = {_sub('option_type')},
-                isin = COALESCE({_sub('isin')}, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
-            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
-        """)
-
-        con.execute("""
-            INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
-            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type, s.isin, s.expense_ratio, s.ter_status, s.ter_source, s.ter_source_url, s.ter_as_of_date, s.exit_load_pct, s.exit_load_days, s.exit_load_description, s.exit_rule_json, s.exit_rule_status, s.exit_rule_source, s.exit_rule_source_url, s.exit_rule_as_of_date, s.lock_in_years
-            FROM stg_schemes s
-            WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
-        """)
-
-        con.execute("""
-            DELETE FROM nav_history
-            WHERE EXISTS (
-                SELECT 1 FROM stg_nav
-                WHERE nav_history.scheme_code = stg_nav.scheme_code
-                  AND nav_history.nav_date = stg_nav.nav_date
-            );
-        """)
-
-        con.execute("""
-            INSERT INTO nav_history (scheme_code, nav_date, nav)
-            SELECT scheme_code, nav_date, nav
-            FROM stg_nav;
-        """)
-
-        con.execute("DROP TABLE IF EXISTS stg_schemes")
-        con.execute("DROP TABLE IF EXISTS stg_nav")
-        con.close()
-        return len(df_stg_schemes), len(df_stg_nav)
+        return _merge_amfi_payload(schemes_dict, nav_rows, label=f"amc {amc_name}")
     except Exception as e:
         logger.error(f"Error updating database for AMC {amc_name}: {e}")
-        con.close()
         return 0, 0
 
 
@@ -666,10 +759,9 @@ def ensure_sync_daemon_running():
     regardless of which page/request accesses the app first.
 
     GATED behind settings.enable_sync_daemon (default True) -- see
-    app/core/config.py. This backend owns its SQLite file exclusively (no
-    other process ever touches it -- see app/db/connection.py's module
-    docstring), so the flag is no longer a cross-process safety guard; it's
-    just an explicit off-switch for e.g. a read-only exploration session.
+    app/core/config.py. This backend is the sole writer of its PostgreSQL
+    database (see app/db/connection.py), so the flag is an explicit off-switch
+    for e.g. a read-only exploration session, not a cross-process safety guard.
     """
     global _SYNC_DAEMON_THREAD
     if not settings.enable_sync_daemon:
@@ -708,9 +800,14 @@ def get_backfill_status() -> dict:
         return dict(BACKFILL_STATE)
 
 def stop_historical_backfill():
+    """Unconditional, matching stop_ter_backfill() above -- a previous version of this
+    function only set should_stop under an ``if BACKFILL_STATE["is_running"]:`` guard,
+    which could silently no-op a stop request that landed in the narrow window around a
+    status read/write race, with zero feedback that anything had gone wrong. Harmless to
+    call when idle either way: _historical_backfill_worker() resets should_stop to False
+    itself the moment a new run actually starts."""
     with _BACKFILL_LOCK:
-        if BACKFILL_STATE["is_running"]:
-            BACKFILL_STATE["should_stop"] = True
+        BACKFILL_STATE["should_stop"] = True
 
 def generate_backfill_chunks(start_year: int = 2020) -> list:
     """Generates 88-day non-overlapping intervals in reverse chronological order from today back to start_year."""
@@ -738,6 +835,11 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
         logger.warning(f"Empty or failed download for chunk {from_date} to {to_date}")
         return 0, 0
 
+    # Step-by-step timing: kept from the investigation that found the quadratic staging
+    # merge (see db/bulk.py). This chunk's date range hung twice with zero log output past
+    # the download, and per-step timing is what localized it -- worth keeping permanently
+    # so the next regression here is one log read away instead of another investigation.
+    _t_parse_start = time.time()
     schemes_dict = {}
     nav_rows = []
     for scheme_meta, nav_record in client.parse_amfi_nav_lines(raw_text):
@@ -745,88 +847,43 @@ def _backfill_single_chunk_impl(from_date: datetime.date, to_date: datetime.date
         if code not in schemes_dict:
             schemes_dict[code] = scheme_meta
         nav_rows.append((nav_record["scheme_code"], nav_record["nav_date"], nav_record["nav"]))
+    logger.info(f"backfill chunk {from_date}-{to_date}: line parsing done in {time.time() - _t_parse_start:.1f}s -- {len(schemes_dict):,} unique schemes, {len(nav_rows):,} NAV rows.")
 
     if not nav_rows:
         return 0, 0
 
-    df_stg_schemes = pd.DataFrame([
-        {
-            "scheme_code": s["scheme_code"],
-            "scheme_name": s["scheme_name"],
-            "fund_house": s["fund_house"],
-            "category": s["category"],
-            "plan_type": s["plan_type"],
-            "option_type": s["option_type"],
-            "isin": s["isin"],
-            **costs_data.get_scheme_cost_specs(s["scheme_code"], s["scheme_name"], s["category"], s["plan_type"])
-        }
-        for s in schemes_dict.values()
-    ])
+    _t_merge_start = time.time()
+    sch_cnt, nav_cnt = _merge_amfi_payload(
+        schemes_dict, nav_rows,
+        label=f"backfill {from_date}-{to_date}",
+        # Polled between committed batches: a stop request lands within one batch
+        # instead of after the whole chunk, and every batch already committed stays.
+        should_stop=lambda: get_backfill_status().get("should_stop", False),
+    )
+    logger.info(f"backfill chunk {from_date}-{to_date}: merged {nav_cnt:,} NAVs / "
+                f"{sch_cnt:,} schemes in {time.time() - _t_merge_start:.1f}s.")
+    return sch_cnt, nav_cnt
 
-    df_stg_nav = pd.DataFrame(nav_rows, columns=["scheme_code", "nav_date", "nav"])
-    df_stg_nav.drop_duplicates(subset=["scheme_code", "nav_date"], inplace=True)
+BACKFILL_JOB = "historical_nav_backfill"
 
+
+def _chunk_unit(frm: datetime.date, to_dt: datetime.date) -> str:
+    """Stable identity for one chunk of work, used as its checkpoint key. Derived
+    from the date range, not the chunk's position in the list, so it stays valid
+    when the list is regenerated with a different start year or a later end date."""
+    return f"{frm.isoformat()}..{to_dt.isoformat()}"
+
+
+def get_backfill_progress() -> dict:
+    """Durable progress, as opposed to get_backfill_status()'s in-memory view of the
+    *current* run -- this survives a stop, a crash and a container restart."""
     con = db.get_connection()
     try:
-        write_staging_table(con, "stg_schemes", df_stg_schemes)
-        write_staging_table(con, "stg_nav", df_stg_nav)
-
-        _sub = lambda col: f"(SELECT s.{col} FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code)"
-        con.execute(f"""
-            UPDATE schemes
-            SET scheme_name = {_sub('scheme_name')},
-                fund_house = CASE WHEN {_sub('fund_house')} IS NOT NULL AND {_sub('fund_house')} != '' THEN {_sub('fund_house')} ELSE schemes.fund_house END,
-                category = CASE WHEN {_sub('category')} IS NOT NULL AND {_sub('category')} != '' THEN {_sub('category')} ELSE schemes.category END,
-                plan_type = {_sub('plan_type')},
-                option_type = {_sub('option_type')},
-                isin = COALESCE({_sub('isin')}, schemes.isin),
-                expense_ratio = CASE WHEN schemes.ter_status = 'official' THEN schemes.expense_ratio ELSE {_sub('expense_ratio')} END,
-                ter_status = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_status ELSE {_sub('ter_status')} END,
-                ter_source = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source ELSE {_sub('ter_source')} END,
-                ter_source_url = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_source_url ELSE {_sub('ter_source_url')} END,
-                ter_as_of_date = CASE WHEN schemes.ter_status = 'official' THEN schemes.ter_as_of_date ELSE {_sub('ter_as_of_date')} END,
-                exit_load_pct = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_pct ELSE {_sub('exit_load_pct')} END,
-                exit_load_days = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_days ELSE {_sub('exit_load_days')} END,
-                exit_load_description = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_load_description ELSE {_sub('exit_load_description')} END,
-                exit_rule_json = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_json ELSE {_sub('exit_rule_json')} END,
-                exit_rule_status = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_status ELSE {_sub('exit_rule_status')} END,
-                exit_rule_source = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source ELSE {_sub('exit_rule_source')} END,
-                exit_rule_source_url = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_source_url ELSE {_sub('exit_rule_source_url')} END,
-                exit_rule_as_of_date = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.exit_rule_as_of_date ELSE {_sub('exit_rule_as_of_date')} END,
-                lock_in_years = CASE WHEN schemes.exit_rule_status = 'official' THEN schemes.lock_in_years ELSE {_sub('lock_in_years')} END
-            WHERE EXISTS (SELECT 1 FROM stg_schemes s WHERE s.scheme_code = schemes.scheme_code);
-        """)
-
-        con.execute("""
-            INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url, ter_as_of_date, exit_load_pct, exit_load_days, exit_load_description, exit_rule_json, exit_rule_status, exit_rule_source, exit_rule_source_url, exit_rule_as_of_date, lock_in_years)
-            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type, s.isin, s.expense_ratio, s.ter_status, s.ter_source, s.ter_source_url, s.ter_as_of_date, s.exit_load_pct, s.exit_load_days, s.exit_load_description, s.exit_rule_json, s.exit_rule_status, s.exit_rule_source, s.exit_rule_source_url, s.exit_rule_as_of_date, s.lock_in_years
-            FROM stg_schemes s
-            WHERE s.scheme_code NOT IN (SELECT scheme_code FROM schemes);
-        """)
-
-        con.execute("""
-            DELETE FROM nav_history
-            WHERE EXISTS (
-                SELECT 1 FROM stg_nav
-                WHERE nav_history.scheme_code = stg_nav.scheme_code
-                  AND nav_history.nav_date = stg_nav.nav_date
-            );
-        """)
-
-        con.execute("""
-            INSERT INTO nav_history (scheme_code, nav_date, nav)
-            SELECT scheme_code, nav_date, nav
-            FROM stg_nav;
-        """)
-
-        con.execute("DROP TABLE IF EXISTS stg_schemes")
-        con.execute("DROP TABLE IF EXISTS stg_nav")
+        done = bulk.completed_units(con, BACKFILL_JOB)
+        return {"completed_chunks": len(done), "completed_units": sorted(done)}
+    finally:
         con.close()
-        return len(df_stg_schemes), len(df_stg_nav)
-    except Exception as e:
-        logger.error(f"Error merging chunk {from_date} to {to_date}: {e}")
-        con.close()
-        return 0, 0
+
 
 def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
     global BACKFILL_STATE
@@ -834,19 +891,38 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
     if max_chunks:
         chunks = chunks[:max_chunks]
 
+    # Resume rather than restart. Every chunk that finished in a previous run is
+    # recorded durably, so a stopped/crashed/restarted backfill skips straight to
+    # where it left off instead of re-downloading and re-merging an hour of work
+    # it already has. (Redoing it would be *correct* -- the merge is an idempotent
+    # upsert -- just wasteful, which is exactly the failure mode this avoids.)
+    con = db.get_connection()
+    try:
+        already_done = bulk.completed_units(con, BACKFILL_JOB)
+    finally:
+        con.close()
+    pending = [(f, t) for (f, t) in chunks if _chunk_unit(f, t) not in already_done]
+    skipped = len(chunks) - len(pending)
+
     with _BACKFILL_LOCK:
         BACKFILL_STATE["is_running"] = True
         BACKFILL_STATE["should_stop"] = False
-        BACKFILL_STATE["total_chunks"] = len(chunks)
+        BACKFILL_STATE["total_chunks"] = len(pending)
         BACKFILL_STATE["current_chunk_idx"] = 0
         BACKFILL_STATE["records_added"] = 0
         BACKFILL_STATE["schemes_added"] = 0
+        BACKFILL_STATE["skipped_chunks"] = skipped
         BACKFILL_STATE["last_error"] = None
         BACKFILL_STATE["started_at"] = time.time()
         BACKFILL_STATE["finished_at"] = None
 
-    logger.info(f"Starting historical backfill: {len(chunks)} chunks to process.")
+    if skipped:
+        logger.info(f"Starting historical backfill: {len(pending)} chunks to process "
+                    f"({skipped} already completed in a previous run -- resuming, not redoing).")
+    else:
+        logger.info(f"Starting historical backfill: {len(pending)} chunks to process.")
 
+    chunks = pending
     for i, (frm, to_dt) in enumerate(chunks):
         with _BACKFILL_LOCK:
             if BACKFILL_STATE["should_stop"]:
@@ -860,15 +936,49 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
             with _BACKFILL_LOCK:
                 BACKFILL_STATE["records_added"] += nav_cnt
                 BACKFILL_STATE["schemes_added"] = max(BACKFILL_STATE["schemes_added"], sch_cnt)
+                stopped = BACKFILL_STATE["should_stop"]
+            # Only a chunk that ran to completion is checkpointed. A chunk cut short
+            # by a stop request committed a correct *prefix* of its NAV rows, so
+            # leaving it unmarked means the next run redoes it and fills in the rest.
+            if not stopped:
+                con = db.get_connection()
+                try:
+                    bulk.checkpoint_mark(con, BACKFILL_JOB, _chunk_unit(frm, to_dt),
+                                         "done", rows_written=nav_cnt)
+                finally:
+                    con.close()
             logger.info(f"Chunk {i+1}/{len(chunks)} ({frm} to {to_dt}): ingested {nav_cnt:,} NAVs.")
-            if (i + 1) % 3 == 0 or (i + 1) == len(chunks):
+            # Every 10th chunk, not every 3rd: refresh_summary_table() recomputes returns/52W
+            # stats across every scheme in one full-table pass, so it's real, non-incremental
+            # cost -- rebuilding it 16 times over a 48-chunk backfill (the old "every 3"
+            # cadence) redid that same full-table work 3x more often than "every 10" for a
+            # marginal freshness gain the UI polls right past anyway (5s refetch interval).
+            # should_stop is still honored between every single chunk regardless (below/above)
+            # -- only the summary-table rebuild cadence changed, not stop responsiveness.
+            if (i + 1) % 10 == 0 or (i + 1) == len(chunks):
                 db.refresh_summary_table()
         except Exception as e:
             logger.error(f"Error processing chunk {frm} to {to_dt}: {e}")
             with _BACKFILL_LOCK:
                 BACKFILL_STATE["last_error"] = str(e)
+            # Recorded as 'failed', not 'done', so it is retried on the next run
+            # rather than silently skipped -- and so a persistently bad date range
+            # is visible in the table instead of only in a scrolled-past log line.
+            try:
+                con = db.get_connection()
+                try:
+                    bulk.checkpoint_mark(con, BACKFILL_JOB, _chunk_unit(frm, to_dt),
+                                         "failed", detail=str(e)[:500])
+                finally:
+                    con.close()
+            except Exception:
+                pass
 
-        time.sleep(1)
+        # A short courtesy pause, not a rate-limit workaround -- AMFI documents no per-request
+        # limit for this endpoint, and each chunk's own download (tens of seconds) already
+        # spaces requests out far more than this ever could. Cut from 1s: over a 48-chunk
+        # backfill (2015-present) that alone was 48s of pure dead time contributing nothing.
+        time.sleep(0.2)
 
     db.refresh_summary_table()
 
@@ -877,11 +987,24 @@ def _historical_backfill_worker(start_year: int, max_chunks: Optional[int]):
         BACKFILL_STATE["finished_at"] = time.time()
     logger.info("Historical backfill completed successfully!")
 
-def start_historical_backfill(start_year: int = 2020, max_chunks: Optional[int] = None) -> bool:
-    """Launches the historical backfill in a background worker thread."""
+def start_historical_backfill(start_year: int = 2020, max_chunks: Optional[int] = None,
+                              resume: bool = True) -> bool:
+    """Launches the historical backfill in a background worker thread.
+
+    Resumes by default, skipping chunks a previous run already completed. Pass
+    resume=False to forget that progress and re-download everything -- worth doing
+    only if AMFI is believed to have restated history, since the merge itself
+    already overwrites changed NAVs on any overlapping run."""
     with _BACKFILL_LOCK:
         if BACKFILL_STATE["is_running"]:
             return False
+    if not resume:
+        con = db.get_connection()
+        try:
+            n = bulk.clear_checkpoints(con, BACKFILL_JOB)
+            logger.info(f"Historical backfill: cleared {n} checkpoint(s) for a full re-run.")
+        finally:
+            con.close()
     t = threading.Thread(target=_historical_backfill_worker, args=(start_year, max_chunks), daemon=True)
     t.start()
     return True

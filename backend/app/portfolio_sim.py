@@ -227,7 +227,10 @@ def run_backtest(
         "absolute_gain": final_value - total_invested,
         "absolute_return_pct": ((final_value / total_invested) - 1.0) * 100.0 if total_invested > 0 else None,
         "money_weighted_xirr_pct": (money_weighted_return * 100.0) if money_weighted_return is not None else None,
-        "twr_metrics": twr_metrics,
+        "twr_metrics": {
+            **(twr_metrics or {}),
+            "costs_model": "nav_only_no_exit_load_no_stt_no_tax",
+        },
         "n_contributions": len(cash_flows),
         "codes": codes,
     }

@@ -66,6 +66,10 @@ def apply_min_trading_days_guard(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
         return df, 0
     thin_mask = df["n_trading_days"] < MIN_TRADING_DAYS_FOR_RANKING
     excluded = int(thin_mask.sum())
+    if excluded == len(df):
+        df = df.copy()
+        df["annualized_vol_pct"] = None
+        return df, 0
     if excluded > 0:
         df = df[~thin_mask].copy()
     return df, excluded

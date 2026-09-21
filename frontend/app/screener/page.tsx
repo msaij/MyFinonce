@@ -1,7 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState, Suspense } from "react";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
+
+import Link from "next/link";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { StatCard } from "@/components/shared/StatCard";
@@ -10,6 +13,7 @@ import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { Banner } from "@/components/shared/Banner";
 import { formatSignedPct, formatDate, toneOf } from "@/lib/format";
+import { useDebouncedValue, useUrlSync } from "@/lib/hooks";
 import { useDateRangeStore } from "@/lib/stores/dateRange";
 import { useFilterStore } from "@/lib/stores/filters";
 import { getMetaFilters } from "@/lib/api/meta";
@@ -26,7 +30,6 @@ const SORT_OPTIONS: Record<string, string> = {
   "90-Day Return %": "return_90d_pct",
   "1-Day Change %": "change_1d_pct",
   "Lowest Expense Ratio (TER)": "expense_ratio",
-  "Lowest Exit Load %": "exit_load_pct",
   "Latest NAV (Rs)": "latest_nav",
   "Scheme Name": "scheme_name",
   "Distance from 52W High %": "dist_from_52w_high_pct",
@@ -42,14 +45,45 @@ const TER_OPTIONS: Record<string, number | undefined> = {
 
 const SCREENER_TABLE_COLUMNS: ColumnConfig[] = [
   { key: "scheme_code", label: "AMFI Code", format: "number", decimals: 0 },
-  { key: "scheme_name", label: "Scheme Name" },
+  {
+    key: "scheme_name",
+    label: "Scheme Name",
+    render: (row) => (
+      <Link href={`/scheme/${row.scheme_code}`} className="font-semibold" style={{ color: "var(--mf-accent)" }}>
+        {String(row.scheme_name ?? "")}
+      </Link>
+    ),
+  },
   { key: "fund_house", label: "AMC" },
   { key: "category", label: "Category" },
   { key: "plan_type", label: "Plan" },
   { key: "option_type", label: "Option" },
-  { key: "expense_ratio", label: "TER %", format: "signed_pct" },
+  {
+    key: "expense_ratio",
+    label: "TER %",
+    format: "number",
+    sortValue: (row) => (row.expense_ratio != null ? Number(row.expense_ratio) : row.ter_base_expense_ratio != null ? Number(row.ter_base_expense_ratio) : null),
+    render: (row) => {
+      const baseTer = row.ter_base_expense_ratio != null ? Number(row.ter_base_expense_ratio) : null;
+      const totalTer = row.expense_ratio != null ? Number(row.expense_ratio) : null;
+      if (baseTer !== null) {
+        return (
+          <div className="flex flex-col" title={`Base TER: ${baseTer.toFixed(4)}% | Total TER: ${totalTer !== null ? totalTer.toFixed(4) : "N/A"}%`}>
+            <span className="font-semibold text-xs" style={{ color: "var(--mf-fg)" }}>
+              {baseTer.toFixed(4)}%
+            </span>
+            {totalTer !== null && Math.abs(totalTer - baseTer) > 0.001 && (
+              <span className="text-[10px]" style={{ color: "var(--mf-muted)" }}>
+                Total: {totalTer.toFixed(2)}%
+              </span>
+            )}
+          </div>
+        );
+      }
+      return totalTer !== null ? `${totalTer.toFixed(4)}%` : "-";
+    },
+  },
   { key: "ter_status", label: "TER Confidence" },
-  { key: "exit_load_pct", label: "Exit Load %", format: "signed_pct" },
   { key: "latest_nav", label: "Latest NAV", format: "inr" },
   { key: "latest_date", label: "NAV Date", format: "date" },
   { key: "change_1d_pct", label: "1D Chg %", format: "signed_pct" },
@@ -93,24 +127,46 @@ function Select({
 }
 
 export default function ScreenerPage() {
-  const { start, end } = useDateRangeStore();
+  return (
+    <Suspense fallback={<div className="p-6 text-sm">Loading Mutual Fund Screener...</div>}>
+      <ScreenerContent />
+    </Suspense>
+  );
+}
+
+function ScreenerContent() {
+  const searchParams = useSearchParams();
+  const { start, end, planType, optionType, setPlanType, setOptionType } = useDateRangeStore();
   const getFilter = useFilterStore((s) => s.getFilter);
   const setFilter = useFilterStore((s) => s.setFilter);
 
-  const [amc, setAmcState] = useState(() => getFilter(SECTION, "amc", "All Fund Houses"));
-  const [broadCat, setBroadCatState] = useState(() => getFilter(SECTION, "broad_cat", "All Categories"));
-  const [subCat, setSubCatState] = useState(() => getFilter(SECTION, "sub_cat", "All Sub-Categories"));
-  const [planType, setPlanTypeState] = useState(() => getFilter(SECTION, "plan", "All Plans"));
-  const [optionType, setOptionTypeState] = useState(() => getFilter(SECTION, "option", "All Options"));
-  const [terLabel, setTerLabelState] = useState(() => getFilter(SECTION, "ter_label", "All Expense Ratios"));
-  const [sortLabel, setSortLabelState] = useState(() => getFilter(SECTION, "sort_label", "Selected Period Return %"));
+  const [amc, setAmcState] = useState(() => searchParams.get("amc") || getFilter(SECTION, "amc", "All Fund Houses"));
+  const [broadCat, setBroadCatState] = useState(() => searchParams.get("broad_cat") || getFilter(SECTION, "broad_cat", "All Categories"));
+  const [subCat, setSubCatState] = useState(() => searchParams.get("sub_cat") || getFilter(SECTION, "sub_cat", "All Sub-Categories"));
+  const [terLabel, setTerLabelState] = useState(() => searchParams.get("ter_label") || getFilter(SECTION, "ter_label", "All Expense Ratios"));
+  const [officialTerOnly, setOfficialTerOnly] = useState(() => searchParams.get("official_ter") === "1");
+  const [sortLabel, setSortLabelState] = useState(() => searchParams.get("sort") || getFilter(SECTION, "sort_label", "Selected Period Return %"));
   const [ascending, setAscendingState] = useState(() => getFilter(SECTION, "ascending", false));
   const [limit, setLimitState] = useState(() => getFilter(SECTION, "limit", 250));
-  const [searchQuery, setSearchQuery] = useState("");
-  const [schemeCode, setSchemeCode] = useState<number | undefined>(undefined);
+  const [searchQuery, setSearchQuery] = useState(() => searchParams.get("search") || "");
+  const [schemeCode, setSchemeCode] = useState<number | undefined>(() =>
+    searchParams.get("scheme_code") ? Number(searchParams.get("scheme_code")) : undefined
+  );
   const [isolatedName, setIsolatedName] = useState<string | undefined>(undefined);
   const [plotMode, setPlotMode] = useState("Auto: Top 5 from filtered results");
   const [chartView, setChartView] = useState<"pct" | "nav">("pct");
+
+  // Sync state with URL search parameters
+  useUrlSync({
+    amc: amc !== "All Fund Houses" ? amc : undefined,
+    broad_cat: broadCat !== "All Categories" ? broadCat : undefined,
+    sub_cat: subCat !== "All Sub-Categories" ? subCat : undefined,
+    ter_label: terLabel !== "All Expense Ratios" ? terLabel : undefined,
+    official_ter: officialTerOnly ? "1" : undefined,
+    sort: sortLabel !== "Selected Period Return %" ? sortLabel : undefined,
+    search: searchQuery || undefined,
+    scheme_code: schemeCode || undefined,
+  });
 
   function setAmc(v: string) {
     setAmcState(v);
@@ -125,14 +181,6 @@ export default function ScreenerPage() {
   function setSubCat(v: string) {
     setSubCatState(v);
     setFilter(SECTION, "sub_cat", v);
-  }
-  function setPlanType(v: string) {
-    setPlanTypeState(v);
-    setFilter(SECTION, "plan", v);
-  }
-  function setOptionType(v: string) {
-    setOptionTypeState(v);
-    setFilter(SECTION, "option", v);
   }
   function setTerLabel(v: string) {
     setTerLabelState(v);
@@ -168,6 +216,7 @@ export default function ScreenerPage() {
 
   const sortCol = SORT_OPTIONS[sortLabel] ?? "return_30d_pct";
   const maxTer = TER_OPTIONS[terLabel];
+  const debouncedSearch = useDebouncedValue(searchQuery, 400);
 
   const filterParams: ScreenerFilterParams = {
     amc: amc !== "All Fund Houses" ? amc : undefined,
@@ -175,21 +224,24 @@ export default function ScreenerPage() {
     sub_cat: subCat !== "All Sub-Categories" ? subCat : undefined,
     plan_type: planType !== "All Plans" ? planType : undefined,
     option_type: optionType !== "All Options" ? optionType : undefined,
-    search_term: searchQuery || undefined,
+    search_term: (schemeCode ? undefined : debouncedSearch) || undefined,
     start: start || undefined,
     end: end || undefined,
     scheme_code: schemeCode,
     max_expense_ratio: maxTer,
+    official_ter_only: officialTerOnly || undefined,
   };
 
   const { data: rows, isLoading: rowsLoading } = useQuery({
     queryKey: ["screener", filterParams, sortCol, ascending, limit],
     queryFn: () => getScreener(filterParams, sortCol, ascending, limit),
+    placeholderData: keepPreviousData,
   });
 
   const { data: kpis } = useQuery({
     queryKey: ["screener-kpis", filterParams],
     queryFn: () => getScreenerKpis(filterParams),
+    placeholderData: keepPreviousData,
   });
 
   const span = start && end ? Math.round((new Date(end).getTime() - new Date(start).getTime()) / 86400000) : 0;
@@ -214,6 +266,7 @@ export default function ScreenerPage() {
     queryKey: ["screener-chart", plottedCodes, start, end],
     queryFn: () => getNavHistory(plottedCodes, start || undefined, end || undefined),
     enabled: plottedCodes.length > 0,
+    placeholderData: keepPreviousData,
   });
 
   const chartFigure = useMemo(() => {
@@ -246,6 +299,7 @@ export default function ScreenerPage() {
       layout: {
         height: 450,
         hovermode: "x unified",
+        hoversort: "value descending",
         yaxis: chartView === "pct" ? { ticksuffix: "%", showgrid: true } : { showgrid: true },
         legend: { orientation: "h", yanchor: "bottom", y: -0.3, xanchor: "left", x: 0 },
       },
@@ -304,6 +358,39 @@ export default function ScreenerPage() {
         )}
       </div>
 
+      {/* --- Chart --- */}
+      <div className="mt-6 border-t pt-6" style={{ borderColor: "var(--mf-border)" }}>
+        <h2 className="text-lg font-bold">Performance Trajectory Graph (Filtered Schemes)</h2>
+        <div className="mt-2 flex flex-wrap gap-4">
+          <Select label="Plot Selection" value={plotMode} onChange={setPlotMode} options={plotOptions} />
+          <Select
+            label="Graph Metric"
+            value={chartView === "pct" ? "Normalized % Return (Base 0%)" : "Nominal NAV (Rs)"}
+            onChange={(v) => setChartView(v.startsWith("Normalized") ? "pct" : "nav")}
+            options={["Normalized % Return (Base 0%)", "Nominal NAV (Rs)"]}
+          />
+        </div>
+        <div className="mt-3 min-h-[460px]">
+          {rows && rows.length > 0 ? (
+            navHistory && navHistory.length > 0 ? (
+              <PlotlyChart figure={chartFigure} />
+            ) : (
+              <div className="flex h-[450px] items-center justify-center rounded-lg border text-sm" style={{ borderColor: "var(--mf-border)", color: "var(--mf-muted)" }}>
+                <Banner level="info">No historical NAV records found for the selected schemes in this time window.</Banner>
+              </div>
+            )
+          ) : rowsLoading ? (
+            <div className="flex h-[450px] items-center justify-center rounded-lg border text-sm" style={{ borderColor: "var(--mf-border)", color: "var(--mf-muted)" }}>
+              Updating chart...
+            </div>
+          ) : (
+            <div className="flex h-[450px] items-center justify-center rounded-lg border text-sm" style={{ borderColor: "var(--mf-border)", color: "var(--mf-muted)" }}>
+              <Banner level="info">No funds match the current filter selection to plot.</Banner>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* --- Filters --- */}
       <div className="filter-box mt-6">
         <div className="mb-2 flex items-center justify-between">
@@ -323,9 +410,13 @@ export default function ScreenerPage() {
           <Select label="Fund House (AMC)" value={amc} onChange={setAmc} options={["All Fund Houses", ...(metaFilters?.amcs ?? [])]} />
           <Select label="Asset Class" value={broadCat} onChange={setBroadCat} options={["All Categories", ...(metaFilters?.broad_categories ?? [])]} />
           <Select label="Category" value={subCat} onChange={setSubCat} options={["All Sub-Categories", ...(metaFilters?.sub_categories ?? [])]} />
-          <Select label="Plan Type" value={planType} onChange={setPlanType} options={["All Plans", "Direct", "Regular"]} />
-          <Select label="Option Type" value={optionType} onChange={setOptionType} options={["All Options", "Growth", "IDCW"]} />
+          <Select label="Plan Type (Global)" value={planType} onChange={(v) => setPlanType(v as any)} options={["All Plans", "Direct", "Regular"]} />
+          <Select label="Option Type (Global)" value={optionType} onChange={(v) => setOptionType(v as any)} options={["All Options", "Growth", "IDCW"]} />
           <Select label="Max TER %" value={terLabel} onChange={setTerLabel} options={Object.keys(TER_OPTIONS)} />
+          <label className="flex items-end gap-2 text-xs font-medium pb-2" style={{ color: "var(--mf-muted)" }}>
+            <input type="checkbox" checked={officialTerOnly} onChange={(e) => setOfficialTerOnly(e.target.checked)} />
+            Official TER only
+          </label>
           <Select label="Sort By" value={sortLabel} onChange={setSortLabel} options={Object.keys(SORT_OPTIONS)} />
           <Select
             label="Sort Direction"
@@ -335,26 +426,24 @@ export default function ScreenerPage() {
           />
           <Select label="Show Top" value={String(limit)} onChange={(v) => setLimit(Number(v))} options={["100", "250", "500", "1000", "2500"]} />
         </div>
-        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-          <label className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
-            Search Fund Name / AMFI Code
-            <input
-              type="text"
-              placeholder="Type any words in any order (e.g. motilal arbitrage, 153187)..."
+        <div className="mt-3">
+          <div className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+            <span>Search Fund Name / AMFI Code (Live suggestions in dropdown)</span>
+            <SearchCombobox
+              placeholder="Type any words in any order (e.g. motilal arbitrage, small cap, 153187)..."
               value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value);
+              onChangeQuery={(q) => {
+                setSearchQuery(q);
+                if (!q) {
+                  setSchemeCode(undefined);
+                  setIsolatedName(undefined);
+                }
+              }}
+              onClear={() => {
+                setSearchQuery("");
                 setSchemeCode(undefined);
                 setIsolatedName(undefined);
               }}
-              className="rounded-lg border px-2 py-1.5 text-sm"
-              style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
-            />
-          </label>
-          <div className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
-            Or Isolate Specific Scheme
-            <SearchCombobox
-              placeholder="Search to isolate a single scheme..."
               extraParams={{
                 amc: amc !== "All Fund Houses" ? amc : undefined,
                 broad_cat: broadCat !== "All Categories" ? broadCat : undefined,
@@ -365,92 +454,79 @@ export default function ScreenerPage() {
               onSelect={(scheme) => {
                 setSchemeCode(scheme.scheme_code);
                 setIsolatedName(scheme.scheme_name);
-                setSearchQuery("");
+                setSearchQuery(scheme.scheme_name);
               }}
             />
-            {schemeCode && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSchemeCode(undefined);
-                  setIsolatedName(undefined);
-                }}
-                className="mt-1 self-start text-xs underline"
-                style={{ color: "var(--mf-accent)" }}
-              >
-                Clear isolated scheme
-              </button>
+            {schemeCode && isolatedName && (
+              <div className="mt-1.5 flex items-center gap-2">
+                <span className="text-xs font-semibold" style={{ color: "var(--mf-accent)" }}>
+                  Isolating fund: {isolatedName} [{schemeCode}]
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSchemeCode(undefined);
+                    setIsolatedName(undefined);
+                    setSearchQuery("");
+                  }}
+                  className="rounded border px-2 py-0.5 text-xs font-semibold"
+                  style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}
+                >
+                  Clear isolation
+                </button>
+              </div>
             )}
           </div>
         </div>
       </div>
 
-      {/* --- TER / Exit-load banner (isolated scheme only) --- */}
+      {/* --- TER banner (isolated scheme only) --- */}
       {isolatedRow && (
         <div className="mt-4">
           <Banner level="info">
-            <div className="flex flex-wrap items-center gap-7">
+            <div className="flex flex-wrap items-center gap-6">
               <div>
                 <div className="text-xs font-semibold uppercase" style={{ color: "var(--mf-muted)" }}>
-                  Expense Ratio (TER)
+                  Base Expense Ratio (AMC)
                 </div>
-                <div className="text-lg font-bold" style={{ color: "var(--mf-accent)" }}>
-                  {isolatedRow.expense_ratio !== null ? `${(isolatedRow.expense_ratio as number).toFixed(4)}% p.a.` : "Unavailable"}
+                <div className="text-xl font-bold" style={{ color: "var(--mf-accent)" }}>
+                  {isolatedRow.ter_base_expense_ratio !== null && isolatedRow.ter_base_expense_ratio !== undefined
+                    ? `${Number(isolatedRow.ter_base_expense_ratio).toFixed(4)}% p.a.`
+                    : isolatedRow.expense_ratio !== null
+                    ? `${Number(isolatedRow.expense_ratio).toFixed(4)}% p.a.`
+                    : "Unavailable"}
                 </div>
                 <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
-                  Status: {String(isolatedRow.ter_status ?? "unknown")} · {String(isolatedRow.ter_source ?? "No source recorded")}
+                  Gross Total TER: {isolatedRow.expense_ratio !== null ? `${Number(isolatedRow.expense_ratio).toFixed(4)}% p.a.` : "Unavailable"}
                 </div>
               </div>
               <div className="border-l pl-5" style={{ borderColor: "var(--mf-border)" }}>
                 <div className="text-xs font-semibold uppercase" style={{ color: "var(--mf-muted)" }}>
-                  Exit-load data
+                  As-of date
                 </div>
-                <div className="text-base font-bold" style={{ color: "var(--mf-warning)" }}>
-                  {String(isolatedRow.exit_rule_status ?? "unknown")}
-                </div>
+                <div className="text-sm font-semibold">{isolatedRow.ter_as_of_date ? String(isolatedRow.ter_as_of_date) : "Not dated"}</div>
                 <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
-                  {String(isolatedRow.exit_rule_source ?? "No source recorded")}
+                  Status: {String(isolatedRow.ter_status ?? "unknown")}
                 </div>
               </div>
-              <div className="flex-1 border-l pl-5" style={{ borderColor: "var(--mf-border)" }}>
-                <div className="text-xs font-semibold uppercase" style={{ color: "var(--mf-muted)" }}>
-                  Exit rule and lock-in
+              {isolatedRow.ter_base_expense_ratio !== null && isolatedRow.ter_base_expense_ratio !== undefined && (
+                <div className="border-l pl-5 text-xs" style={{ borderColor: "var(--mf-border)", color: "var(--mf-muted)" }}>
+                  <div className="font-semibold uppercase tracking-wider" style={{ color: "var(--mf-fg)" }}>SEBI Reg 66 Breakdown</div>
+                  <div>Base Fee: <span className="font-semibold" style={{ color: "var(--mf-fg)" }}>{Number(isolatedRow.ter_base_expense_ratio).toFixed(4)}%</span></div>
+                  <div>Statutory GST: <span className="font-semibold" style={{ color: "var(--mf-fg)" }}>{Number(isolatedRow.ter_statutory_levies_pct ?? 0).toFixed(4)}%</span></div>
+                  <div>Brokerage &amp; Trans: <span className="font-semibold" style={{ color: "var(--mf-fg)" }}>{(Number(isolatedRow.ter_brokerage_cost_pct ?? 0) + Number(isolatedRow.ter_transaction_cost_pct ?? 0)).toFixed(4)}%</span></div>
+                  <div className="mt-1 pt-1 border-t" style={{ borderColor: "var(--mf-border)" }}>
+                    Total Gross TER: <span className="font-bold" style={{ color: "var(--mf-accent)" }}>{isolatedRow.expense_ratio !== null ? `${Number(isolatedRow.expense_ratio).toFixed(4)}%` : "N/A"}</span>
+                  </div>
                 </div>
-                <div className="text-sm">
-                  {String(isolatedRow.exit_load_description ?? "Exit-load rule unavailable.")} &nbsp;|&nbsp;
-                  <b> {isolatedRow.lock_in_years !== null ? `Lock-in: ${isolatedRow.lock_in_years} years` : "Lock-in not verified"}</b>
-                </div>
-              </div>
+              )}
             </div>
           </Banner>
         </div>
       )}
 
-      {/* --- Chart --- */}
-      {rows && rows.length > 0 && (
-        <div className="mt-6 border-t pt-6" style={{ borderColor: "var(--mf-border)" }}>
-          <h2 className="text-lg font-bold">Performance Trajectory Graph (Filtered Schemes)</h2>
-          <div className="mt-2 flex flex-wrap gap-4">
-            <Select label="Plot Selection" value={plotMode} onChange={setPlotMode} options={plotOptions} />
-            <Select
-              label="Graph Metric"
-              value={chartView === "pct" ? "Normalized % Return (Base 0%)" : "Nominal NAV (Rs)"}
-              onChange={(v) => setChartView(v.startsWith("Normalized") ? "pct" : "nav")}
-              options={["Normalized % Return (Base 0%)", "Nominal NAV (Rs)"]}
-            />
-          </div>
-          <div className="mt-3">
-            {navHistory && navHistory.length > 0 ? (
-              <PlotlyChart figure={chartFigure} />
-            ) : (
-              <Banner level="info">No historical NAV records found for the selected schemes in this time window.</Banner>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* --- Table --- */}
-      <div className="mt-6 border-t pt-6" style={{ borderColor: "var(--mf-border)" }}>
+      <div className="mt-6 border-t pt-6 min-h-[450px]" style={{ borderColor: "var(--mf-border)" }}>
         <h2 className="text-lg font-bold">Filtered Performance Table</h2>
         <p className="mf-page-caption">All NAVs, returns, and percentages are computed with strict 4-decimal precision.</p>
         {!rowsLoading && rows && rows.length === 0 ? (

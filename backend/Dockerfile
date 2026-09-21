@@ -21,7 +21,7 @@ COPY . .
 
 EXPOSE 8000
 
-# --workers 1 is deliberate, not a placeholder: app/db/connection.py keeps one
-# module-global SQLite connection + an in-process write lock; multiple worker
-# processes would mean multiple connection singletons stepping on each other.
+# --workers 1 is deliberate: in-process caches, WRITE_LOCK, BACKFILL_STATE, and
+# the AMFI schedule thread are process-local. A future app.worker extraction
+# would be required before raising --workers. Do not change in this program.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

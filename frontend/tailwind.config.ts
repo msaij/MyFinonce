@@ -1,11 +1,16 @@
 import type { Config } from "tailwindcss";
 
-// Design tokens mirror fetcher/theme.py's CSS custom properties 1:1 so the
-// two UIs stay visually consistent during the migration -- see globals.css
-// for the actual :root/dark variable definitions these reference.
+// Design tokens -- see globals.css for the actual :root variable definitions
+// these reference. Always light: dark mode was removed (2026-09-12, user
+// request) by deleting globals.css's `@media (prefers-color-scheme: dark)`
+// override block entirely, so `darkMode` here has no block left to activate
+// -- set to "media" it would just never match anything; "class" is the
+// honest way to say "no automatic dark variant" (nothing anywhere applies a
+// `dark` class either, so this is inert either way, but this reads correctly
+// rather than implying an OS-driven dark mode that no longer exists).
 const config: Config = {
   content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
-  darkMode: "media",
+  darkMode: "class",
   theme: {
     extend: {
       colors: {

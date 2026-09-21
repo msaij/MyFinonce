@@ -20,6 +20,9 @@ describe("computeRangeForPreset", () => {
     ["Past 90 Days (3M)", 90],
     ["Past 180 Days (6M)", 180],
     ["Past 1 Year (12M)", 365],
+    ["Past 3 Years (3Y)", 3 * 365],
+    ["Past 5 Years (5Y)", 5 * 365],
+    ["Past 10 Years (10Y)", 10 * 365],
   ];
 
   it.each(relativePresets)("'%s' ends at dbMax and spans exactly %i days when dbMin doesn't clamp it", (preset, expectedDays) => {

@@ -19,7 +19,10 @@ def get_leaders(
     search: str = "",
     start: Optional[datetime.date] = None,
     end: Optional[datetime.date] = None,
+    vol_lookback: str = "1Y",
 ) -> dict:
+    if start and end and start > end:
+        start, end = end, start
     df_all = db.get_advanced_leaders_dataframe(
         broad_cat=broad_cat or "All Categories",
         sub_cat=sub_cat or "All Sub-Categories",
@@ -27,6 +30,7 @@ def get_leaders(
         option_type=option_type or "All Options",
         start_date=start,
         end_date=end,
+        vol_lookback=vol_lookback,
     )
     result = leaders_service.build_leaders_dataset(df_all, search_query=search)
     return {
@@ -41,4 +45,6 @@ def get_leaders(
         "med_vol": sanitize_floats(result["med_vol"]),
         "med_ret": sanitize_floats(result["med_ret"]),
         "quadrant_excluded": result["quadrant_excluded"],
+        "vol_lookback": vol_lookback,
+        "vol_methodology": "Annualized daily sample standard deviation scaled by sqrt(252)",
     }

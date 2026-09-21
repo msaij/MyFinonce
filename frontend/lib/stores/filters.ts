@@ -50,6 +50,19 @@ export const useFilterStore = create<FilterState>()(
           return { sections: rest };
         }),
     }),
-    { name: "mf-filters" }
+    {
+      name: "mf-filters",
+      // Rehydration is triggered manually (lib/providers.tsx, once on mount) instead of
+      // automatically at module-load time. Automatic rehydration runs synchronously as soon
+      // as this module is evaluated on the client -- which happens BEFORE React's first
+      // (hydration) render commits -- so a page whose useState initializer calls getFilter()
+      // would see the real persisted value on the client's hydration pass while the server
+      // render (which never had localStorage) saw the plain default, a guaranteed mismatch
+      // ("Expected server HTML to contain a matching <X>...", full remount) for any section
+      // with a persisted, non-default value. Deferring to a post-mount effect makes the
+      // client's first render match the server's (both plain defaults); the real values then
+      // arrive one render later via a normal state update, not a hydration error.
+      skipHydration: true,
+    }
   )
 );

@@ -11,8 +11,6 @@ export interface LeaderRow {
   plan_type: string;
   option_type: string;
   expense_ratio: number | null;
-  exit_load_pct: number | null;
-  lock_in_years: number | null;
   latest_nav: number | null;
   dist_from_52w_high_pct: number | null;
   period_return_pct: number;
@@ -45,6 +43,8 @@ export interface LeadersResponse {
   med_vol: number | null;
   med_ret: number | null;
   quadrant_excluded: number;
+  vol_lookback?: string;
+  vol_methodology?: string;
 }
 
 export const getLeaders = (params: {
@@ -55,4 +55,5 @@ export const getLeaders = (params: {
   search?: string;
   start?: string;
   end?: string;
+  vol_lookback?: string;
 }) => apiGet<LeadersResponse>("/api/leaders", params);

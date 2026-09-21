@@ -36,8 +36,8 @@ AMFI_AMC_CATALOG = [
     {"mf_id": 7, "name": "Franklin Templeton Mutual Fund"},
     {"mf_id": 8, "name": "GIC Mutual Fund"},
     {"mf_id": 73, "name": "Groww Mutual Fund"},
-    {"mf_id": 9, "name": "Hathway Mutual Fund"},
-    {"mf_id": 10, "name": "HDFC Mutual Fund"},
+    {"mf_id": 5, "name": "Hathway Mutual Fund"},
+    {"mf_id": 9, "name": "HDFC Mutual Fund"},
     {"mf_id": 76, "name": "Helios Mutual Fund"},
     {"mf_id": 37, "name": "HSBC Mutual Fund"},
     {"mf_id": 20, "name": "ICICI Prudential Mutual Fund"},
@@ -58,7 +58,7 @@ AMFI_AMC_CATALOG = [
     {"mf_id": 55, "name": "Motilal Oswal Mutual Fund"},
     {"mf_id": 54, "name": "Navi Mutual Fund"},
     {"mf_id": 21, "name": "Nippon India Mutual Fund"},
-    {"mf_id": 73, "name": "NJ Mutual Fund"},
+    {"mf_id": 68, "name": "NJ Mutual Fund"},
     {"mf_id": 78, "name": "Old Bridge Mutual Fund"},
     {"mf_id": 58, "name": "PGIM India Mutual Fund"},
     {"mf_id": 64, "name": "PPFAS Mutual Fund"},
@@ -89,10 +89,9 @@ class AmfiClient:
     NAV_DAILY_URL = "https://portal.amfiindia.com/spages/NAVAll.txt"
 
     def __init__(self, user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"):
+        from app.core.config import amfi_ssl_context
         self.headers = {"User-Agent": user_agent}
-        self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
+        self.ssl_ctx = amfi_ssl_context()
 
     def get_amc_directory(self) -> List[Dict]:
         """
@@ -118,6 +117,12 @@ class AmfiClient:
                         seen.add(mf_id)
                         live_amcs.append({"mf_id": mf_id, "name": clean_name})
                 logger.info(f"Discovered {len(live_amcs)} Mutual Fund houses dynamically from AMFI portal.")
+                try:
+                    import json
+                    from app.db import queries as db
+                    db.set_sync_meta_value("amc_directory_json", json.dumps(live_amcs))
+                except Exception:
+                    pass
                 return live_amcs
         except Exception as e:
             logger.warning(f"Could not scrape live AMC list from AMFI ({e}). Using built-in catalog.")
@@ -158,7 +163,13 @@ class AmfiClient:
         logger.info(f"Requesting bulk AMFI historical report: {url}")
         req = urllib.request.Request(url, headers=self.headers)
         try:
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=120) as resp:
+            # 60s, not the old 120s: this is the same NAV-history endpoint
+            # download_amc_90d_report already calls with a 60s timeout below, just
+            # unfiltered by AMC -- there's no reason a wider report should need double the
+            # patience, and a slow/hung request here is also what the historical backfill's
+            # should_stop check waits behind (see amfi_sync._historical_backfill_worker) --
+            # failing faster halves that worst-case "Stop doesn't seem to do anything" wait.
+            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=60) as resp:
                 if resp.status == 200:
                     return resp.read().decode("utf-8", errors="ignore")
                 else:
@@ -205,17 +216,38 @@ class AmfiClient:
         current_amc = default_amc
 
         # Default fallback column index mapping
+        # "isin" is a LIST of indices, not one index: AMFI's header carries two ISIN
+        # columns -- "ISIN Div Payout/ISIN Growth" and "ISIN Div Reinvestment" -- and
+        # which one a given row populates depends on that row's option type. A
+        # Growth/IDCW-Payout row fills the first and leaves the second blank or "-";
+        # an IDCW-Reinvestment row does the opposite. Recording only the first column
+        # (as this did until 2026-09-12) silently dropped the ISIN of every single
+        # reinvestment-option scheme in the file.
         col_map = {
             "code": 0,
             "name": 1,
             "plan": 2,
             "option": 3,
-            "isin": 4,
+            "isin": [4, 5],
             "nav": 6,
             "date": 7
         }
 
+        # Diagnostic logging added 2026-09-12 after a historical-backfill chunk hung for 60+
+        # minutes with zero log output: this is the only genuinely large, pure-Python O(n)
+        # loop in the whole backfill path, and it previously logged nothing between "download
+        # requested" and "chunk ingested" -- a truly stuck chunk and a chunk just slowly
+        # working through an unusually large response were indistinguishable from the log
+        # alone. The size line below shows immediately whether a report is abnormally large;
+        # the periodic line shows whether the loop is still actually advancing.
+        total_lines = raw_text.count("\n") + 1
+        logger.info(f"parse_amfi_nav_lines: {len(raw_text):,} chars, ~{total_lines:,} lines to process.")
+        line_count = 0
+
         for line in raw_text.splitlines():
+            line_count += 1
+            if line_count % 200_000 == 0:
+                logger.info(f"parse_amfi_nav_lines: still working -- {line_count:,}/{total_lines:,} lines processed so far.")
             line = line.strip()
             if not line:
                 continue
@@ -274,8 +306,8 @@ class AmfiClient:
                         new_map["plan"] = i
                     elif col == "option":
                         new_map["option"] = i
-                    elif "isin" in col and "isin" not in new_map:
-                        new_map["isin"] = i
+                    elif "isin" in col:
+                        new_map.setdefault("isin", []).append(i)
                     elif "net asset value" in col:
                         new_map["nav"] = i
                     elif "date" in col:
@@ -293,7 +325,7 @@ class AmfiClient:
                 name_idx = col_map.get("name", 1)
                 plan_idx = col_map.get("plan")
                 option_idx = col_map.get("option")
-                isin_idx = col_map.get("isin")
+                isin_indices = col_map.get("isin") or []
                 nav_idx = col_map.get("nav", len(parts) - 2)
                 date_idx = col_map.get("date", len(parts) - 1)
 
@@ -304,9 +336,16 @@ class AmfiClient:
 
                 plan_raw = parts[plan_idx] if plan_idx is not None and plan_idx < len(parts) else ""
                 option_raw = parts[option_idx] if option_idx is not None and option_idx < len(parts) else ""
-                isin = parts[isin_idx] if isin_idx is not None and isin_idx < len(parts) else None
-                if isin in ("-", "", "None", "null"):
-                    isin = None
+                # First non-placeholder value across every ISIN column -- see col_map's
+                # comment: exactly one of them is populated per row, and which one
+                # depends on the row's option type.
+                isin = None
+                for idx in isin_indices:
+                    if idx < len(parts):
+                        candidate = parts[idx]
+                        if candidate and candidate not in ("-", "None", "null"):
+                            isin = candidate
+                            break
 
                 nav_val = float(nav_str)
                 nav_date = self.parse_date(date_str)

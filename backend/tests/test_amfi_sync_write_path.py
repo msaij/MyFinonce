@@ -48,12 +48,9 @@ Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net A
 
 
 @pytest.fixture()
-def db_con(tmp_path, monkeypatch):
-    monkeypatch.setattr(connection, "DB_PATH", str(tmp_path / "test.sqlite3"))
-    connection._THREAD_LOCAL.con = None
+def db_con(pg_db, monkeypatch):
     db.init_db()
     yield
-    connection._THREAD_LOCAL.con = None
 
 
 def test_sync_daily_nav_inserts_new_schemes_and_navs(db_con, monkeypatch):

@@ -33,9 +33,6 @@ export interface SchemeProfile {
   ter_brokerage_cost_pct: number | null;
   ter_transaction_cost_pct: number | null;
   ter_statutory_levies_pct: number | null;
-  exit_load_description: string | null;
-  exit_rule_status: string | null;
-  lock_in_years: number | null;
   latest_nav: number | null;
   latest_date: string | null;
   change_1d_pct: number | null;
@@ -55,3 +52,10 @@ export interface SchemeDetail {
 }
 
 export const getScheme = (code: number) => apiGet<SchemeDetail>(`/api/schemes/${code}`);
+
+export const getSchemeProfile = (code: number) => apiGet<SchemeProfile>(`/api/schemes/${code}/profile`);
+
+export const getSchemeTerHistory = (code: number) =>
+  apiGet<{ ter_date: string; total_ter_pct: number | null; base_expense_ratio_pct: number | null }[]>(
+    `/api/schemes/${code}/ter-history`
+  );

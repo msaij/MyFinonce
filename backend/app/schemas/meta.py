@@ -20,6 +20,9 @@ class MetaStatus(BaseModel):
     db_path: str
     is_stale: bool
     expected_date: Optional[datetime.date]
+    ter_records_count: Optional[int] = 0
+    ter_official_schemes: Optional[int] = 0
+    flags: dict = {}
 
 
 class MetaFilters(BaseModel):

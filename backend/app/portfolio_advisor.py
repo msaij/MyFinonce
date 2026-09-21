@@ -130,17 +130,26 @@ FOLD_MAP = {"Liquid Buffer": "Debt", "Gold": "Debt", "International Equity": "Eq
 SCORE_WEIGHTS = {"sharpe": 0.30, "sortino": 0.25, "alpha_vs_sleeve_median": 0.25, "max_drawdown": 0.10, "expense_ratio": 0.10}
 
 
+_INTL_ETF_NAME_TOKENS = ["%nasdaq%", "%s&p 500%", "%s&p500%", "%sp500%", "%sp 500%"]
+
+
 def _sleeve_where_clause(sleeve: str) -> Tuple[str, List[Any]]:
     spec = SLEEVE_CATEGORY_FILTERS[sleeve]
     keywords = spec["category_keywords"]
-    # LIKE, not ILIKE (DuckDB-only) -- SQLite's LIKE is already ASCII case-insensitive by
-    # default, the same effect for this English-text-only data.
-    cat_conditions = " OR ".join(["s.category LIKE ?"] * len(keywords))
+    cat_conditions = " OR ".join(["s.category LIKE %s"] * len(keywords))
     params: List[Any] = [f"%{kw}%" for kw in keywords]
     where = f"({cat_conditions})"
     if spec.get("name_keyword"):
-        where += " AND s.scheme_name LIKE ?"
+        where += " AND s.scheme_name ILIKE %s"
         params.append(f"%{spec['name_keyword']}%")
+    if sleeve == "International Equity":
+        name_or = " OR ".join(["s.scheme_name ILIKE %s"] * len(_INTL_ETF_NAME_TOKENS))
+        extra = (
+            f"(s.category LIKE %s OR s.category LIKE %s) AND ({name_or}) "
+            f"AND s.scheme_name NOT ILIKE %s"
+        )
+        where = f"({where} OR ({extra}))"
+        params.extend(["%Other ETFs%", "%Index Funds%", *_INTL_ETF_NAME_TOKENS, "%gold%"])
     return where, params
 
 
@@ -172,9 +181,21 @@ def get_sleeve_candidates(
     # distribution-amount data source to adjust for that, so IDCW candidates are excluded
     # outright rather than silently mis-scored. Only the Direct/Regular plan_type requirement
     # is relaxed for ETF-like sleeves (Gold), which don't carry a meaningful commission split.
-    plan_clause = "AND s.option_type = 'Growth'"
-    if not spec.get("relax_plan_filter"):
-        plan_clause += " AND s.plan_type = 'Direct'"
+    if sleeve == "International Equity":
+        # FoF Overseas stays Direct+Growth; India-listed Nasdaq/S&P 500 ETFs often have no Direct plan.
+        plan_clause = (
+            "AND ("
+            " (s.category LIKE '%%FoF Overseas%%' AND s.option_type = 'Growth' AND s.plan_type = 'Direct')"
+            " OR ("
+            "  (s.category LIKE '%%Other ETFs%%' OR s.category LIKE '%%Index Funds%%')"
+            "  AND (s.option_type IS NULL OR s.option_type = '' OR s.option_type = 'Growth')"
+            " )"
+            ")"
+        )
+    else:
+        plan_clause = "AND s.option_type = 'Growth'"
+        if not spec.get("relax_plan_filter"):
+            plan_clause += " AND s.plan_type = 'Direct'"
 
     track_record_cutoff = active_end - datetime.timedelta(days=int(min_track_record_years * 365.25))
     # A within-window data-sufficiency floor that scales with the window itself (~5 trading
@@ -185,48 +206,61 @@ def get_sleeve_candidates(
 
     con = db.get_connection()
     sql = f"""
-        WITH p_start AS (
-            SELECT scheme_code, nav AS start_nav
-            FROM (SELECT scheme_code, nav, ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY nav_date ASC) rn
-                  FROM nav_history WHERE nav_date >= ? AND nav_date <= ?) WHERE rn = 1
+        WITH matched_schemes AS MATERIALIZED (
+            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type,
+                   s.expense_ratio, s.ter_status, s.latest_nav
+            FROM summary_table s
+            WHERE s.is_active
+              {plan_clause}
+              AND {where_cat}
         ),
-        p_end AS (
-            SELECT scheme_code, nav AS end_nav
-            FROM (SELECT scheme_code, nav, ROW_NUMBER() OVER (PARTITION BY scheme_code ORDER BY nav_date DESC) rn
-                  FROM nav_history WHERE nav_date >= ? AND nav_date <= ?) WHERE rn = 1
+        daily_returns AS (
+            SELECT
+                nh.scheme_code,
+                (nh.nav - LAG(nh.nav) OVER (PARTITION BY nh.scheme_code ORDER BY nh.nav_date)) /
+                NULLIF(LAG(nh.nav) OVER (PARTITION BY nh.scheme_code ORDER BY nh.nav_date), 0) AS ret
+            FROM nav_history nh
+            JOIN matched_schemes ms ON nh.scheme_code = ms.scheme_code
+            WHERE nh.nav_date >= %s AND nh.nav_date <= %s
         ),
         vol_calc AS (
             SELECT scheme_code,
-                   ROUND(STDDEV(ret) * SQRT(252.0) * 100.0, 4) AS annualized_vol_pct,
+                   ROUND((stddev_samp(ret) * SQRT(252.0) * 100.0)::numeric, 4)::double precision AS annualized_vol_pct,
                    COUNT(ret) AS n_trading_days
-            FROM (
-                SELECT scheme_code,
-                       (nav - LAG(nav) OVER (PARTITION BY scheme_code ORDER BY nav_date)) /
-                       NULLIF(LAG(nav) OVER (PARTITION BY scheme_code ORDER BY nav_date), 0) AS ret
-                FROM nav_history WHERE nav_date >= ? AND nav_date <= ?
-            ) WHERE ret IS NOT NULL
-            GROUP BY scheme_code
-        ),
-        inception AS (
-            SELECT scheme_code, MIN(nav_date) AS first_nav_date
-            FROM nav_history
+            FROM daily_returns
+            WHERE ret IS NOT NULL
             GROUP BY scheme_code
         )
         SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.plan_type, s.option_type,
                s.expense_ratio, s.ter_status,
-               ROUND((pe.end_nav - ps.start_nav) / NULLIF(ps.start_nav, 0) * 100.0, 4) AS period_return_pct,
+               CASE
+                   WHEN ps.nav IS NULL OR ps.nav <= 0 THEN NULL
+                   ELSE ROUND((((COALESCE(pe.nav, s.latest_nav) - ps.nav) / NULLIF(ps.nav, 0) * 100.0))::numeric, 4)::double precision
+               END AS period_return_pct,
                v.annualized_vol_pct, COALESCE(v.n_trading_days, 0) AS n_trading_days
-        FROM summary_table s
-        JOIN p_start ps ON s.scheme_code = ps.scheme_code
-        JOIN p_end pe ON s.scheme_code = pe.scheme_code
-        JOIN inception i ON s.scheme_code = i.scheme_code
+        FROM matched_schemes s
+        LEFT JOIN LATERAL (
+            SELECT nav FROM nav_history
+            WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
+            ORDER BY nav_date ASC
+            LIMIT 1
+        ) ps ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT nav FROM nav_history
+            WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
+            ORDER BY nav_date DESC
+            LIMIT 1
+        ) pe ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT nav_date AS first_nav_date FROM nav_history
+            WHERE scheme_code = s.scheme_code
+            ORDER BY nav_date ASC
+            LIMIT 1
+        ) i ON TRUE
         LEFT JOIN vol_calc v ON s.scheme_code = v.scheme_code
-        WHERE s.is_active = 1
-          AND i.first_nav_date <= ?
-          {plan_clause}
-          AND {where_cat};
+        WHERE i.first_nav_date <= %s;
     """
-    all_params = [active_start, active_end, active_start, active_end, active_start, active_end, track_record_cutoff] + cat_params
+    all_params = cat_params + [active_start, active_end, active_start, active_end, active_start, active_end, track_record_cutoff]
     try:
         df = fetchdf(con.execute(sql, all_params))
     finally:
@@ -296,15 +330,18 @@ def score_candidates(
             return pd.Series(0.0, index=series.index)
         return (series - series.mean()) / std
 
-    ter_filled = df["expense_ratio"].astype(float)
-    ter_filled = ter_filled.fillna(ter_filled.median() if ter_filled.notna().any() else 0.0)
+    ter_status = df["ter_status"].astype(str) if "ter_status" in df.columns else pd.Series("unknown", index=df.index)
+    ter_official = df["expense_ratio"].astype(float).where(ter_status.str.lower() == "official")
+    ter_z = _z(ter_official.dropna()) if ter_official.notna().any() else pd.Series(dtype=float)
+    ter_term = pd.Series(0.0, index=df.index)
+    ter_term.update(ter_z)
 
     df["quality_score"] = (
         SCORE_WEIGHTS["sharpe"] * _z(df["sharpe_ratio"])
         + SCORE_WEIGHTS["sortino"] * _z(df["sortino_ratio"])
         + SCORE_WEIGHTS["alpha_vs_sleeve_median"] * _z(df["alpha_vs_sleeve_median_pct"])
         - SCORE_WEIGHTS["max_drawdown"] * _z(df["max_drawdown_pct"].abs())
-        - SCORE_WEIGHTS["expense_ratio"] * _z(ter_filled)
+        - SCORE_WEIGHTS["expense_ratio"] * ter_term
     )
     return df.sort_values("quality_score", ascending=False).reset_index(drop=True)
 
@@ -622,11 +659,11 @@ def backtest_portfolio(
 
 RISK_QUESTIONNAIRE: List[Dict[str, Any]] = [
     {
-        "key": "horizon", "question": "When will you likely need this money?",
+        "key": "horizon", "question": "When will you likely need this money%s",
         "options": [("Within 1 year", 1), ("1-3 years", 2), ("3-5 years", 3), ("5-10 years", 4), ("10+ years", 5)],
     },
     {
-        "key": "goal", "question": "What best describes your primary goal?",
+        "key": "goal", "question": "What best describes your primary goal%s",
         "options": [
             ("Preserve capital -- I can't afford to lose money", 1),
             ("Steady income with low volatility", 2),
@@ -636,7 +673,7 @@ RISK_QUESTIONNAIRE: List[Dict[str, Any]] = [
         ],
     },
     {
-        "key": "reaction", "question": "Your portfolio drops 20% in a month. What do you do?",
+        "key": "reaction", "question": "Your portfolio drops 20% in a month. What do you do%s",
         "options": [
             ("Sell everything to stop further loss", 1),
             ("Sell some to reduce risk", 2),
@@ -645,7 +682,7 @@ RISK_QUESTIONNAIRE: List[Dict[str, Any]] = [
         ],
     },
     {
-        "key": "experience", "question": "How would you describe your investing experience?",
+        "key": "experience", "question": "How would you describe your investing experience%s",
         "options": [
             ("None -- this would be new to me", 1),
             ("Some -- a few years, mostly funds/FDs", 2),
@@ -654,7 +691,7 @@ RISK_QUESTIONNAIRE: List[Dict[str, Any]] = [
         ],
     },
     {
-        "key": "dependence", "question": "How dependent are you on this money for near-term expenses?",
+        "key": "dependence", "question": "How dependent are you on this money for near-term expenses%s",
         "options": [
             ("Fully dependent -- I may need it any time", 1),
             ("Somewhat -- a portion may be needed soon", 3),
@@ -662,7 +699,7 @@ RISK_QUESTIONNAIRE: List[Dict[str, Any]] = [
         ],
     },
     {
-        "key": "emergency_fund", "question": "Do you have an emergency fund in place?",
+        "key": "emergency_fund", "question": "Do you have an emergency fund in place%s",
         "options": [
             ("No emergency fund yet", 2),
             ("Partial -- a few months' expenses covered", 3),

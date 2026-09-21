@@ -10,16 +10,13 @@ export interface ScreenerRow {
   plan_type: string;
   option_type: string;
   expense_ratio: number | null;
+  ter_base_expense_ratio?: number | null;
+  ter_brokerage_cost_pct?: number | null;
+  ter_transaction_cost_pct?: number | null;
+  ter_statutory_levies_pct?: number | null;
   ter_status: string | null;
   ter_source: string | null;
   ter_as_of_date: string | null;
-  exit_load_pct: number | null;
-  exit_load_days: number | null;
-  exit_load_description: string | null;
-  exit_rule_status: string | null;
-  exit_rule_source: string | null;
-  exit_rule_as_of_date: string | null;
-  lock_in_years: number | null;
   latest_nav: number | null;
   latest_date: string | null;
   change_1d_pct: number | null;
@@ -58,6 +55,7 @@ export interface ScreenerFilterParams {
   end?: string;
   scheme_code?: number;
   max_expense_ratio?: number;
+  official_ter_only?: boolean;
 }
 
 export const getScreener = (

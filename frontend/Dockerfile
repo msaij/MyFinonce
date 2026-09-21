@@ -17,11 +17,47 @@ COPY .npmrc package.json ./
 RUN --mount=type=cache,target=/root/.npm npm install
 COPY . .
 
-EXPOSE 3000
+# Production build, not the dev server (was `CMD ["npm", "run", "dev"]` for the
+# whole active-migration-development period -- fine while pages were being
+# built and iterated on many times an hour, but next dev's per-request
+# on-demand compilation/Fast-Refresh instrumentation adds massive latency to
+# every request once the app is actually being used: measured ~1.1s for an API
+# call proxied through `next dev`'s rewrite handling that takes ~25-50ms
+# against the backend directly, or through a production `next start`).
+# docker-compose.yml no longer bind-mounts source over this image -- a
+# production container runs what was baked in at build time; rebuild the
+# image after a code change instead of relying on live reload.
+ENV NODE_ENV=production
+# BACKEND_URL must be a build-time ENV, not just a docker-compose.yml runtime
+# environment var: `next build` calls next.config.js's rewrites() once to
+# generate .next/routes-manifest.json, and `next start` replays that
+# manifest rather than re-invoking rewrites() -- so a value only set at
+# container-start time (docker-compose.yml's `environment:`) is invisible to
+# the build and silently falls back to next.config.js's localhost default,
+# which inside THIS container resolves to itself, not the backend service.
+# (Confirmed the hard way: every /api/* call 500'd after switching off next
+# dev, which evaluates rewrites() live and so never exposed this.) The
+# Compose network's service name is stable for this project's one deployment
+# shape, so it's hardcoded here rather than threaded through as a build ARG.
+ENV BACKEND_URL=http://backend:8000
+# Separate from BACKEND_URL above, and for a different reason: this one is read
+# IN THE BROWSER (any NEXT_PUBLIC_* var gets inlined into the client JS bundle
+# at this build step), which cannot resolve the Docker-internal hostname
+# `backend` at all -- it needs the same host-mapped port the browser's own
+# machine reaches this stack on (docker-compose.yml maps backend's 8000
+# straight through). Used only for the admin Activity Log's SSE connection,
+# to bypass `next start`'s own gzip compression of the proxied /api/* route --
+# gzip fundamentally breaks Server-Sent Events (each small event needs to
+# flush immediately; a compressor buffers until it has enough data, which for
+# a slow-trickle log stream may never come, so the browser's EventSource
+# receives nothing despite the backend sending real bytes -- confirmed
+# directly: curl against either origin gets every event immediately, but a
+# real browser EventSource against the proxied :3000 route got zero messages
+# with content-encoding: gzip on the response). The backend's CORSMiddleware
+# already allows http://localhost:3000 explicitly, so a direct cross-origin
+# connection from the browser works with no backend change needed.
+ENV NEXT_PUBLIC_BACKEND_ORIGIN=http://localhost:8000
+RUN npm run build
 
-# Dev server, not a production build -- matches this project's existing
-# philosophy (the Streamlit container is also just "run the app directly").
-# docker-compose.yml bind-mounts ./frontend:/app over this for live reload
-# during development, with an anonymous volume over /app/node_modules so the
-# host's (nonexistent) node_modules doesn't shadow what npm install baked in.
-CMD ["npm", "run", "dev"]
+EXPOSE 3000
+CMD ["npm", "run", "start"]

@@ -1,34 +1,85 @@
-services:
-  dashboard:
-    build:
-      context: ./fetcher
-      dockerfile: Dockerfile
-    container_name: mf_dashboard
-    restart: unless-stopped
-    ports:
-      - "8501:8501"
-    environment:
-      - DUCKDB_PATH=/app/data/mutual_funds.duckdb
-      - TZ=Asia/Kolkata
-      - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
-      - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
-      - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
-    volumes:
-      - ./fetcher:/app
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+# Pinned explicitly, NOT derived from the directory name. Compose defaults the
+# project name to the containing folder, and the project name is what prefixes
+# the named volume -- so the pgdata holding ~27M nav_history rows is
+# `indian-mutual-funds_pgdata`, from the directory this repo used to live in.
+# After the move to .../Music/github/MyFinonce, an unpinned project name would
+# resolve to `myfinonce`, create an empty `myfinonce_pgdata`, and bring Postgres
+# up on a blank database -- indistinguishable from having lost everything. This
+# line keeps the existing volume attached no matter where the repo is checked out.
+name: indian-mutual-funds
 
-  # --- Webstack migration (see .claude/plans/floofy-petting-mountain.md) ---
-  # backend/frontend run ALONGSIDE dashboard (kept as a legacy reference/
-  # fallback), not replacing it yet, until the final cutover phase. backend
-  # now runs on its own SQLite file (see app/db/connection.py) -- a clean
-  # slate, no data carried over from dashboard's old DuckDB file -- so it
-  # owns that file exclusively and is its own sole writer from the start;
-  # the AMFI sync re-populates it from scratch (POST /api/admin/sync/* once
-  # Phase 9 lands, or trigger amfi_sync directly in the meantime).
+services:
+  # PostgreSQL -- replaced SQLite on 2026-09-12. The move was NOT about data
+  # volume (SQLite handles 7M rows fine); it was about this app's access
+  # pattern, which sits on SQLite's two structural weak points at once:
+  #
+  #   1. One writer at a time. The historical backfill writes continuously for
+  #      the better part of an hour.
+  #   2. A WAL checkpoint can only reclaim up to the oldest snapshot any reader
+  #      still holds -- and this UI polls several endpoints every 5s, so there
+  #      is almost never a quiet moment. SQLite would try, get SQLITE_BUSY,
+  #      give up silently, and let the WAL grow.
+  #
+  # Measured live before the switch: a 256MB database with a 547MB WAL, ingest
+  # collapsed from 234,760 rows/s on the first chunk to 1,929 rows/s by the
+  # twentieth, backend at 484% CPU and 5.8GB RSS, and /api/health timing out.
+  # Postgres is MVCC: readers never block the checkpointer, a background writer
+  # and autovacuum run on their own, and concurrent ingest-plus-query is the
+  # normal operating mode rather than the failure mode.
+  #
+  # The data lives in a NAMED VOLUME, not a host bind mount -- that keeps it on
+  # the VM's own ext4 filesystem instead of paying Docker Desktop for Windows'
+  # per-page bind-mount cost on every read and write, which was a standing tax
+  # on the old backend/data/*.sqlite3 file.
+  postgres:
+    image: postgres:16-alpine
+    container_name: mf_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=mutual_funds
+      - POSTGRES_USER=mf
+      - POSTGRES_PASSWORD=mf_local_dev
+      - TZ=Asia/Kolkata
+      # Postgres skips fsync-per-commit durability tuning knobs here on purpose:
+      # this is public NAV data that is always re-downloadable from AMFI, so the
+      # defaults' full durability is kept rather than traded away for speed.
+    # Host port is unpublished by default. Inspect with:
+    #   docker compose --profile dbports up -d
+    command:
+      # Tuned for this box (~7.6GB total) and this workload: large sequential
+      # bulk loads plus analytical reads over a few million rows. Deliberately
+      # modest -- the old SQLite setup fell over partly because a 64MB page
+      # cache was multiplied by 53 thread-local connections; here there is one
+      # shared buffer pool, sized once.
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      # The bulk ingest commits often; spreading checkpoints over a longer
+      # window keeps them from bunching into write spikes mid-backfill.
+      - "max_wal_size=2GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      # Log any statement slower than 2s. This is how the missing nav_date index
+      # would have been caught in minutes instead of after a site hang.
+      - "log_min_duration_statement=2000"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mf -d mutual_funds"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # FastAPI backend -- replaced the original Streamlit + DuckDB app (fetcher/,
+  # removed at Final Cutover; see git history if it's ever needed again).
   backend:
     build:
       context: ./backend
@@ -38,47 +89,93 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DB_PATH=/app/data/mutual_funds.sqlite3
+      - DATABASE_URL=postgresql://mf:mf_local_dev@postgres:5432/mutual_funds
       - TZ=Asia/Kolkata
       - AMFI_DOWNLOAD_PAGE=https://www.amfiindia.com/net-asset-value/nav-download
       - AMFI_HISTORY_URL=https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx
       - AMFI_DAILY_URL=https://portal.amfiindia.com/spages/NAVAll.txt
-      # false during active development (not "true" as originally set right after the
-      # SQLite migration): the daemon does a real, potentially long-running startup
-      # catch-up sync (check_and_catchup_sync(), possibly a full historical backfill)
-      # against the live AMFI servers, unconditionally, on every container start --
-      # discovered when it made the backend unresponsive (even /api/health timing out)
-      # for minutes after an ordinary dev rebuild. That's fine for the real, deliberate
-      # write-ownership handoff (Phase 9, where this flips true on purpose), not for a
-      # container that gets rebuilt many times per hour while iterating. The database
-      # already has real synced data from whichever rebuild it last happened to be true
-      # for -- this flag only controls the daemon auto-starting, not whether previously
-      # synced data is kept.
-      - ENABLE_SYNC_DAEMON=false
+      # TEMPORARILY false (2026-09-12): the user cleared the database and wants to
+      # trigger the very first sync themselves from the browser (Data Management
+      # page) -- the daemon's unconditional startup catch-up would otherwise
+      # auto-populate a day of data within seconds of the next restart, racing
+      # them to it. Normally true (this backend is the sole writer of mutual fund
+      # data -- see app/core/config.py's docstring for the full history of why
+      # this default changed over the migration). Flip back to true once the
+      # user has run their initial sync/backfill and wants ongoing automatic
+      # scheduled updates again.
+      - ENABLE_SYNC_DAEMON=true
+      - ADMIN_TOKEN=mf_local_admin
+      - ADMIN_TOKEN_OPTIONAL=false
+      - AMFI_SSL_INSECURE=false
+      - HOLDOUT_PORTFOLIOS=false
+      - BL_UI=false
+      # Backend --reload: DEV_RELOAD=true docker compose up -d backend
+      # Frontend remains a production image — after UI copy changes:
+      #   docker compose up -d --build frontend
+      - DEV_RELOAD=${DEV_RELOAD:-false}
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        if [ "$$DEV_RELOAD" = "true" ]; then
+          exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app;
+        else
+          exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1;
+        fi
     volumes:
       - ./backend:/app
-      # Read-write: this is backend's own, exclusively-owned data directory
-      # (not shared with dashboard/fetcher's data dir at all anymore).
+      # Still bind-mounted, but this now holds only the bundled TER CSV and any
+      # file the user imports or exports -- no database. The old
+      # mutual_funds.sqlite3* files here are dead and can be deleted.
       - ./backend/data:/app/data
+    depends_on:
+      postgres:
+        # `service_healthy`, not a bare `depends_on` -- Postgres takes a couple of
+        # seconds to accept connections after its container starts, and init_db()
+        # runs at FastAPI startup, so starting the backend on container-start
+        # alone would race it and crash on the first connect.
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
 
+  # Sidecar that publishes Postgres 5432 on the host. Usage:
+  #   docker compose --profile dbports up -d
+  dbports:
+    profiles: ["dbports"]
+    image: alpine:3.20
+    network_mode: "service:postgres"
+    command: ["sleep", "infinity"]
+    ports:
+      - "5432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Next.js production build (next build + next start), not the dev server --
+  # see frontend/Dockerfile's comment for why (next dev's per-request overhead
+  # measured ~1s+ per API call vs ~25-50ms in production). No source bind mount:
+  # this container runs what was baked into the image; rebuild
+  # (docker compose up -d --build frontend) after a frontend code change.
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      # NOTE: BACKEND_URL is NOT set here as a runtime `environment:` var --
+      # next.config.js's rewrites() is resolved once at `next build` time (baked
+      # into .next/routes-manifest.json), so it must be a build-time ENV instead;
+      # see frontend/Dockerfile's own ENV BACKEND_URL line and comment.
     container_name: mf_frontend
     restart: unless-stopped
     ports:
       - "3000:3000"
-    environment:
-      - BACKEND_URL=http://backend:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
     depends_on:
       - backend
+
+volumes:
+  # Named volume, deliberately: keeps the cluster on the VM's ext4 rather than a
+  # Windows bind mount. Survives `docker compose down`; `docker compose down -v`
+  # destroys it, which is the intended way to start from an empty database.
+  pgdata:
