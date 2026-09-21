@@ -124,10 +124,6 @@ services:
         fi
     volumes:
       - ./backend:/app
-      # Still bind-mounted, but this now holds only the bundled TER CSV and any
-      # file the user imports or exports -- no database. The old
-      # mutual_funds.sqlite3* files here are dead and can be deleted.
-      - ./backend/data:/app/data
     depends_on:
       postgres:
         # `service_healthy`, not a bare `depends_on` -- Postgres takes a couple of

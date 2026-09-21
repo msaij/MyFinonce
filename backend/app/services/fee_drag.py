@@ -150,7 +150,7 @@ def compute_fee_drag_attribution(
                     return None
                 exp_f = float(exp)
                 status = str(row.get("ter_status") or "")
-                # Official + ter_history are percent. Decimal heuristic only for legacy CSV rows.
+                # Official + ter_history are percent. Decimal heuristic only for leftover non-official TERs.
                 if status == "official":
                     return exp_f / 100.0
                 return exp_f / 100.0 if exp_f > 0.05 else exp_f

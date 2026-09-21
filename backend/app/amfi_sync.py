@@ -33,9 +33,8 @@ SCHEME_COLUMNS = [
 #   * AMFI's per-file headers don't always carry fund_house/category (a chunk
 #     download can omit the AMC banner lines), so a blank incoming value must
 #     not erase a good stored one.
-#   * An 'official' TER comes from AMFI's dated Regulation 66 disclosure portal;
-#     the value derived from scheme name/category is a fallback. Official must
-#     never be overwritten by derived.
+#   * An 'official' TER comes from AMFI's dated Regulation 66 disclosure portal.
+#     Official must never be overwritten by the NAV-merge fallback.
 # Expressed as ON CONFLICT DO UPDATE expressions, this handles insert-or-update
 # in one statement -- replacing the old UPDATE-then-INSERT-what's-missing pair.
 SCHEME_UPDATE = {
@@ -61,9 +60,8 @@ SCHEME_UPDATE = {
 
 
 def _scheme_rows(schemes_dict: Dict[int, dict]) -> List[tuple]:
-    """Flattens parsed scheme metadata into SCHEME_COLUMNS order, merging in the
-    derived cost specs. Plain tuples, not a DataFrame: these go straight into
-    executemany, and the DataFrame round-trip in between bought nothing."""
+    """Flattens parsed scheme metadata into SCHEME_COLUMNS order, merging in
+    cost fields from get_scheme_cost_specs. Plain tuples for executemany."""
     rows = []
     for s in schemes_dict.values():
         specs = costs_data.get_scheme_cost_specs(

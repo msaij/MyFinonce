@@ -608,7 +608,7 @@ export default function DataManagementPage() {
               </tr>
               <tr className="border-b" style={{ borderColor: "var(--mf-border)" }}>
                 <td className="py-1.5"><b>Legacy (unverified name match)</b></td>
-                <td className="py-1.5" style={{ color: "var(--mf-muted)" }}>Matched only by scheme name against the bundled reference CSV -- no source URL or effective date on record.</td>
+                <td className="py-1.5" style={{ color: "var(--mf-muted)" }}>Historical name match with no source URL or effective date. No longer written for new schemes.</td>
               </tr>
               <tr className="border-b" style={{ borderColor: "var(--mf-border)" }}>
                 <td className="py-1.5"><b>Unknown</b></td>

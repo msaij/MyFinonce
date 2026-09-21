@@ -76,10 +76,9 @@ def test_merge_updates_a_changed_nav_in_place(db_con):
 
 def test_merge_does_not_let_a_derived_ter_overwrite_an_official_one(db_con):
     """The precedence rule with real consequences: 'official' TER comes from AMFI's
-    dated Regulation 66 disclosure, and the value derived from scheme name/category
-    is only a fallback. Every daily sync re-submits the derived value, so if this
-    rule broke, one sync would quietly downgrade every officially-sourced expense
-    ratio in the database."""
+    dated Regulation 66 disclosure, and the NAV-merge fallback must not replace it.
+    Every daily sync re-submits fallback TER fields, so if this rule broke, one
+    sync would quietly downgrade every officially-sourced expense ratio."""
     amfi_sync._merge_amfi_payload({111111: _scheme()},
                                   [(111111, datetime.date(2025, 2, 1), 100.0)], label="t")
     con = connection.get_connection()
@@ -99,18 +98,18 @@ def test_merge_does_not_let_a_derived_ter_overwrite_an_official_one(db_con):
     assert source == "AMFI TER portal"
 
 
-def test_merge_applies_a_derived_ter_when_none_is_official(db_con, monkeypatch):
+def test_merge_applies_fallback_ter_when_none_is_official(db_con, monkeypatch):
     """The other half of the same rule -- a scheme with no official TER must still
-    receive the derived one, or the precedence guard would just be a write block.
+    receive the fallback from get_scheme_cost_specs, or the precedence guard
+    would just be a write block.
 
-    get_scheme_cost_specs is stubbed because the derived TER comes from matching
-    the scheme name against a bundled CSV, and a fictional test fund matches
-    nothing (returning expense_ratio=None, status 'unknown'), which would make
-    this assertion pass for the wrong reason."""
+    get_scheme_cost_specs is stubbed because the real function always returns
+    expense_ratio=None / status 'unknown', which would make this assertion pass
+    for the wrong reason."""
     monkeypatch.setattr(
         amfi_sync.costs_data, "get_scheme_cost_specs",
         lambda code, name, category, plan: {
-            "expense_ratio": 1.25, "ter_status": "legacy", "ter_source": "Bundled CSV",
+            "expense_ratio": 1.25, "ter_status": "unverified", "ter_source": "test fallback",
             "ter_source_url": None, "ter_as_of_date": None,
         })
     amfi_sync._merge_amfi_payload({111111: _scheme()},
@@ -118,7 +117,7 @@ def test_merge_applies_a_derived_ter_when_none_is_official(db_con, monkeypatch):
     ratio, status = _fetch(
         "SELECT expense_ratio, ter_status FROM schemes WHERE scheme_code = 111111")[0]
     assert ratio == pytest.approx(1.25)
-    assert status == "legacy"
+    assert status == "unverified"
 
 
 def test_merge_does_not_erase_fund_house_or_category_with_a_blank(db_con):

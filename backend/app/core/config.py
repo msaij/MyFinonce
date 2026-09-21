@@ -29,14 +29,7 @@ case-insensitively by default, so `tz` already reads `TZ` with no extra
 aliasing needed.
 """
 
-from pathlib import Path
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# backend/ -- this file is backend/app/core/config.py. Anchoring on the package's
-# own location keeps the default independent of the process's working directory,
-# so it resolves identically in the container (/app) and in a host-side run.
-_BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -46,11 +39,6 @@ class Settings(BaseSettings):
     # env var to work; a host-side run (or a test against a different database)
     # overrides it with DATABASE_URL.
     database_url: str = "postgresql://mf:mf_local_dev@postgres:5432/mutual_funds"
-    # Bundled reference files (amfi_ter_data.csv) and anything imported/exported.
-    # Used to be inferred as "the directory the SQLite file lives in"; with the
-    # database now inside the postgres container there is no such file to infer
-    # it from, so it is its own setting.
-    data_dir: str = str(_BACKEND_ROOT / "data")
     tz: str = "Asia/Kolkata"
     amfi_download_page: str = "https://www.amfiindia.com/net-asset-value/nav-download"
     amfi_history_url: str = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx"

@@ -4,9 +4,12 @@ from app import costs_data
 
 
 class CostDataTests(unittest.TestCase):
-    def test_legacy_ter_is_not_marked_official(self):
+    def test_scheme_without_official_source_is_unknown(self):
         specs = costs_data.get_scheme_cost_specs(1, "360 One Balanced Hybrid Fund", "", "Direct")
-        self.assertEqual(specs["ter_status"], costs_data.STATUS_LEGACY)
+        self.assertIsNone(specs["expense_ratio"])
+        self.assertEqual(specs["ter_status"], costs_data.STATUS_UNKNOWN)
+        self.assertNotEqual(specs["ter_status"], costs_data.STATUS_OFFICIAL)
+        self.assertNotEqual(specs["ter_status"], costs_data.STATUS_LEGACY)
 
     def test_unmatched_scheme_ter_is_unknown(self):
         specs = costs_data.get_scheme_cost_specs(2, "Definitely Not A Real Scheme Name Xyz", "", "Direct")

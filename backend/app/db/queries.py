@@ -1736,7 +1736,8 @@ def get_database_stats(force_refresh: bool = False) -> Dict[str, Any]:
 @cached(ttl=600)
 def get_cost_data_coverage() -> Dict[str, Any]:
     """Breaks down how many schemes have an 'official' (dated, source-linked) vs.
-    'legacy_unverified' (bundled CSV, name-matched) vs. 'unknown' TER record.
+    'legacy_unverified' (leftover unverified name-match rows still stored on
+    schemes) vs. 'unknown' TER record.
     Official TER comes from the AMFI TER-disclosure portal sync
     (see amfi_sync.sync_official_ter). ter_auto_synced counts schemes whose
     ter_source tag matches that portal specifically."""
