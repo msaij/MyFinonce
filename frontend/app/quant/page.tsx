@@ -9,7 +9,6 @@ import { StatCard } from "@/components/shared/StatCard";
 import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { Banner } from "@/components/shared/Banner";
-import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
 import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { formatSignedPct, formatInr, formatDate, toneOf } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
@@ -236,9 +235,6 @@ function QuantAnalysisContent() {
       <p className="mf-page-caption">
         Institutional-grade quantitative intelligence, risk-adjusted scoring (Sharpe, Sortino, Calmar), tail risk (empirical VaR & CVaR), CAPM regression against benchmarks, rolling risk regimes, and forward-looking Monte Carlo paths.
       </p>
-      <div className="mt-3">
-        <NonAdviceDisclaimer compact />
-      </div>
       {result && result.coverage.n_trading_days < 252 && (
         <div className="mt-3">
           <Banner level="warning">Sharpe/CAGR/factor OLS are noisy below 1 year; treat as descriptive.</Banner>

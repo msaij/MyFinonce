@@ -6,7 +6,6 @@ import { useQuery } from "@tanstack/react-query";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { Banner } from "@/components/shared/Banner";
-import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { StatCard } from "@/components/shared/StatCard";
 import { FeeDragPanel } from "@/components/quant/FeeDragPanel";
@@ -58,9 +57,6 @@ export default function SchemeDossierPage() {
     <AppShell>
       <h1 className="mf-page-title">{profile?.scheme_name ?? `Scheme ${code}`}</h1>
       <p className="mf-page-caption">Profile-only dossier. No AUM. NAV history is not loaded unbounded on this page.</p>
-      <div className="mt-3">
-        <NonAdviceDisclaimer compact />
-      </div>
       {isError && <Banner level="danger">Scheme not found.</Banner>}
       {profile && (
         <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">

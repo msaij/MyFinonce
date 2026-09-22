@@ -9,7 +9,6 @@ import { StatCard } from "@/components/shared/StatCard";
 import { DataTable, ColumnConfig } from "@/components/shared/DataTable";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { Banner } from "@/components/shared/Banner";
-import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
 import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
 import { StatusPill } from "@/components/layout/StatusPill";
 import { formatSignedPct, formatInr, toneOf, CHART_MUTED_COLOR } from "@/lib/format";
@@ -512,9 +511,6 @@ function PortfolioAdvisorContent() {
       <h1 className="mf-page-title">Portfolio Suggestion</h1>
       <p className="mf-page-caption">Pick a risk level and a budget; get a model portfolio built from disclosed, quantitative rules against official AMFI historical data.</p>
 
-      <div className="mt-4">
-        <NonAdviceDisclaimer />
-      </div>
       <details className="mt-3 rounded-lg border p-3 text-sm" style={{ borderColor: "var(--mf-border)" }}>
         <summary className="cursor-pointer font-semibold">Methodology</summary>
         <ul className="mt-2 list-disc pl-5 text-xs" style={{ color: "var(--mf-muted)" }}>

@@ -5,6 +5,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 
+import { NonAdviceNotice } from "@/components/shared/Disclaimer";
+import { getAlertCount } from "@/lib/api/holdings";
 import { getMetaStatus } from "@/lib/api/meta";
 import { formatDate } from "@/lib/format";
 import { useDateRangeStore } from "@/lib/stores/dateRange";
@@ -24,6 +26,7 @@ import { StatusPill } from "./StatusPill";
 
 const NAV_ITEMS = [
   { href: "/", label: "Overview" },
+  { href: "/holdings", label: "Holdings" },
   { href: "/screener", label: "Scheme Screener" },
   { href: "/compare", label: "Compare & Simulate" },
   { href: "/quant", label: "Quantitative MF Analysis" },
@@ -41,6 +44,13 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
     queryFn: getMetaStatus,
     refetchInterval: 60_000,
   });
+  // Unacknowledged holdings alerts (evaluated server-side after each NAV sync).
+  const { data: alertCount } = useQuery({
+    queryKey: ["holdings", "alert-count"],
+    queryFn: getAlertCount,
+    refetchInterval: 60_000,
+  });
+  const unackedAlerts = alertCount?.unacked ?? 0;
 
   // Before `status` resolves, `status?.is_stale` is undefined (falsy) -- without this guard
   // the pill would flash green ("Live (Closing NAVs)") during initial load on a database
@@ -79,6 +89,15 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
             }}
           >
             {item.label}
+            {item.href === "/holdings" && unackedAlerts > 0 && (
+              <span
+                className="ml-2 rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold"
+                style={{ background: "var(--mf-danger)", color: "#fff" }}
+                aria-label={`${unackedAlerts} unread holdings alert${unackedAlerts === 1 ? "" : "s"}`}
+              >
+                {unackedAlerts}
+              </span>
+            )}
           </Link>
         ))}
         <div className="mt-3 mb-1 text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
@@ -137,7 +156,11 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
         )}
       </div>
 
-      <div className="mt-auto border-t pt-2" style={{ borderColor: "var(--mf-border)" }}>
+      <div className="mt-auto">
+        <NonAdviceNotice />
+      </div>
+
+      <div className="border-t pt-2" style={{ borderColor: "var(--mf-border)" }}>
         <button
           type="button"
           className="w-full text-left text-xs font-semibold"

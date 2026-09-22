@@ -10,7 +10,6 @@ import { DataTable, ColumnConfig } from "@/components/shared/DataTable";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { Banner } from "@/components/shared/Banner";
-import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
 import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
 import { formatSignedPct, formatInr, toneOf, CHART_MUTED_COLOR } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
@@ -361,9 +360,6 @@ function CompareContent() {
   return (
     <AppShell pageContext={selectedCodes.length ? { label: "Selected Funds", value: String(selectedCodes.length) } : undefined}>
       <h1 className="mf-page-title">Compare & Simulate</h1>
-      <div className="mt-3">
-        <NonAdviceDisclaimer compact />
-      </div>
       <p className="mf-page-caption">Compare mutual fund schemes side-by-side, then backtest the same funds together as a weighted portfolio.</p>
 
       {/* --- Shared fund selector --- */}

@@ -10,7 +10,6 @@ import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { DataTable, ColumnConfig } from "@/components/shared/DataTable";
 import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { Banner } from "@/components/shared/Banner";
-import { NonAdviceDisclaimer } from "@/components/shared/Disclaimer";
 import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
 import { formatSignedPct, formatDate, toneOf, CHART_MUTED_COLOR } from "@/lib/format";
 import { useDebouncedValue, useUrlSync } from "@/lib/hooks";
@@ -545,9 +544,6 @@ function OverviewContent() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="mf-page-title">Executive Market Overview & Alpha Intelligence</h1>
-          <div className="mt-3">
-            <NonAdviceDisclaimer compact />
-          </div>
           <p className="mf-page-caption">
             Comprehensive market breadth, macro asset class trends, relative alpha rankings, and institutional quadrant analysis.
           </p>
