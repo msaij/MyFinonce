@@ -181,3 +181,26 @@ class TestBlackLittermanPrecision:
         resp = client.post("/api/portfolio-advisor/black-litterman", json=payload)
         assert resp.status_code == 400
 
+
+
+# --- Degenerate inputs (ported from the retired adversarial suite) ------------------------
+
+@pytest.mark.parametrize("cov", [np.full((3, 3), 0.04), np.zeros((3, 3))], ids=["rank-1", "all-zero"])
+def test_singular_covariance_still_yields_long_only_weights(cov):
+    res = optimize_black_litterman(cov, np.array([0.33, 0.33, 0.34]), np.array([[1.0, -1.0, 0.0]]), np.array([0.05]))
+    w = res["optimal_weights"]
+    assert math.isclose(sum(w), 1.0, abs_tol=1e-5) and all(x >= 0.0 for x in w)
+    post = np.array(res["posterior_cov_matrix"])
+    assert np.allclose(post, post.T, atol=1e-6)
+
+
+def test_vanishing_confidence_reverts_monotonically_to_equilibrium():
+    cov = np.array([[0.04, 0.01], [0.01, 0.09]])
+    w_mkt = np.array([0.6, 0.4])
+    pi = 2.5 * (cov @ w_mkt)
+    diffs = [
+        abs(optimize_black_litterman(cov, w_mkt, np.array([[1.0, 0.0]]), np.array([0.50]), risk_aversion=2.5,
+                                     views_confidences=[c])["posterior_expected_returns"][0] - pi[0])
+        for c in (0.1, 0.01, 1e-3, 1e-4)
+    ]
+    assert all(a > b for a, b in zip(diffs, diffs[1:])) and diffs[-1] < 1e-4

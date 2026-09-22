@@ -14,7 +14,6 @@ Verifies:
 import math
 import numpy as np
 import pandas as pd
-import pytest
 
 from app.stress_testing import (
     evaluate_historical_stress_scenarios,
@@ -160,3 +159,30 @@ class TestHistoricalCrisisReplayScenarios:
         assert "data" in fig
         assert len(fig["data"]) == 2  # Fund and Benchmark traces
         assert "layout" in fig
+
+
+# --- Messy NAV input (ported from the retired adversarial suite) ------------------------
+
+def _crisis_frame(dates, drop_pct, from_date):
+    return pd.DataFrame({"nav_date": dates, "nav": [100.0 - (drop_pct if d >= pd.Timestamp(from_date) else 0.0) for d in dates]})
+
+
+def test_duplicate_nav_dates_do_not_break_replay():
+    dates = pd.date_range("2020-01-01", "2021-01-01", freq="D").tolist() + [pd.Timestamp("2020-03-23")] * 2
+    covid = evaluate_historical_stress_scenarios(1, df_hist=_crisis_frame(dates, 15.0, "2020-03-01"))["covid_march_2020"]
+    assert covid["available"] and math.isclose(covid["max_drawdown_pct"], -15.0, abs_tol=1e-2)
+
+
+def test_unsorted_nav_dates_are_sorted_before_replay():
+    dates = pd.date_range("2020-01-01", "2021-01-01", freq="D").tolist()
+    np.random.default_rng(12).shuffle(dates)
+    covid = evaluate_historical_stress_scenarios(1, df_hist=_crisis_frame(dates, 25.0, "2020-03-20"))["covid_march_2020"]
+    assert covid["available"] and covid["trough_date"] == "2020-03-20"
+    assert math.isclose(covid["max_drawdown_pct"], -25.0, abs_tol=1e-2)
+
+
+def test_all_nan_crisis_window_is_reported_unavailable():
+    dates = pd.date_range("2020-01-01", "2021-01-01", freq="D")
+    df = pd.DataFrame({"nav_date": dates, "nav": 100.0})
+    df.loc[(df["nav_date"] >= "2020-02-15") & (df["nav_date"] <= "2020-04-15"), "nav"] = None
+    assert evaluate_historical_stress_scenarios(1, df_hist=df)["covid_march_2020"]["available"] is False

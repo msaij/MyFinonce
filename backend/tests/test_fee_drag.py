@@ -4,7 +4,6 @@ and gross vs net alpha isolation.
 """
 
 import math
-import pytest
 
 from app.services import fee_drag
 
@@ -97,17 +96,3 @@ class TestFeeDragUnit:
         res = fee_drag.compute_fee_drag_attribution(0.15, 0.14, 0.008, 0.018, initial_capital=0.0)
         assert res["horizons"]["1Y"]["rupee_wealth_erosion"] == 0.0
         assert res["horizons"]["10Y"]["rupee_wealth_erosion"] == 0.0
-
-    def test_live_db_scheme_codes_fee_drag(self):
-        """Verifies database integration using actual scheme codes (Bandhan Nifty 50)."""
-        res = fee_drag.compute_fee_drag_attribution(
-            direct_scheme_code=118482,
-            regular_scheme_code=118481,
-            initial_capital=100000.0,
-        )
-        assert "horizons" in res
-        assert res.get("status") in ("ok", "unavailable", "unpaired", None)
-        if res.get("status") == "ok" and res["horizons"]:
-            assert res["schemes"]["direct_scheme"]["scheme_code"] == 118482
-            assert res["schemes"]["regular_scheme"]["scheme_code"] == 118481
-            assert res["horizons"]["1Y"]["wealth_direct"] > 0

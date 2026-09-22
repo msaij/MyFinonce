@@ -246,3 +246,29 @@ class TestFactorModelEdgeCases:
         res = compute_multivariate_factor_attribution(fund_ret, factors_df)
         assert res["r_squared"] >= 0.0
         assert res["n_observations"] == 80
+
+
+# --- Data-alignment edge cases (ported from the retired adversarial suite) ------------
+
+def _factor_frame(n, seed):
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2023-01-02", periods=n, freq="B")
+    return pd.DataFrame({k: rng.normal(0, 0.01, n) for k in ("mkt_excess", "smb", "hml", "wml")}, index=dates)
+
+
+def test_interleaved_nans_are_dropped_row_wise():
+    factors = _factor_frame(80, 555)
+    fund = factors["mkt_excess"] * 1.1
+    fund.iloc[[5, 15]] = np.nan
+    factors.iloc[20, 0] = np.nan
+    factors.iloc[30, 2] = np.nan
+    res = compute_multivariate_factor_attribution(fund, factors)
+    assert res["n_observations"] == 76
+    assert math.isclose(sum(res["variance_decomposition"].values()), 100.0, abs_tol=1e-2)
+
+
+def test_no_overlapping_dates_raises_value_error():
+    factors = _factor_frame(30, 1)
+    fund = pd.Series(0.01, index=pd.date_range("2020-01-01", periods=30, freq="B"))
+    with pytest.raises(ValueError, match="Insufficient overlapping observations"):
+        compute_multivariate_factor_attribution(fund, factors)

@@ -85,11 +85,13 @@ class TestPlanMatcherUnit:
         pairs = plan_matcher.pair_direct_and_regular_schemes(schemes)
         assert pairs.get(801) == 802
 
-    def test_live_db_pairing_integrity(self):
-        """Verifies pairing execution against live PostgreSQL database."""
-        pairs = plan_matcher.pair_direct_and_regular_schemes()
-        assert len(pairs) > 1000
-        # Check known benchmark pair: Bandhan Nifty 50 Index Fund Regular Growth (112877) -> Direct Growth (118482)
-        assert pairs.get(112877) == 118482
-        # And IDCW pair: Regular IDCW (112878) -> Direct IDCW (118483)
-        assert pairs.get(112878) == 118483
+
+# --- Word-boundary traps (ported from the retired adversarial suite) ---------------------
+
+@pytest.mark.parametrize("name,option,expected", [
+    ("Franklin India Diversified Equity Fund - Growth", "Growth", "growth"),
+    ("UTI Dividend Yield Fund - Regular Plan - Growth", "Growth", "growth"),
+    ("UTI Dividend Yield Fund - Regular Plan - IDCW", "IDCW", "idcw"),
+])
+def test_div_substrings_do_not_make_growth_plans_idcw(name, option, expected):
+    assert plan_matcher.extract_option_type(name, option) == expected

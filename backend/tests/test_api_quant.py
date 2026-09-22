@@ -73,3 +73,17 @@ def test_monte_carlo_endpoint_happy_path(client):
     body = resp.json()
     assert body["figure"]["data"]
     assert 0.0 <= body["prob_profit_pct"] <= 100.0
+
+
+# --- /factors window contract (ported from the retired adversarial suites) -----------
+# docs/maintainability-refactor.md (PR 7) relies on these exact 422 messages.
+
+@pytest.mark.parametrize("start,end,message", [
+    ("2025-01-01", "2025-01-07", "Insufficient trading days"),   # 7 days of NAVs, 60 required
+    ("2015-01-01", "2015-01-10", "No NAV records found"),        # before the scheme's history
+    ("2099-01-01", "2099-12-31", "No NAV records found"),        # far future
+])
+def test_factors_window_errors_are_clear_422s(client, start, end, message):
+    resp = client.get("/api/quant/111/factors", params={"start_date": start, "end_date": end})
+    assert resp.status_code == 422
+    assert message in str(resp.json()["detail"])

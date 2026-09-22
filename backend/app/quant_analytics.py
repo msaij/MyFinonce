@@ -1,10 +1,9 @@
 import datetime
-import math
 import threading
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 from app.core.cache import cached
 from app.db.connection import get_connection, fetchdf
 
@@ -825,120 +824,3 @@ def compute_tail_risk_metrics(
         "drawdown": dd_metrics,
         "benchmark_capture": bench_metrics,
     }
-
-
-def compute_cornish_fisher_var(
-    returns: np.ndarray,
-    confidence_levels: List[float] = [0.95, 0.99],
-) -> Dict[str, float]:
-    """Cornish-Fisher expansion adjusting VaR for skewness and excess kurtosis."""
-    clean = returns[~np.isnan(returns)]
-    if len(clean) < 5:
-        raise ValueError("Insufficient return data for Cornish-Fisher VaR calculation (need >= 5)")
-
-    mu = float(np.mean(clean))
-    sigma = float(np.std(clean, ddof=1))
-    if sigma < 1e-12:
-        return {f"var_{int(round(c * 100))}_cf_daily_pct": 0.0 for c in confidence_levels}
-
-    ret_s = pd.Series(clean)
-    s = float(ret_s.skew()) if not np.isnan(ret_s.skew()) else 0.0
-    k = float(ret_s.kurtosis()) if not np.isnan(ret_s.kurtosis()) else 0.0
-
-    out = {
-        "skewness": round(s, 4),
-        "kurtosis": round(k, 4),
-        "mean_daily_pct": round(mu * 100.0, 4),
-        "vol_daily_pct": round(sigma * 100.0, 4),
-    }
-
-    for alpha_conf in confidence_levels:
-        tag = int(round(alpha_conf * 100))
-        p = 1.0 - alpha_conf
-        z = float(stats.norm.ppf(p))
-        var_cf_raw = cornish_fisher_var(clean, alpha=p)
-        var_cf_daily = -var_cf_raw
-        var_cf_ann = var_cf_daily * math.sqrt(252.0)
-        var_gaussian = -(mu + z * sigma)
-
-        out[f"var_{tag}_cf_daily_pct"] = round(float(var_cf_daily * 100.0), 4)
-        out[f"var_{tag}_cf_ann_pct"] = round(float(var_cf_ann * 100.0), 4)
-        out[f"var_{tag}_gaussian_daily_pct"] = round(float(var_gaussian * 100.0), 4)
-        out[f"var_{tag}_conservative_premium_pct"] = round(float((var_cf_daily - var_gaussian) * 100.0), 4)
-
-    return out
-
-
-def compute_expected_shortfall_and_capture(
-    fund_returns: np.ndarray,
-    bench_returns: Optional[np.ndarray] = None,
-    nav_series: Optional[pd.Series] = None,
-    confidence_level: float = 0.99,
-) -> Dict[str, Any]:
-    """Calculates 99% CVaR (Expected Shortfall), drawdown duration/recovery, and downside capture efficiency."""
-    clean_f = fund_returns[~np.isnan(fund_returns)]
-    if len(clean_f) < 5:
-        raise ValueError("Insufficient data points for CVaR")
-
-    # 1. CVaR / Expected Shortfall
-    p_cutoff = (1.0 - confidence_level) * 100.0
-    var_threshold = float(np.percentile(clean_f, p_cutoff))
-    tail = clean_f[clean_f <= var_threshold]
-    cvar_daily = float(np.mean(tail)) if len(tail) > 0 else var_threshold
-    cvar_ann = cvar_daily * math.sqrt(252.0)
-
-    # 2. Maximum Drawdown duration & recovery if nav_series given
-    dd_metrics = {
-        "max_drawdown_pct": 0.0,
-        "drawdown_duration_days": 0,
-        "recovery_duration_days": None,
-        "peak_date": None,
-        "trough_date": None,
-    }
-    if nav_series is not None and len(nav_series) > 2:
-        df_nav = pd.DataFrame({"nav_date": pd.to_datetime(nav_series.index), "nav": nav_series.values})
-        dd_res = compute_drawdown_duration_metrics(df_nav)
-        dd_metrics = {
-            "max_drawdown_pct": dd_res["max_drawdown_pct"],
-            "drawdown_duration_days": dd_res["drawdown_decline_days"],
-            "recovery_duration_days": dd_res["drawdown_recovery_days"],
-            "peak_date": dd_res["max_drawdown_peak_date"],
-            "trough_date": dd_res["max_drawdown_trough_date"],
-        }
-
-    # 3. Downside capture efficiency
-    capture_metrics = {
-        "downside_capture_ratio": 1.0,
-        "upside_capture_ratio": 1.0,
-        "capture_efficiency": 1.0,
-    }
-    if bench_returns is not None and len(bench_returns) == len(clean_f):
-        df_cb = pd.DataFrame({"fund": clean_f, "bench": bench_returns}).dropna()
-        down_days = df_cb[df_cb["bench"] < 0]
-        up_days = df_cb[df_cb["bench"] > 0]
-
-        if len(down_days) > 0:
-            fund_down_comp = float(np.prod(1.0 + down_days["fund"]) - 1.0)
-            bench_down_comp = float(np.prod(1.0 + down_days["bench"]) - 1.0)
-            if abs(bench_down_comp) > 1e-8:
-                capture_metrics["downside_capture_ratio"] = round((fund_down_comp / bench_down_comp) * 100.0, 2)
-
-        if len(up_days) > 0:
-            fund_up_comp = float(np.prod(1.0 + up_days["fund"]) - 1.0)
-            bench_up_comp = float(np.prod(1.0 + up_days["bench"]) - 1.0)
-            if abs(bench_up_comp) > 1e-8:
-                capture_metrics["upside_capture_ratio"] = round((fund_up_comp / bench_up_comp) * 100.0, 2)
-
-        if capture_metrics["downside_capture_ratio"] > 1e-4:
-            capture_metrics["capture_efficiency"] = round(
-                capture_metrics["upside_capture_ratio"] / capture_metrics["downside_capture_ratio"], 4
-            )
-
-    return {
-        "cvar_99_daily_pct": round(float(cvar_daily * 100.0), 4),
-        "cvar_99_ann_pct": round(float(cvar_ann * 100.0), 4),
-        "var_99_daily_pct": round(float(var_threshold * 100.0), 4),
-        "drawdown_metrics": dd_metrics,
-        "capture_metrics": capture_metrics,
-    }
-
