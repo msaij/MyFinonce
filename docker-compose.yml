@@ -87,7 +87,10 @@ services:
     container_name: mf_backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # Loopback only. The holdings ledger (/api/holdings) is the owner's
+      # personal financial data and has no login in front of it -- publishing
+      # on 0.0.0.0 would hand it to anyone on the same LAN/Wi-Fi.
+      - "127.0.0.1:8000:8000"
     environment:
       - DATABASE_URL=postgresql://mf:mf_local_dev@postgres:5432/mutual_funds
       - TZ=Asia/Kolkata
@@ -166,12 +169,20 @@ services:
     container_name: mf_frontend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # Loopback only, for the same reason as the backend's port.
+      - "127.0.0.1:3000:3000"
     depends_on:
       - backend
 
 volumes:
   # Named volume, deliberately: keeps the cluster on the VM's ext4 rather than a
   # Windows bind mount. Survives `docker compose down`; `docker compose down -v`
-  # destroys it, which is the intended way to start from an empty database.
+  # destroys it.
+  #
+  # DO NOT treat `down -v` as a harmless reset any more. NAV/TER data is public
+  # and re-downloadable from AMFI, but this volume also holds the holdings
+  # ledger (portfolios, holding_transactions, goals, SIP mandates) -- data the
+  # owner typed in by hand that exists nowhere else. Take a backup first:
+  #   scripts\backup_holdings.ps1        (pg_dump of the holdings tables)
+  # or GET /api/holdings/backup.json from the running app.
   pgdata:

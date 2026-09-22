@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import product_flags, settings
-from app.routers import admin, backtest, leaders, meta, overview, portfolio_advisor, quant, schemes, screener
+from app.routers import admin, backtest, holdings, leaders, meta, overview, portfolio_advisor, quant, schemes, screener
 
 app = FastAPI(title="Indian Mutual Funds API", version="0.1.0")
 _access_log = logging.getLogger("access")
@@ -61,6 +61,7 @@ app.include_router(backtest.router)
 app.include_router(portfolio_advisor.router)
 app.include_router(quant.router)
 app.include_router(admin.router)
+app.include_router(holdings.router)
 
 
 @app.on_event("startup")

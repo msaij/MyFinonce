@@ -59,17 +59,23 @@ async function extractErrorMessage(res: Response): Promise<string> {
   return body || res.statusText;
 }
 
-export async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+async function apiSend<T>(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   const token = path.startsWith("/api/admin/") ? getAdminToken() : null;
   if (token) headers["X-Admin-Token"] = token;
   const res = await fetch(path, {
-    method: "POST",
+    method,
     headers,
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
     throw new ApiError(res.status, await extractErrorMessage(res));
   }
   return res.json();
 }
+
+export const apiPost = <T>(path: string, body: unknown): Promise<T> => apiSend<T>("POST", path, body);
+export const apiPut = <T>(path: string, body: unknown): Promise<T> => apiSend<T>("PUT", path, body);
+export const apiPatch = <T>(path: string, body: unknown): Promise<T> => apiSend<T>("PATCH", path, body);
+export const apiDelete = <T>(path: string): Promise<T> => apiSend<T>("DELETE", path);

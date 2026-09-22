@@ -218,7 +218,21 @@ def sync_daily_nav(_trigger: str = "manual") -> Tuple[bool, str]:
         _record_sync_result(False, str(e), _trigger)
         raise
     _record_sync_result(success, msg, _trigger)
+    if success:
+        _evaluate_holdings_alerts()
     return success, msg
+
+
+def _evaluate_holdings_alerts() -> None:
+    """New NAVs can trip the owner's holdings alert rules (drift, drawdown, stale
+    NAV). Runs after WRITE_LOCK is released, and can never fail or change the
+    reported outcome of the market-data sync itself."""
+    try:
+        from app.services import holdings_insights
+
+        holdings_insights.evaluate_all()
+    except Exception:
+        logger.exception("Holdings alert evaluation after NAV sync failed")
 
 def _sync_daily_nav_impl() -> Tuple[bool, str]:
     """
