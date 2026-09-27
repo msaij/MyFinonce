@@ -56,6 +56,21 @@ NAV_DEVIATION_WARN = 0.005
 # XIRR annualises; over a few days it turns a 1% move into a three-digit rate.
 MIN_XIRR_DAYS = 30
 
+from app.classification import sebi_category  # noqa: E402  (re-exported: svc.sebi_category)
+
+
+def _as_date(value: Any) -> Optional[datetime.date]:
+    if value is None or value != value:     # NaN / NaT compare unequal to themselves
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if hasattr(value, "date"):          # pandas Timestamp
+        return value.date()
+    return datetime.date.fromisoformat(str(value)[:10])
+
+
 UNITS_Q = Decimal("0.001")      # AMCs allot to 3 decimals
 STORED_UNITS_Q = Decimal("0.000001")
 MONEY_Q = Decimal("0.01")
@@ -464,21 +479,41 @@ def replay_view(portfolio_ids: Sequence[int]) -> Tuple[Dict[int, ledger.LedgerRe
     return {pid: ledger.replay(rows) for pid, rows in by_pf.items()}, txns
 
 
-def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: List[int], split_adjusted: bool) -> Dict[str, Any]:
+def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: List[int], split_adjusted: bool,
+                  units_new_today: Decimal = Decimal(0)) -> Dict[str, Any]:
     units = float(pos.units) if not pos.is_closed else 0.0
     nav = info.get("latest_nav")
     nav = float(nav) if nav is not None and nav == nav else None
     value = units * nav if nav is not None else 0.0
     cost = float(pos.cost_basis) if units else 0.0
-    chg = info.get("change_1d_pct")
-    day_change = units * nav * (1.0 - 1.0 / (1.0 + float(chg) / 100.0)) if (units and nav is not None and chg is not None and chg == chg) else 0.0
+    # The day's rupee move is earned by the units held at the PREVIOUS close:
+    # units_then x (nav - nav_1d_ago). Units allotted on the latest NAV date were bought
+    # at that NAV and have not moved yet; units redeemed on it were held through the move
+    # and sold at its end, so they are added back. This is the broker convention, and it
+    # is what makes the column add up to the portfolio's 1-day tile. The NAV pair is used
+    # directly: rebuilding yesterday's value from change_1d_pct, which summary_table rounds
+    # to 4 dp, was Rs 0.63 off across two funds on the owner's real portfolio.
+    prev_nav = info.get("nav_1d_ago")
+    prev_nav = float(prev_nav) if prev_nav is not None and prev_nav == prev_nav else None
+    units_then = units - float(units_new_today)
+    day_change = units_then * (nav - prev_nav) if (units_then and nav is not None and prev_nav is not None) else 0.0
     xirr_pct, xirr_note = compute_xirr(pos.cash_flows, info.get("latest_date"), value)
+    first_flow = min((d for d, _ in pos.cash_flows), default=None)
+    ter = info.get("expense_ratio")
+    ter = float(ter) if ter is not None and ter == ter else None
+    riskometer = info.get("riskometer")
     plan = str(info.get("plan_type") or "")
     return {
         "scheme_code": pos.scheme_code,
         **{k: info.get(k) for k in ("scheme_name", "fund_house", "category", "broad_category", "option_type",
                                     "expense_ratio", "ter_status", "latest_date")},
+        "sebi_category": sebi_category(info.get("category")),
+        "riskometer": riskometer if isinstance(riskometer, str) and riskometer else None,
+        # What the expense ratio costs a year at today's value. The TER is deducted from
+        # the NAV daily, so this is already inside the returns shown -- it is not a bill.
+        "annual_fee": value * ter / 100.0 if (ter is not None and value > 0) else None,
         "plan_type": plan or None,
+        "display_name": info.get("display_name") or hdb.display_name({"scheme_code": pos.scheme_code}),
         "units": units,
         "avg_cost_nav": cost / units if units else None,
         "cost_basis": cost,
@@ -488,11 +523,14 @@ def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: Lis
         "unrealised_pct": (value - cost) / cost * 100.0 if cost > 0 else None,
         "realised_gain": float(pos.realised_gain),
         "dividend_income": float(pos.dividend_income),
+        "stamp_duty": float(pos.stamp_duty),
         "total_invested": float(pos.total_invested),
         "total_redeemed": float(pos.total_redeemed),
         "day_change": day_change,
         "xirr_pct": xirr_pct,
         "xirr_note": xirr_note,
+        "xirr_available_on": (first_flow + datetime.timedelta(days=MIN_XIRR_DAYS)).isoformat()
+                             if (xirr_note == "too_short" and first_flow is not None) else None,
         "first_date": pos.first_date,
         "txn_count": pos.txn_count,
         "portfolio_ids": portfolio_ids,
@@ -503,6 +541,42 @@ def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: Lis
             "split_adjusted": split_adjusted,
         },
     }
+
+
+TER_MIN_PEERS = 10
+TER_HIGH_VS_P90 = 1.25      # > 1.25 x the category's 90th percentile
+TER_LOW_VS_P10 = 0.5        # < half the category's 10th percentile
+TER_SUM_TOLERANCE = 0.02    # components vs total, in percentage points
+
+
+def ter_context(meta: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """Per scheme: its TER, the disclosed breakdown, where it sits in its category
+    (same plan type), and a verdict. Under SEBI's current disclosure a TER includes
+    brokerage, transaction costs and statutory levies, so e.g. a 0.10%-base
+    arbitrage fund can correctly total 1.00% -- judging a TER against its own
+    category's spread is what makes that readable."""
+    spread = hdb.category_ter_spread([(m.get("category"), m.get("plan_type")) for m in meta.values()])
+    out: Dict[int, Dict[str, Any]] = {}
+    for code, m in meta.items():
+        ter = m.get("expense_ratio")
+        ter = float(ter) if ter is not None and ter == ter else None
+        parts = {k: m.get(f"ter_{k}") for k in ("base_expense_ratio", "brokerage_cost_pct", "transaction_cost_pct", "statutory_levies_pct")}
+        parts = {k: float(v) for k, v in parts.items() if v is not None and v == v}
+        s = spread.get((m.get("category"), m.get("plan_type")))
+        status, reason = "ok", None
+        if ter is None:
+            status, reason = "missing", "No expense ratio on record."
+        elif m.get("ter_status") != "official":
+            status, reason = "unverified", "Not from AMFI's official TER disclosure; treat as an estimate."
+        elif len(parts) == 4 and abs(sum(parts.values()) - ter) > TER_SUM_TOLERANCE:
+            status, reason = "inconsistent", f"Its disclosed components add up to {sum(parts.values()):.2f}%, not {ter:.2f}%."
+        elif s and s["peers"] >= TER_MIN_PEERS and ter > s["p90"] * TER_HIGH_VS_P90:
+            status, reason = "high", f"Well above its peers: {ter:.2f}% vs a category median of {s['median']:.2f}% (90% of peers are at or below {s['p90']:.2f}%)."
+        elif s and s["peers"] >= TER_MIN_PEERS and ter < s["p10"] * TER_LOW_VS_P10:
+            status, reason = "low", f"Unusually low for its category: {ter:.2f}% vs a median of {s['median']:.2f}%. Possibly an incomplete disclosure."
+        out[code] = {"ter_pct": ter, "breakdown": parts or None, "as_of": m.get("ter_as_of_date"),
+                     "category_spread": s, "status": status, "reason": reason}
+    return out
 
 
 def summary(pid: str) -> Dict[str, Any]:
@@ -526,10 +600,21 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             held_in[code].append(pid_i)
     meta = hdb.scheme_meta(list(by_code))
     split_codes = {int(t["scheme_code"]) for t in txns if t["units_scale"] != 1}
+    # Net units allotted on (or after) each fund's latest NAV date: not yet held for a move.
+    units_new_today: Dict[int, Decimal] = defaultdict(Decimal)
+    for t in txns:
+        code = int(t["scheme_code"])
+        latest = _as_date(meta.get(code, {}).get("latest_date"))
+        if latest is not None and _as_date(t["trade_date"]) >= latest:
+            units_new_today[code] += ledger.unit_sign(t["txn_type"]) * ledger.effective_units(t)
+    from app.services import holdings_analytics as ha  # local: ha imports this module
     positions = [
-        _position_row(ledger.merge_positions(parts), meta.get(code, {}), held_in[code], code in split_codes)
+        _position_row(ledger.merge_positions(parts), meta.get(code, {}), held_in[code], code in split_codes,
+                      units_new_today[code])
         for code, parts in by_code.items()
     ]
+    for p in positions:
+        p["asset_class"] = ha.classify(p.get("category"), p.get("broad_category"), p.get("scheme_name"))
 
     open_pos = [p for p in positions if not p["is_closed"]]
     total_value = sum(p["current_value"] for p in open_pos)
@@ -542,10 +627,29 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
     cost_total = sum(p["cost_basis"] for p in open_pos)
     realised = sum(p["realised_gain"] for p in positions)
     dividends = sum(p["dividend_income"] for p in positions)
-    day_change = sum(p["day_change"] for p in open_pos)
+    stamp_duty = sum(p["stamp_duty"] for p in positions)
     unrealised = total_value - cost_total
+    net_contributed = -sum(float(v) for _, v in pf_flows)
     xirr_pct, xirr_note = compute_xirr(pf_flows, as_of, total_value)
-    prev_value = total_value - day_change
+
+    # The portfolio's 1-day change comes from a one-day window of the same
+    # time-weighted engine that powers the "Last N days" tiles beneath it, so the two
+    # rows agree by construction rather than by coincidence. Summing the per-position
+    # day_change above would not do: those are each fund's own NAV move applied to
+    # today's unit balance, so units bought today would be credited a day's move they
+    # never earned (on the real ledger, Rs 217 of it on one Rs 1,000,000 purchase).
+    day = ha.day_change(key)
+    # Value-weighted expense ratio over the funds that have one, and how much of the
+    # money that covers -- a weighted TER over half the portfolio must say so.
+    with_ter = [p for p in open_pos if p["annual_fee"] is not None]
+    ter_value = sum(p["current_value"] for p in with_ter)
+    annual_fee = sum(p["annual_fee"] for p in with_ter)
+    since = ha.since_start(key)
+    first_flow = min((d for d, _ in pf_flows), default=None)
+    # Measured to the valuation date the gain is priced at; a fully exited view has none,
+    # so its money is counted to its last flow (every rupee is back out by then anyway).
+    days_to = _as_date(as_of) or max((d for d, _ in pf_flows), default=None)
+    avg_days = ledger.average_days_invested(results.values(), days_to)
     return {
         "portfolio_ids": portfolio_ids,
         "as_of": as_of,
@@ -556,12 +660,42 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             "unrealised_pct": unrealised / cost_total * 100.0 if cost_total > 0 else None,
             "realised_gain": realised,
             "dividend_income": dividends,
-            "total_gain": unrealised + realised + dividends,
-            "net_contributed": -sum(float(v) for _, v in pf_flows),
+            "stamp_duty": stamp_duty,
+            # Straight from the cash: value + money taken out - money paid in. It
+            # equals unrealised + realised + dividends - stamp duty up to paise of
+            # AMC unit rounding (units x NAV rarely equals amount - stamp exactly),
+            # which is why it isn't built from those parts.
+            "total_gain": total_value - net_contributed,
+            # On the cash actually put in, net of withdrawals. Undefined once more has been
+            # taken out than put in -- a percentage of a negative base is a sign error, not
+            # a return.
+            "total_gain_pct": (total_value - net_contributed) / net_contributed * 100.0 if net_contributed > 0 else None,
+            "net_contributed": net_contributed,
             "xirr_pct": xirr_pct,
             "xirr_note": xirr_note,
-            "day_change": day_change,
-            "day_change_pct": day_change / prev_value * 100.0 if prev_value > 0 else None,
+            # When a withheld XIRR will start to show, so the tile can promise a date rather
+            # than repeat a reason. Calendar days here, unlike the NAV-day windows: the
+            # threshold is measured in calendar days from the first cash flow.
+            "xirr_available_on": (first_flow + datetime.timedelta(days=MIN_XIRR_DAYS)).isoformat()
+                                 if (xirr_note == "too_short" and first_flow is not None) else None,
+            "first_investment_date": first_flow.isoformat() if first_flow is not None else None,
+            # How long the money behind Total gain has been invested: each rupee put in counts
+            # from its purchase to the valuation date (or to the redemption that took it out,
+            # oldest first), averaged by amount. For a SIP about half the time since the first
+            # instalment -- which is how long the gain has actually had to build.
+            "avg_days_invested": avg_days,
+            "days_since_first_investment": (days_to - first_flow).days if (days_to and first_flow) else None,
+            # Time-weighted, since the first investment, beside the funds' own peer groups.
+            "twr_since_start_pct": since["twr_pct"],
+            "benchmark_since_start_pct": since["benchmark_pct"],
+            "excess_since_start_pp": since["excess_pp"],
+            "benchmark_name": since["benchmark_name"],
+            "day_change": day["gain"],
+            "day_change_pct": day["change_pct"],
+            "day_benchmark_pct": day["benchmark_change_pct"],
+            "weighted_ter_pct": annual_fee / ter_value * 100.0 if ter_value > 0 else None,
+            "annual_fee": annual_fee if with_ter else None,
+            "ter_coverage_pct": ter_value / total_value * 100.0 if total_value > 0 else None,
             "open_positions": len(open_pos),
             "transactions": len(txns),
         },
@@ -597,7 +731,8 @@ def position_detail(pid: str, scheme_code: int) -> Dict[str, Any]:
     nav_df = db.get_nav_history_dataframe([code], start_date=min(t["trade_date"] for t in rows) - datetime.timedelta(days=30))
     nav_series = [{"date": d, "nav": float(n)} for d, n in zip(nav_df["nav_date"], nav_df["nav"])] if not nav_df.empty else []
     position = next((p for p in summary(pid)["positions"] if p["scheme_code"] == code), None)
-    return {"position": position, "lots": lots, "transactions": txn_rows, "nav_series": nav_series}
+    ter = ter_context(hdb.scheme_meta([code])).get(code)
+    return {"position": position, "ter": ter, "lots": lots, "transactions": txn_rows, "nav_series": nav_series}
 
 
 # --- Export / backup ------------------------------------------------------------------

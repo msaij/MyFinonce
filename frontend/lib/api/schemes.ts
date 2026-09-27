@@ -19,16 +19,34 @@ export const getNavHistory = (codes: number[], start?: string, end?: string) =>
     end,
   });
 
+/** One scheme's percentile among ACTIVE funds of the same category and plan type. */
+export interface PeerRank {
+  value: number;
+  percentile: number;
+  peers: number;
+}
+
 export interface SchemeProfile {
   [key: string]: unknown;
   scheme_code: number;
   scheme_name: string;
+  /** "Name (Plan - Option) [AMFI code]" -- the app-wide label. */
+  display_name: string;
   fund_house: string;
   category: string;
+  broad_category: string | null;
   plan_type: string;
   option_type?: string;
+  is_active: boolean | null;
   expense_ratio: number | null;
   ter_status: string | null;
+  ter_as_of_date: string | null;
+  ter_source: string | null;
+  ter_source_url: string | null;
+  return_3y_pct: number | null;
+  return_5y_pct: number | null;
+  return_10y_pct: number | null;
+  peer_rank?: Partial<Record<"1y" | "3y" | "5y", PeerRank | null>>;
   ter_base_expense_ratio: number | null;
   ter_brokerage_cost_pct: number | null;
   ter_transaction_cost_pct: number | null;
@@ -56,6 +74,6 @@ export const getScheme = (code: number) => apiGet<SchemeDetail>(`/api/schemes/${
 export const getSchemeProfile = (code: number) => apiGet<SchemeProfile>(`/api/schemes/${code}/profile`);
 
 export const getSchemeTerHistory = (code: number) =>
-  apiGet<{ ter_date: string; total_ter_pct: number | null; base_expense_ratio_pct: number | null }[]>(
+  apiGet<{ ter_date: string; valid_to: string | null; total_ter_pct: number | null; base_expense_ratio_pct: number | null }[]>(
     `/api/schemes/${code}/ter-history`
   );

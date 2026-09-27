@@ -8,11 +8,8 @@
  *
  * Sections are namespaced exactly like the original app's filter_state
  * sections (e.g. "screener", "leaders", "compare_simulate",
- * "portfolio_weights", "portfolio_config", "portfolio_advisor") -- kept
- * deliberately separate per section, matching a confirmed behavior of the
- * original (Compare & Simulate's portfolio_weights/portfolio_config are NOT
- * shared with Portfolio Suggestion's portfolio_advisor section despite
- * similar-sounding names).
+ * "portfolio_weights", "portfolio_config") -- kept deliberately separate
+ * per section, matching a confirmed behavior of the original.
  */
 
 import { create } from "zustand";

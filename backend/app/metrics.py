@@ -7,7 +7,6 @@ import threading
 _lock = threading.Lock()
 _counters: dict[str, int] = {
     "quant_factors_unavailable_total": 0,
-    "suggest_holdout_fallback_is_total": 0,
     "amfi_sync_success_nav": 0,
     "amfi_sync_success_ter": 0,
 }

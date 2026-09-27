@@ -12,9 +12,92 @@ import pytest
 from app import quant_analytics
 
 
-def _nav_df(navs: list[float], start: str = "2024-01-01") -> pd.DataFrame:
-    dates = pd.date_range(start, periods=len(navs), freq="D")
+def _nav_df(navs: list[float], start: str = "2024-01-01", freq: str = "D") -> pd.DataFrame:
+    dates = pd.date_range(start, periods=len(navs), freq=freq)
     return pd.DataFrame({"nav_date": dates, "nav": navs})
+
+
+def _walk(n: int, sigma: float = 0.006, seed: int = 5) -> list[float]:
+    rets = np.random.default_rng(seed).normal(0.0004, sigma, n - 1)
+    return list(100.0 * np.cumprod(np.concatenate([[1.0], 1.0 + rets])))
+
+
+class TestAnnualizationBase:
+    """sqrt(252) is only right for a trading-day series. Liquid and overnight funds publish
+    a NAV every calendar day, so the base has to follow the data -- measured once where the
+    series is born, then carried on the object rather than re-guessed at each use."""
+
+    def test_calendar_day_series_lands_on_365_and_a_trading_day_series_near_252(self):
+        calendar = pd.date_range("2022-01-01", "2024-12-31", freq="D")
+        trading = pd.date_range("2022-01-01", "2024-12-31", freq="B")
+        assert quant_analytics.infer_obs_per_year(calendar) == pytest.approx(365.25, abs=1.0)
+        ppy = quant_analytics.infer_obs_per_year(trading)
+        assert abs(ppy - 252.0) / 252.0 < 0.05                       # an all-equity book behaves as before
+        assert ppy < 300                                             # and is nowhere near calendar-daily
+
+    def test_a_suspended_fund_keeps_its_real_frequency(self):
+        """The whole reason the base is not a row count: a fund that stopped publishing for
+        three months still ticks 365 times a year when it publishes. len/span would call it
+        ~335 and understate its annualised volatility by 4%."""
+        days = pd.date_range("2022-01-01", "2024-12-31", freq="D")
+        suspended = days[(days < "2023-05-01") | (days >= "2023-08-01")]
+        naive = len(suspended) / ((suspended[-1] - suspended[0]).days / 365.25)
+        assert naive < 340
+        assert quant_analytics.infer_obs_per_year(suspended) == pytest.approx(365.25, abs=1.0)
+
+    def test_an_attached_base_is_used_instead_of_re_deriving_one(self):
+        """The attribute is the mechanism; re-derivation is only the fallback. A frame tagged
+        upstream must annualise on that number even though its own rows say otherwise."""
+        df = quant_analytics.compute_daily_returns(_nav_df(_walk(400), freq="B"))
+        derived = quant_analytics.compute_risk_adjusted_metrics(df)
+        quant_analytics.with_obs_per_year(df, quant_analytics.CALENDAR_DAYS_PER_YEAR)
+        attached = quant_analytics.compute_risk_adjusted_metrics(df)
+        assert abs(derived["obs_per_year"] - 252.0) / 252.0 < 0.05
+        assert attached["obs_per_year"] == pytest.approx(365.25)
+        assert attached["vol_annualized_pct"] == pytest.approx(
+            derived["vol_annualized_pct"] * np.sqrt(365.25 / derived["obs_per_year"]), rel=1e-9
+        )
+
+    def test_a_daily_funds_volatility_is_no_longer_understated(self):
+        """One return sample, two calendars. The calendar-day reading must be sqrt(365.25/252)
+        = 1.20x the trading-day one -- previously they came out identical."""
+        navs = _walk(900, sigma=0.0004)
+        cal = quant_analytics.compute_risk_adjusted_metrics(quant_analytics.compute_daily_returns(_nav_df(navs, freq="D")))
+        trd = quant_analytics.compute_risk_adjusted_metrics(quant_analytics.compute_daily_returns(_nav_df(navs, freq="B")))
+        # Per-observation volatility is measured around the return expected for each
+        # return's span (span_residuals: a + b x days, fitted). On the trading-day calendar
+        # the Monday spans give the fit a slope to estimate, so the two readings of one
+        # sample now differ by that fitted slope's degree of freedom (~0.04% here), not 0.
+        assert cal["vol_daily_pct"] == pytest.approx(trd["vol_daily_pct"], rel=1e-2)
+        assert cal["vol_annualized_pct"] / cal["vol_daily_pct"] == pytest.approx(np.sqrt(cal["obs_per_year"]), rel=1e-9)
+        assert trd["vol_annualized_pct"] / trd["vol_daily_pct"] == pytest.approx(np.sqrt(trd["obs_per_year"]), rel=1e-9)
+        assert cal["vol_annualized_pct"] > trd["vol_annualized_pct"] * 1.15
+
+    def test_the_quant_page_annualises_a_window_on_the_cadence_it_had_then(self):
+        """Same base as the Compare tab (cadence_obs_per_year): a fund that published daily
+        years ago and on trading days now is not annualised on its old calendar."""
+        dates = pd.date_range("2019-01-01", "2021-12-31", freq="D").append(pd.bdate_range("2022-01-03", "2024-12-31"))
+        raw = pd.DataFrame({"nav_date": dates, "nav": _walk(len(dates))})
+        assert quant_analytics.infer_obs_per_year(dates) > 350
+        _, cov = quant_analytics.prepare_fund_timeseries(raw, pd.Timestamp("2024-06-01").date(), pd.Timestamp("2024-12-31").date())
+        assert abs(cov["obs_per_year"] - 261.0) < 2.0
+
+    def test_prepare_fund_timeseries_publishes_and_carries_the_base(self):
+        raw = _nav_df(_walk(500), freq="D")
+        df, cov = quant_analytics.prepare_fund_timeseries(raw, raw["nav_date"].iloc[60].date(), raw["nav_date"].iloc[-1].date())
+        assert cov["obs_per_year"] == pytest.approx(365.25)
+        assert quant_analytics.get_obs_per_year(df) == pytest.approx(365.25)   # survives the slice
+        vol = df["rolling_vol_ann"].dropna()
+        std = df["daily_return"].rolling(30).std().dropna()
+        assert vol.iloc[-1] == pytest.approx(float(std.iloc[-1]) * np.sqrt(365.25) * 100.0)
+
+    def test_the_overlap_ticks_as_often_as_the_sparser_series(self):
+        """A daily liquid fund measured against a trading-day benchmark only shares trading
+        days, so tracking error must annualise on 252-ish, not on the fund's own 365."""
+        fund = quant_analytics.compute_daily_returns(_nav_df(_walk(800), freq="D"))
+        bench = quant_analytics.compute_daily_returns(_nav_df(_walk(600, seed=9), freq="B"))
+        rel = quant_analytics.compute_benchmark_relative_metrics(fund, bench)
+        assert abs(rel["obs_per_year"] - 252.0) / 252.0 < 0.05
 
 
 class TestComputeRiskAdjustedMetrics:
@@ -90,6 +173,16 @@ class TestRunMonteCarloSimulation:
         result_a = quant_analytics.run_monte_carlo_simulation(100.0, returns, n_simulations=200, n_days=50)
         result_b = quant_analytics.run_monte_carlo_simulation(100.0, returns, n_simulations=200, n_days=50, seed=42)
         assert result_a["p50"] == pytest.approx(result_b["p50"])
+
+    def test_echoes_the_base_it_stepped_on(self):
+        """The step count and the chart's years-from-today divisor have to be the same
+        number, or a "5 year" fan of a calendar-day series silently plots 3.45 years."""
+        result = quant_analytics.run_monte_carlo_simulation(
+            100.0, self._returns(), n_simulations=50, n_days=1826, obs_per_year=365.25
+        )
+        assert result["n_days"] == 1826 and result["obs_per_year"] == pytest.approx(365.25)
+        assert result["n_days"] / result["obs_per_year"] == pytest.approx(5.0, abs=0.01)
+        assert len(result["days"]) == result["n_days"] + 1
 
     def test_does_not_mutate_global_numpy_random_state(self):
         """Before the fix, np.random.seed(42) inside the function reset global

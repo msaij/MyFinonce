@@ -20,6 +20,22 @@ CREATE TABLE IF NOT EXISTS schemes (
     plan_type TEXT,
     option_type TEXT,
     isin TEXT,
+    -- AMFI's second ISIN column. Only a scheme with a dividend option is issued one, so
+    -- its presence is the structural evidence that option_type is IDCW -- which matters
+    -- because AMFI's own Option field is hand-typed free text and sometimes says
+    -- "Growth" for a scheme that has one (152965 is published exactly that way).
+    isin_reinvestment TEXT,
+    -- Where plan_type / option_type came from: 'amfi' (AMFI's Plan/Option column), 'isin'
+    -- (option read off the reinvestment ISIN), 'name' (inferred from the scheme name),
+    -- 'nav_match' (amfi_sync.resolve_plan_options). NULL = written before provenance was
+    -- recorded. Without it a value AMFI stated and one an old parser guessed look identical.
+    plan_source TEXT,
+    option_source TEXT,
+    -- SEBI's riskometer label (Low ... Very High) from AMFI's fund-performance feed, and the
+    -- feed's NAV date it was read on. The fund's own official risk classification, so it
+    -- outranks anything the app infers from NAV volatility.
+    riskometer TEXT,
+    riskometer_as_of DATE,
     expense_ratio DOUBLE PRECISION,
     ter_status TEXT,
     ter_source TEXT,
@@ -37,9 +53,17 @@ CREATE TABLE IF NOT EXISTS nav_history (
     nav DOUBLE PRECISION,
     PRIMARY KEY (scheme_code, nav_date)
 );
+-- One row per *change* in a scheme's disclosed TER, not per calendar day. AMFI republishes
+-- the same figures daily, so the dense form stored ~236k rows per month to say the same
+-- thing 30 times over. `ter_date` is the first date these figures were seen and `valid_to`
+-- the last, so a row asserts "this TER held from ter_date through valid_to".
+--
+-- valid_to is what keeps a wound-up fund honest: without it the final row of a scheme that
+-- stopped publishing in 2019 would read as "and it still charges this today".
 CREATE TABLE IF NOT EXISTS ter_history (
     scheme_code BIGINT,
     ter_date DATE,
+    valid_to DATE,
     base_expense_ratio_pct DOUBLE PRECISION,
     brokerage_cost_pct DOUBLE PRECISION,
     transaction_cost_pct DOUBLE PRECISION,
@@ -195,11 +219,135 @@ CREATE TABLE IF NOT EXISTS holding_alerts (
 );
 """
 
+# Collapses the dense daily TER grid into one row per change. AMFI republishes identical
+# figures every calendar day, so ~82% of the rows restated the previous day's numbers.
+#
+# Re-running this must be a no-op, which is why the run's end is max(COALESCE(valid_to,
+# ter_date)) rather than max(ter_date): on already-compacted data each group is a single
+# row, and taking max(ter_date) would silently reset every valid_to back to its start and
+# throw away the interval.
+#
+# A run breaks on any gap in the calendar, not only on a change in value. AMFI publishes
+# every day of the month for a live scheme, so a missing day means the scheme genuinely had
+# no disclosure -- it had not launched, was suspended, or the fetch lost pages. Bridging
+# those days would invent disclosures that never happened: measured over the 6 months held
+# at the time of writing, bridging silently added 27,433 days across 1,641 schemes and moved
+# their duration-weighted mean TER by up to 0.85 percentage points. Breaking instead makes
+# the compaction exactly lossless -- expanding the runs reproduces the daily grid row for
+# row -- and costs almost nothing, since gaps are rare.
+TER_CHANGE_POINTS_SQL = """
+ALTER TABLE ter_history ADD COLUMN IF NOT EXISTS valid_to DATE;
+UPDATE ter_history SET valid_to = ter_date WHERE valid_to IS NULL;
+
+CREATE TEMP TABLE _ter_runs ON COMMIT DROP AS
+WITH marked AS (
+    SELECT scheme_code, ter_date, valid_to, base_expense_ratio_pct, brokerage_cost_pct,
+           transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url,
+           CASE WHEN (base_expense_ratio_pct, brokerage_cost_pct, transaction_cost_pct,
+                      statutory_levies_pct, total_ter_pct)
+                     IS DISTINCT FROM
+                     LAG((base_expense_ratio_pct, brokerage_cost_pct, transaction_cost_pct,
+                          statutory_levies_pct, total_ter_pct))
+                       OVER (PARTITION BY scheme_code ORDER BY ter_date)
+                  OR LAG(COALESCE(valid_to, ter_date))
+                       OVER (PARTITION BY scheme_code ORDER BY ter_date) IS DISTINCT FROM ter_date - 1
+                THEN 1 ELSE 0 END AS starts_run
+    FROM ter_history
+), grouped AS (
+    SELECT *, SUM(starts_run) OVER (PARTITION BY scheme_code ORDER BY ter_date
+                                    ROWS UNBOUNDED PRECEDING) AS run_id
+    FROM marked
+)
+SELECT scheme_code,
+       min(ter_date) AS ter_date,
+       max(COALESCE(valid_to, ter_date)) AS valid_to,
+       min(base_expense_ratio_pct) AS base_expense_ratio_pct,
+       min(brokerage_cost_pct)     AS brokerage_cost_pct,
+       min(transaction_cost_pct)   AS transaction_cost_pct,
+       min(statutory_levies_pct)   AS statutory_levies_pct,
+       min(total_ter_pct)          AS total_ter_pct,
+       min(source_url)             AS source_url
+FROM grouped
+GROUP BY scheme_code, run_id;
+
+DELETE FROM ter_history;
+INSERT INTO ter_history (scheme_code, ter_date, valid_to, base_expense_ratio_pct,
+                         brokerage_cost_pct, transaction_cost_pct, statutory_levies_pct,
+                         total_ter_pct, source_url)
+SELECT scheme_code, ter_date, valid_to, base_expense_ratio_pct, brokerage_cost_pct,
+       transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url
+FROM _ter_runs;
+
+CREATE INDEX IF NOT EXISTS idx_ter_history_asof ON ter_history (scheme_code, ter_date DESC);
+"""
+
+# Adds the column to databases created before the baseline carried it. The next NAV sync
+# fills it in; nothing back-fills it here, because the value only exists in AMFI's daily
+# file and re-deriving it from what is already stored would defeat the point of keeping it.
+SCHEME_REINVESTMENT_ISIN_SQL = """
+ALTER TABLE schemes ADD COLUMN IF NOT EXISTS isin_reinvestment TEXT;
+"""
+
+# Provenance for plan_type / option_type (see the baseline's comment on the columns).
+# Existing rows are deliberately left NULL rather than back-filled: which signal produced a
+# stored value was never recorded, and guessing it now would manufacture exactly the false
+# certainty these columns exist to expose. The next NAV sync stamps every scheme AMFI's
+# file speaks for; what stays NULL afterwards is the genuinely unexplained remainder.
+SCHEME_FIELD_PROVENANCE_SQL = """
+ALTER TABLE schemes ADD COLUMN IF NOT EXISTS plan_source TEXT;
+ALTER TABLE schemes ADD COLUMN IF NOT EXISTS option_source TEXT;
+"""
+
+# Filled by the nightly plan/option resolution, which already downloads the feed that
+# carries it; nothing is back-filled here because the value only exists in that feed.
+SCHEME_RISKOMETER_SQL = """
+ALTER TABLE schemes ADD COLUMN IF NOT EXISTS riskometer TEXT;
+ALTER TABLE schemes ADD COLUMN IF NOT EXISTS riskometer_as_of DATE;
+"""
+
+# One row per FUND (not per plan/option scheme) as AMFI's fund-performance feed last
+# published it: its assets, its official SEBI benchmark, and the returns AMFI itself
+# computes for the Direct plan, the Regular plan and that benchmark. The nightly plan/option
+# resolution already downloads this feed and used to throw all of it away. Kept at fund
+# level on purpose: AUM is reported once per fund, so summing it over the four plan/option
+# schemes of a fund would count the same money four times. `scheme_codes` are our schemes
+# matched to the fund; `fund_house` is read off them, since the feed does not name the AMC.
+# Replaced wholesale on each successful fetch, so it is always one consistent day's picture.
+AMFI_FUND_SNAPSHOT_SQL = """
+CREATE TABLE IF NOT EXISTS amfi_fund_snapshot (
+    fund_name TEXT NOT NULL,
+    sub_category TEXT NOT NULL,
+    category_id INTEGER,
+    fund_house TEXT,
+    scheme_codes BIGINT[] NOT NULL DEFAULT '{}',
+    aum_cr DOUBLE PRECISION,
+    benchmark TEXT,
+    riskometer TEXT,
+    return_1y_direct DOUBLE PRECISION,
+    return_1y_regular DOUBLE PRECISION,
+    return_1y_benchmark DOUBLE PRECISION,
+    return_3y_direct DOUBLE PRECISION,
+    return_3y_regular DOUBLE PRECISION,
+    return_3y_benchmark DOUBLE PRECISION,
+    return_5y_direct DOUBLE PRECISION,
+    return_5y_regular DOUBLE PRECISION,
+    return_5y_benchmark DOUBLE PRECISION,
+    as_of DATE NOT NULL,
+    PRIMARY KEY (fund_name, sub_category)
+);
+CREATE INDEX IF NOT EXISTS idx_amfi_fund_snapshot_codes ON amfi_fund_snapshot USING GIN (scheme_codes);
+"""
+
 MIGRATIONS = [
     ("0001_baseline", BASELINE_SQL),
     ("0002_holdings_core", HOLDINGS_CORE_SQL),
     ("0003_holdings_targets", HOLDINGS_TARGETS_SQL),
     ("0004_holdings_planning", HOLDINGS_PLANNING_SQL),
+    ("0005_ter_change_points", TER_CHANGE_POINTS_SQL),
+    ("0006_scheme_reinvestment_isin", SCHEME_REINVESTMENT_ISIN_SQL),
+    ("0007_scheme_field_provenance", SCHEME_FIELD_PROVENANCE_SQL),
+    ("0008_scheme_riskometer", SCHEME_RISKOMETER_SQL),
+    ("0009_amfi_fund_snapshot", AMFI_FUND_SNAPSHOT_SQL),
 ]
 
 

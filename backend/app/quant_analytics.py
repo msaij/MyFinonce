@@ -10,6 +10,86 @@ from app.db.connection import get_connection, fetchdf
 _ts_cache: Dict[Tuple, Tuple[pd.DataFrame, Dict[str, Any]]] = {}
 _ts_cache_lock = threading.Lock()
 
+# --- Annualization base -------------------------------------------------------------------
+#
+# sqrt(252) is only correct for a series sampled on *trading* days. Liquid, overnight and
+# arbitrage funds publish a NAV on every calendar day, so their return series carries ~365
+# observations a year; annualizing those on 252 understates volatility by ~17% and drags
+# every ratio built on it (Sharpe read -14 on the owner's portfolio purely from this).
+#
+# The base therefore follows the data. It is measured ONCE, where the series is born, and
+# carried on the pandas object's `.attrs` so every consumer downstream reads the same
+# number instead of re-guessing from whatever rows it happens to be holding. Re-deriving
+# from a slice is the fallback, not the mechanism.
+
+TRADING_DAYS_PER_YEAR = 252.0
+CALENDAR_DAYS_PER_YEAR = 365.25
+OBS_PER_YEAR_ATTR = "obs_per_year"
+
+
+def infer_obs_per_year(dates, default: float = TRADING_DAYS_PER_YEAR) -> float:
+    """Measures how many observations a year a date index really carries.
+
+    Counts the observations inside every trailing 365.25-day window and takes a high
+    quantile of those counts. Dividing the row count by the calendar span (the naive
+    ratio) is not good enough: a fund suspended for three months, or one whose NAVs
+    start part-way into the window, reports an artificially low frequency and so gets
+    its annualized volatility understated. Busy windows still report the true cadence,
+    and a quantile ignores the dormant ones.
+
+    Median gap between observations cannot do this job either: a trading-day series has
+    a median gap of 1 day (the Fri->Mon 3-day gaps are the minority), which would misread
+    it as calendar-daily.
+    """
+    t = pd.to_datetime(pd.Series(list(dates))).dropna().sort_values()
+    if len(t) < 3:
+        return default
+    days = (t - t.iloc[0]).dt.total_seconds().values / 86400.0
+    span = float(days[-1])
+    if span <= 0:
+        return default
+    if span >= CALENDAR_DAYS_PER_YEAR:
+        ends = np.searchsorted(days, days + CALENDAR_DAYS_PER_YEAR, side="left")
+        complete = (days + CALENDAR_DAYS_PER_YEAR) <= span
+        counts = (ends - np.arange(len(days)))[complete]
+        if counts.size:
+            return _clamp_obs_per_year(float(np.quantile(counts, 0.9)))
+    # Under a year of history there is no complete window to count, so fall back to the
+    # row density over the span -- a guess, but the only one available.
+    return _clamp_obs_per_year(len(t) / (span / CALENDAR_DAYS_PER_YEAR))
+
+
+def _clamp_obs_per_year(value: float) -> float:
+    # NAV history is keyed by (scheme, date), so a series can never tick more than once
+    # per calendar day; anything above that is a counting artefact, not a real cadence.
+    if not np.isfinite(value) or value <= 0:
+        return TRADING_DAYS_PER_YEAR
+    return float(min(CALENDAR_DAYS_PER_YEAR, max(1.0, value)))
+
+
+def _dates_of(obj) -> Optional[Any]:
+    if isinstance(obj, pd.DataFrame) and "nav_date" in obj.columns:
+        return obj["nav_date"]
+    index = getattr(obj, "index", None)
+    return index if isinstance(index, pd.DatetimeIndex) else None
+
+
+def with_obs_per_year(obj, obs_per_year: float):
+    """Attaches the annualization base to a DataFrame/Series so it travels with the data."""
+    obj.attrs[OBS_PER_YEAR_ATTR] = _clamp_obs_per_year(float(obs_per_year))
+    return obj
+
+
+def get_obs_per_year(obj, default: float = TRADING_DAYS_PER_YEAR) -> float:
+    """The base attached upstream, where the series was built and its whole history was
+    visible. Only when nothing was attached is one re-derived from the object's own dates."""
+    attached = getattr(obj, "attrs", {}).get(OBS_PER_YEAR_ATTR)
+    if attached is not None and np.isfinite(attached) and attached > 0:
+        return _clamp_obs_per_year(float(attached))
+    dates = _dates_of(obj)
+    return default if dates is None else infer_obs_per_year(dates, default)
+
+
 def calendar_day_cagr(cum_return: float, start_date, end_date) -> float:
     """Annualizes a cumulative return over its actual calendar-day span. Compounds for spans
     of 30+ days; linearly extrapolates below that to avoid absurd over-annualization of a short
@@ -43,7 +123,7 @@ def compute_daily_returns(df: pd.DataFrame) -> pd.DataFrame:
     df["peak_nav"] = df["nav"].cummax()
     df["drawdown"] = (df["nav"] - df["peak_nav"]) / df["peak_nav"]
     df["drawdown_pct"] = df["drawdown"] * 100.0
-    return df
+    return with_obs_per_year(df, get_obs_per_year(df))
 
 
 def prepare_fund_timeseries(
@@ -81,26 +161,37 @@ def prepare_fund_timeseries(
         with _ts_cache_lock:
             if cache_key in _ts_cache:
                 df_res, cov = _ts_cache[cache_key]
-                return df_res.copy(), dict(cov)
+                return with_obs_per_year(df_res.copy(), cov[OBS_PER_YEAR_ATTR]), dict(cov)
 
     df = df_raw.copy()
     df["nav_date"] = pd.to_datetime(df["nav_date"])
     df["nav"] = df["nav"].astype(float)
     df = df.sort_values("nav_date").reset_index(drop=True)
 
+    # The annualization base is the cadence the fund actually had around the window, over at
+    # least a year (cadence_obs_per_year) -- a 3-month window of a daily fund still ticks 365
+    # times a year, and a fund whose cadence changed years ago is not annualised on its old
+    # one. The Compare tab uses the same base. A base attached upstream still wins.
+    attached = getattr(df_raw, "attrs", {}).get(OBS_PER_YEAR_ATTR)
+    if attached is not None and np.isfinite(attached) and attached > 0:
+        obs_per_year = _clamp_obs_per_year(float(attached))
+    else:
+        obs_per_year = cadence_obs_per_year(df["nav_date"], start_date, end_date)
+
     # 1. Full-history continuous returns (guarantees day 1 in window has valid return)
     df["daily_return"] = df["nav"].pct_change()
     df["log_return"] = np.log(df["nav"] / df["nav"].shift(1))
 
     # 2. Full-history rolling risk metrics
-    rf_daily = (1.0 + risk_free_rate_ann) ** (1.0 / 252.0) - 1.0
-    roll_mean = df["daily_return"].rolling(rolling_window).mean()
+    # Mean EXCESS return, each return net of Rf over its own span (see rf_per_interval).
+    rf_daily = rf_per_interval(interval_days_before(df).values, risk_free_rate_ann, obs_per_year)
+    roll_mean = (df["daily_return"] - rf_daily).rolling(rolling_window).mean()
     roll_std = df["daily_return"].rolling(rolling_window).std()
 
-    df["rolling_vol_ann"] = roll_std * np.sqrt(252.0) * 100.0
+    df["rolling_vol_ann"] = roll_std * np.sqrt(obs_per_year) * 100.0
     df["rolling_sharpe"] = np.where(
         roll_std > 1e-8,
-        (roll_mean - rf_daily) / roll_std * np.sqrt(252.0),
+        roll_mean / roll_std * np.sqrt(obs_per_year),
         0.0
     )
     df["rolling_return_30d"] = (df["nav"] / df["nav"].shift(rolling_window) - 1.0) * 100.0
@@ -137,8 +228,10 @@ def prepare_fund_timeseries(
         "actual_end": actual_end,
         "actual_days": actual_days,
         "requested_days": req_days,
-        "is_partial": is_partial
+        "is_partial": is_partial,
+        OBS_PER_YEAR_ATTR: round(obs_per_year, 2),
     }
+    with_obs_per_year(df_window, obs_per_year)
 
     if cache_key is not None:
         with _ts_cache_lock:
@@ -315,6 +408,114 @@ def compute_drawdown_duration_metrics(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def interval_days_before(df: pd.DataFrame) -> pd.Series:
+    """Calendar days each row's return spans (since the previous NAV), aligned to df's index."""
+    dates = pd.to_datetime(df["nav_date"])
+    return dates.diff().dt.days.astype(float)
+
+
+def rf_per_interval(days: np.ndarray, risk_free_rate_ann: float, obs_per_year: float) -> np.ndarray:
+    """Risk-free return over each interval's own length in calendar days. Where the length is
+    unknown (NaN), falls back to one observation of the series' own clock."""
+    days = np.asarray(days, dtype=float)
+    per_obs = (1.0 + risk_free_rate_ann) ** (1.0 / obs_per_year) - 1.0
+    by_days = (1.0 + risk_free_rate_ann) ** (np.nan_to_num(days, nan=0.0) / 365.25) - 1.0
+    return np.where(np.isfinite(days) & (days > 0), by_days, per_obs)
+
+
+def cadence_obs_per_year(dates, start, end, default: float = TRADING_DAYS_PER_YEAR) -> float:
+    """NAVs a year the series actually published around the analysed period [start, end]:
+    NAV dates in (lo, end] per year of (end - lo), where lo is the earlier of `start` and a
+    year before `end` (clipped to the first NAV). A year at least, so a 30-day window's
+    holidays do not set the base; the period itself when it is longer, so a multi-year
+    period is annualised on exactly the returns it contains.
+
+    infer_obs_per_year's high quantile over the WHOLE history is the wrong base for a
+    period: it remembers a cadence the fund no longer has. Quant Liquid published ~355 NAVs
+    a year in 2015-17 and ~305 since 2018, so its 1-year risk was annualised on 354 --
+    volatility and Sharpe overstated by sqrt(354/307) = 7.4%, and its mean return scaled
+    to a year by 354 against an Rf charged over 307 returns' worth of calendar days."""
+    t = pd.DatetimeIndex(pd.to_datetime(pd.Series(list(dates))).dropna()).unique().sort_values()
+    if len(t) < 2:
+        return default
+    end_ts = pd.Timestamp(end)
+    upto = t[t <= end_ts]
+    if len(upto) < 2:
+        return infer_obs_per_year(t, default)
+    end_ts = upto[-1]
+    lo = min(pd.Timestamp(start), end_ts - pd.Timedelta(days=CALENDAR_DAYS_PER_YEAR))
+    lo = max(lo, upto[0])
+    span_days = (end_ts - lo).total_seconds() / 86400.0
+    count = int(((upto > lo) & (upto <= end_ts)).sum())
+    if span_days < 7 or count < 2:
+        return infer_obs_per_year(upto, default)
+    return _clamp_obs_per_year(count / (span_days / CALENDAR_DAYS_PER_YEAR))
+
+
+def span_residuals(returns, gap_days) -> Tuple[np.ndarray, int]:
+    """Each return minus the return expected for a return of ITS span: a + b x calendar
+    days, fitted by least squares over the sample. Returns (residuals, degrees of freedom).
+
+    A plain standard deviation measures every return against one mean, so a Monday return
+    (three days of accrual) counts as a deviation. For liquid/overnight/target-maturity
+    funds the accrual IS the return, and the plain figure measured how often a fund skips
+    NAVs: Zerodha Overnight (missing ~13 NAVs a year) read 4.3x SBI Overnight's volatility.
+    Fitting the slope rather than assuming calendar-day accrual lets the data decide: an
+    accrual fund's slope is its daily accrual, an equity fund's (which does not drift over
+    a weekend) is noise and the result is its plain deviation. When every span is equal the
+    fit is just the mean."""
+    r = np.asarray(returns, dtype=float)
+    g = np.asarray(gap_days, dtype=float)
+    X = np.column_stack([np.ones_like(g), g])
+    rank = int(np.linalg.matrix_rank(X)) if len(r) else 0
+    if len(r) - rank < 1:
+        return r - (r.mean() if len(r) else 0.0), max(len(r) - 1, 0)
+    coef, *_ = np.linalg.lstsq(X, r, rcond=None)
+    return r - X @ coef, len(r) - rank
+
+
+def period_risk_ratios(returns, gap_days, obs_per_year: float, risk_free_rate_ann: float) -> Dict[str, Any]:
+    """Volatility, Sharpe and Sortino of NAV-to-NAV returns whose spans differ (weekends,
+    holidays, skipped NAVs). One definition for the Compare tab and the Quant page.
+
+    * Volatility: standard deviation of the returns around the return expected for their
+      span (span_residuals), x sqrt(obs_per_year).
+    * Sharpe: annualised mean excess return / that volatility, each return net of Rf over
+      its own span (rf_per_interval). mean x obs_per_year is the period's summed excess
+      return scaled linearly to a year.
+    * Sortino: the SAME numerator over the annualised downside deviation (root mean square
+      of the excess returns below 0, over all returns). It used to be (CAGR - Rf): a
+      compounded CAGR on a 90-day window turned a +11% quarter into 52% a year, reading
+      24% above the arithmetic figure Sharpe uses, and could disagree with Sharpe in sign.
+
+    None where a ratio is undefined (no variation / no downside)."""
+    r = np.asarray(returns, dtype=float)
+    n = len(r)
+    if n < 2:
+        return {"vol_per_obs": None, "vol_ann": None, "mean_excess_ann": None,
+                "downside_dev_ann": None, "sharpe": None, "sortino": None, "n": n}
+    g = np.asarray(gap_days, dtype=float)
+    one_obs = CALENDAR_DAYS_PER_YEAR / obs_per_year
+    g = np.where(np.isfinite(g) & (g > 0), g, one_obs)
+    sqrt_obs = float(np.sqrt(obs_per_year))
+    resid, dof = span_residuals(r, g)
+    sd = float(np.sqrt(np.sum(resid ** 2) / dof)) if dof > 0 else 0.0
+    excess = r - rf_per_interval(g, risk_free_rate_ann, obs_per_year)
+    mean_excess_ann = float(np.mean(excess)) * obs_per_year
+    vol_ann = sd * sqrt_obs
+    downside = np.minimum(excess, 0.0)
+    dd_ann = float(np.sqrt(np.sum(downside ** 2) / n)) * sqrt_obs
+    return {
+        "vol_per_obs": sd,
+        "vol_ann": vol_ann,
+        "mean_excess_ann": mean_excess_ann,
+        "downside_dev_ann": dd_ann,
+        "sharpe": mean_excess_ann / vol_ann if sd > 1e-10 else None,
+        "sortino": mean_excess_ann / dd_ann if dd_ann > 1e-10 else None,
+        "n": n,
+    }
+
+
 def compute_risk_adjusted_metrics(
     df: pd.DataFrame,
     risk_free_rate_ann: float = 0.065
@@ -323,6 +524,7 @@ def compute_risk_adjusted_metrics(
     Computes institutional risk-adjusted return metrics, downside risk,
     and tail risk metrics (Sharpe, Sortino, Calmar, VaR, CVaR, Skewness, Kurtosis).
     """
+    interval_days = interval_days_before(df)
     df_clean = df.dropna(subset=["daily_return"]).copy()
     if len(df_clean) < 3:
         return {}
@@ -331,38 +533,29 @@ def compute_risk_adjusted_metrics(
     navs = df_clean["nav"].values
     n_days = len(returns)
 
-    # Daily risk free rate
-    rf_daily = (1.0 + risk_free_rate_ann) ** (1.0 / 252.0) - 1.0
+    # Every annualization below runs on the base the series carries, not on 252.
+    obs_per_year = get_obs_per_year(df_clean)
+    sqrt_obs = np.sqrt(obs_per_year)
+
+    # The risk-free return each NAV-to-NAV return had to beat is charged over that return's
+    # OWN span inside period_risk_ratios (see rf_per_interval): a flat per-observation rate
+    # turned Quant Liquid's 6.10% year (below a 6.5% Rf) into a Sharpe of +2.98.
 
     # Return metrics
     total_ret = (navs[-1] - navs[0]) / navs[0]
     total_days = max(1, (df_clean["nav_date"].iloc[-1] - df_clean["nav_date"].iloc[0]).days)
     cagr = calendar_day_cagr(total_ret, df_clean["nav_date"].iloc[0], df_clean["nav_date"].iloc[-1])
 
-    # Volatility
-    vol_daily = np.std(returns, ddof=1)
-    vol_ann = vol_daily * np.sqrt(252.0)
-
-    # Excess return
-    excess_daily = returns - rf_daily
-    mean_excess = np.mean(excess_daily)
-
-    # Sharpe Ratio (Annualized)
-    sharpe = (mean_excess / vol_daily) * np.sqrt(252.0) if vol_daily > 1e-8 else 0.0
-
-    # Downside Deviation (Semi-deviation relative to Rf)
-    downside_diff = returns[returns < rf_daily] - rf_daily
-    if len(downside_diff) > 0:
-        downside_dev_daily = np.sqrt(np.sum(downside_diff ** 2) / n_days)
-        downside_dev_ann = downside_dev_daily * np.sqrt(252.0)
-    else:
-        downside_dev_ann = 1e-6
-
-    # Sortino Ratio
-    if vol_daily < 1e-8:
-        sortino = 0.0
-    else:
-        sortino = (cagr - risk_free_rate_ann) / downside_dev_ann if downside_dev_ann > 1e-8 else 0.0
+    # Volatility, Sharpe, Sortino: one definition shared with the Compare tab
+    # (period_risk_ratios) -- volatility around each return's expected growth over its own
+    # span, Sharpe and Sortino on the same annualised mean excess return. This page keeps
+    # its convention of 0.0 (not None) for an undefined ratio.
+    ratios = period_risk_ratios(returns, interval_days.loc[df_clean.index].values, obs_per_year, risk_free_rate_ann)
+    vol_daily = ratios["vol_per_obs"]
+    vol_ann = ratios["vol_ann"]
+    sharpe = ratios["sharpe"] if ratios["sharpe"] is not None and vol_daily > 1e-8 else 0.0
+    downside_dev_ann = ratios["downside_dev_ann"] if ratios["downside_dev_ann"] else 1e-6
+    sortino = ratios["sortino"] if ratios["sortino"] is not None and vol_daily > 1e-8 else 0.0
 
     # Maximum Drawdown
     drawdown = df_clean["drawdown"].values
@@ -376,22 +569,22 @@ def compute_risk_adjusted_metrics(
     # Value at Risk (VaR) & Expected Shortfall (CVaR)
     var_95_daily = np.percentile(returns, 5.0)
     var_99_daily = np.percentile(returns, 1.0)
-    var_95_ann = var_95_daily * np.sqrt(252.0)
-    var_99_ann = var_99_daily * np.sqrt(252.0)
+    var_95_ann = var_95_daily * sqrt_obs
+    var_99_ann = var_99_daily * sqrt_obs
 
     tail_95 = returns[returns <= var_95_daily]
     cvar_95_daily = np.mean(tail_95) if len(tail_95) > 0 else var_95_daily
-    cvar_95_ann = cvar_95_daily * np.sqrt(252.0)
+    cvar_95_ann = cvar_95_daily * sqrt_obs
 
     tail_99 = returns[returns <= var_99_daily]
     cvar_99_daily = np.mean(tail_99) if len(tail_99) > 0 else var_99_daily
-    cvar_99_ann = cvar_99_daily * np.sqrt(252.0)
+    cvar_99_ann = cvar_99_daily * sqrt_obs
 
     # Cornish-Fisher Expansion Adjusted VaR
     cf_var_95_daily = cornish_fisher_var(returns, 0.05)
-    cf_var_95_ann = cf_var_95_daily * np.sqrt(252.0)
+    cf_var_95_ann = cf_var_95_daily * sqrt_obs
     cf_var_99_daily = cornish_fisher_var(returns, 0.01)
-    cf_var_99_ann = cf_var_99_daily * np.sqrt(252.0)
+    cf_var_99_ann = cf_var_99_daily * sqrt_obs
 
     # Higher Moments & Tail Risk
     ret_series = pd.Series(returns)
@@ -420,6 +613,7 @@ def compute_risk_adjusted_metrics(
     return {
         "n_trading_days": n_days,
         "total_days": total_days,
+        OBS_PER_YEAR_ATTR: round(obs_per_year, 2),
         "total_return_pct": total_ret * 100.0,
         "cagr_pct": cagr * 100.0,
         "vol_annualized_pct": vol_ann * 100.0,
@@ -477,10 +671,16 @@ def compute_benchmark_relative_metrics(
     r_fund = merged["r_fund"].values
     r_bench = merged["r_bench"].values
 
+    # The overlap only ticks as often as the *sparser* of the two series -- a daily liquid
+    # fund merged against a trading-day index is a trading-day sample. Taken from the bases
+    # the two frames carry rather than re-measured off the merge.
+    obs_per_year = min(get_obs_per_year(df_fund), get_obs_per_year(df_bench))
+    sqrt_obs = np.sqrt(obs_per_year)
+
     # Linear Regression (Beta and Alpha)
     cov_mat = np.cov(r_fund, r_bench)
     var_bench = cov_mat[1, 1]
-    bench_vol = np.sqrt(var_bench) * np.sqrt(252.0) * 100.0 if var_bench > 0 else 0.0
+    bench_vol = np.sqrt(var_bench) * sqrt_obs * 100.0 if var_bench > 0 else 0.0
     cov_fb = cov_mat[0, 1]
 
     beta = cov_fb / var_bench if var_bench > 1e-10 else 1.0
@@ -504,7 +704,7 @@ def compute_benchmark_relative_metrics(
     # Tracking Error & Information Ratio
     diff_returns = r_fund - r_bench
     te_daily = np.std(diff_returns, ddof=1)
-    tracking_error_ann = te_daily * np.sqrt(252.0)
+    tracking_error_ann = te_daily * sqrt_obs
 
     info_ratio = (fund_cagr - bench_cagr) / tracking_error_ann if tracking_error_ann > 1e-8 else 0.0
 
@@ -546,6 +746,7 @@ def compute_benchmark_relative_metrics(
         "benchmark_vol_annualized_pct": round(bench_vol, 4),
         "excess_cagr_pct": round((fund_cagr - bench_cagr) * 100.0, 4),
         "common_trading_days": n_days,
+        OBS_PER_YEAR_ATTR: round(obs_per_year, 2),
         "regression_points": merged
     }
 
@@ -562,15 +763,17 @@ def compute_rolling_metrics(
     if len(df_clean) < window:
         return pd.DataFrame()
 
-    rf_daily = (1.0 + risk_free_rate_ann) ** (1.0 / 252.0) - 1.0
+    obs_per_year = get_obs_per_year(df_clean)
+    rf_daily = rf_per_interval(interval_days_before(df).loc[df_clean.index].values, risk_free_rate_ann, obs_per_year)
 
-    roll_mean = df_clean["daily_return"].rolling(window).mean()
+    # Mean EXCESS return, each return net of Rf over its own span.
+    roll_mean = (df_clean["daily_return"] - rf_daily).rolling(window).mean()
     roll_std = df_clean["daily_return"].rolling(window).std()
 
-    df_clean["rolling_vol_ann"] = roll_std * np.sqrt(252.0) * 100.0
+    df_clean["rolling_vol_ann"] = roll_std * np.sqrt(obs_per_year) * 100.0
     df_clean["rolling_sharpe"] = np.where(
         roll_std > 1e-8,
-        (roll_mean - rf_daily) / roll_std * np.sqrt(252.0),
+        roll_mean / roll_std * np.sqrt(obs_per_year),
         0.0
     )
     df_clean["rolling_return"] = (df_clean["nav"] / df_clean["nav"].shift(window) - 1.0) * 100.0
@@ -584,12 +787,17 @@ def run_monte_carlo_simulation(
     n_simulations: int = 500,
     n_days: int = 252,
     initial_capital: float = 100000.0,
-    seed: int = 42
+    seed: int = 42,
+    obs_per_year: float = TRADING_DAYS_PER_YEAR,
 ) -> Dict[str, Any]:
     """
     Simulates forward-looking returns using Geometric Brownian Motion (GBM)
     calibrated on the scheme's empirical drift and volatility.
-    Projects portfolio values for ₹100,000 initial capital over 252 trading days.
+
+    One step = one observation of `returns`, so `obs_per_year` is how many steps make a
+    year for THIS series. It is echoed back in the result: the caller that chose n_days
+    and the chart that turns steps into years must divide by the same number, or a
+    "5 year" fan silently plots 3.45 years.
     """
     if len(returns) < 60:
         return {}
@@ -630,6 +838,8 @@ def run_monte_carlo_simulation(
 
     return {
         "days": step_days,
+        "n_days": n_days,
+        OBS_PER_YEAR_ATTR: _clamp_obs_per_year(obs_per_year),
         "p5": p5,
         "p25": p25,
         "p50": p50,
@@ -648,62 +858,161 @@ def run_monte_carlo_simulation(
     }
 
 
+# A peer's NAV that jumps this far and comes straight back (the next NAV within
+# PEER_SPIKE_REVERT of the one before) is a mis-keyed price, not a return anyone earned.
+PEER_SPIKE_MOVE = 0.15
+PEER_SPIKE_REVERT = 0.02
+# A closed scheme's final NAV that sits this far off its peers' move that day is a
+# rebasing/wind-up artefact (Quant Liquid Fund 148511/148513 printed Rs 10.0000 after
+# 13.5225 on 2025-12-15 and never priced again), not a -26% day for a liquid fund.
+PEER_TERMINAL_OUTLIER = 0.10
+PEER_DEAD_AFTER_DAYS = 7
+
+
+def _peer_average_returns(w: pd.DataFrame, last_ever: pd.Series) -> pd.Series:
+    """Equal-weighted peer return per date of a wide NAV frame (dates x schemes), on the
+    union calendar of the peers, each scheme taking part from its second NAV to its last.
+
+    A peer that did not price on a date is carried at its last NAV (a 0 return) and its
+    accrual lands on the date it next prices. Averaging each scheme's own NAV-to-NAV return
+    on the dates it happened to price instead mixed 1-day and 3-day returns on the same
+    date whenever the peers' calendars differ (weekend-pricing liquid funds, FoFs on
+    overseas holidays) and double-counted the weekend: over 2021-09..2026-09 that put the
+    FoF Overseas peer index 9.9 points above the calendar-consistent one (103.0% vs 93.1%;
+    the buy-and-hold mean of the peers that lived through the window was 91.7%)."""
+    w = w.sort_index()
+    # A "Growth" NAV that never moves is a daily-payout (IDCW) option AMFI labelled Growth
+    # under the plain fund name (Invesco India Liquid 139388/139390 at 1000.0000 and JM Liquid
+    # 148413/148414 at 41.4437 for the whole of 2025-26): it would add exact zeros.
+    counts, spread = w.count(), w.max() - w.min()
+    flat = [c for c in w.columns if counts[c] >= 5 and spread[c] <= 0]
+    if flat:
+        w = w.drop(columns=flat)
+    for c in w.columns:
+        s = w[c].dropna()
+        if len(s) >= 3:
+            r = s.pct_change()
+            back = s.shift(-1) / s.shift(1) - 1.0
+            spikes = s.index[(r.abs() > PEER_SPIKE_MOVE) & (back.abs() < PEER_SPIKE_REVERT)]
+            if len(spikes):
+                w.loc[spikes, c] = np.nan
+    first = w.apply(lambda s: s.first_valid_index())
+    last = w.apply(lambda s: s.last_valid_index())
+    rets = w.ffill().pct_change()
+    alive = pd.DataFrame({c: (w.index > first[c]) & (w.index <= last[c]) for c in w.columns}, index=w.index)
+    rets = rets.where(alive)
+    if len(w.index):
+        med = rets.median(axis=1, skipna=True)
+        dead_before = w.index[-1] - pd.Timedelta(days=PEER_DEAD_AFTER_DAYS)
+        for c in w.columns:
+            lc = last[c]
+            if lc is None or lc > dead_before or c not in last_ever.index or pd.Timestamp(last_ever[c]) != lc:
+                continue
+            r_last = rets.at[lc, c]
+            if pd.notna(r_last) and pd.notna(med.get(lc)) and abs(r_last - med[lc]) > PEER_TERMINAL_OUTLIER:
+                rets.at[lc, c] = np.nan
+    return rets.mean(axis=1, skipna=True).dropna()
+
+
 @cached(ttl=600)
 def get_synthetic_category_benchmark(
     category: str,
     start_date: Optional[datetime.date] = None,
     end_date: Optional[datetime.date] = None,
     exclude_scheme_code: Optional[int] = None,
+    asset_class: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Synthesizes an institutional Category Benchmark by aggregating the daily average returns
-    of up to 50 Direct-Growth schemes in the same AMFI category, excluding the analysed scheme.
+    Synthesizes a category benchmark: the equal-weighted average daily return of every
+    Direct-Growth scheme in the same AMFI category, excluding the analysed scheme.
+
+    The sample is Direct-Growth ONLY, and all of it. It used to be "up to 50, Direct and
+    Growth sorted first" with no filter and no stable order, which let IDCW schemes fill the
+    slots the category's Direct-Growth funds did not: a daily-IDCW liquid fund distributes
+    its whole accrual every day, so its NAV never moves and it adds an exact 0 to the
+    average. Measured over 30 days on the live data, that understated the liquid-fund
+    category's return by 23-28% (0.40% against a true 0.52%), which made every liquid fund
+    look better than its peers -- on the Holdings tiles, the Performance tab and here.
+    The IDCW guard also checks the name, because AMFI's own Option column sometimes calls
+    an IDCW scheme "Growth".
+
+    A scheme contributes only on dates it has NAVs, so funds that have since closed still
+    count for the periods they existed -- restricting to today's active schemes would
+    instead bake survivorship bias into every historical window. If a category has no
+    Direct plans at all (a pre-2013 legacy category), its Growth schemes of any plan stand
+    in rather than returning nothing.
+
+    Rules added 2026-09-25 (each one found in the live data):
+    - The category is the SEBI category, not AMFI's raw label: "Income/Debt Oriented
+      Schemes - Liquid Fund" and "Debt Scheme - Liquid Fund" are one peer group
+      (classification.sebi_category), not two half-samples.
+    - ETFs have a single plan and AMFI's plan label on them is noise ("Other ETFs" had just
+      2 schemes marked Direct, so every ETF was benchmarked against a Sensex Next 50 and a
+      Midcap 150 ETF): in an ETF category every Growth scheme is a peer.
+    - Segregated portfolios (credit side pockets) are not investable funds: their NAVs are
+      write-down/recovery accounting (0.1353 -> 0.5342 in one day, then 0), which put the
+      Credit Risk peer index at +154% over five years against +76% for the funds.
+    - NAVs <= 0, a NAV that never moves, a spike that reverts on the next NAV, and the
+      outlying final NAV of a scheme that then stopped publishing are dropped (see
+      _peer_average_returns).
+    - The average is taken on the peers' common calendar (see _peer_average_returns).
+    - `asset_class` (classification.classify) optionally narrows the peers to one asset
+      class inside the category: "Index Funds", "Other ETFs" and "FoF Domestic" mix Nifty,
+      gilt, Nasdaq, gold and silver schemes.
     """
     if not category:
         return pd.DataFrame()
+    from app.classification import broad_category_of, classify, sebi_category
 
+    lookback_start = start_date - datetime.timedelta(days=10) if start_date else None
     con = get_connection()
-    # A few days of lookback before start_date guarantee LAG() has a prior NAV to diff against
-    # for the window's first trading day, without pulling the scheme's entire history.
-    lookback_start = None
-    if start_date:
-        lookback_start = start_date - datetime.timedelta(days=10)
-    exclude_clause = ""
-    params: list = [category]
-    if exclude_scheme_code is not None:
-        exclude_clause = "AND scheme_code <> %s"
-        params.append(int(exclude_scheme_code))
-    sql = f"""
-        WITH category_schemes AS (
-            SELECT scheme_code
-            FROM schemes
-            WHERE category = %s
-            {exclude_clause}
-            ORDER BY
-                CASE WHEN plan_type = 'Direct' THEN 0 ELSE 1 END,
-                CASE WHEN option_type = 'Growth' THEN 0 ELSE 1 END
-            LIMIT 50
-        ),
-        daily_diff AS (
-            SELECT n.scheme_code, n.nav_date, n.nav,
-                   (n.nav - LAG(n.nav) OVER (PARTITION BY n.scheme_code ORDER BY n.nav_date)) /
-                   NULLIF(LAG(n.nav) OVER (PARTITION BY n.scheme_code ORDER BY n.nav_date), 0) as ret
-            FROM nav_history n
-            JOIN category_schemes cs ON n.scheme_code = cs.scheme_code
-            WHERE (%s IS NULL OR n.nav_date >= %s) AND (%s IS NULL OR n.nav_date <= %s)
-        )
-        SELECT nav_date, AVG(ret) as daily_return
-        FROM daily_diff
-        WHERE ret IS NOT NULL
-        GROUP BY nav_date
-        ORDER BY nav_date ASC;
-    """
     try:
-        df_bench = fetchdf(con.execute(sql, params + [lookback_start, lookback_start, end_date, end_date]))
+        target = sebi_category(category)
+        labels = [r[0] for r in con.execute("SELECT DISTINCT category FROM schemes WHERE category IS NOT NULL").fetchall()]
+        labels = sorted({lab for lab in labels if sebi_category(lab) == target} | {category})
+        schemes = fetchdf(con.execute(
+            """
+            SELECT scheme_code, scheme_name, plan_type, category
+            FROM schemes
+            WHERE category = ANY(%s)
+              AND option_type = 'Growth'
+              AND scheme_name NOT ILIKE '%%IDCW%%'
+              -- Not a bare '%%dividend%%': that also emptied the Dividend Yield category,
+              -- whose Growth funds are named for the stocks they pick, not for a payout.
+              AND scheme_name !~* 'dividend(?!\\s*yield)'
+              AND scheme_name !~* 'segregat'
+            """, (labels,)))
+        if exclude_scheme_code is not None and not schemes.empty:
+            schemes = schemes[schemes["scheme_code"] != int(exclude_scheme_code)]
+        if asset_class and not schemes.empty:
+            keep = [classify(r.category, broad_category_of(r.category), r.scheme_name) == asset_class
+                    for r in schemes.itertuples()]
+            schemes = schemes[keep]
+        if not schemes.empty:
+            is_etf = schemes["category"].str.contains("ETF", case=False, na=False)
+            has_direct = (schemes["plan_type"] == "Direct").any()
+            schemes = schemes[(schemes["plan_type"] == "Direct") | is_etf | (not has_direct)]
+        codes = [int(c) for c in schemes["scheme_code"]] if not schemes.empty else []
+        if not codes:
+            return pd.DataFrame()
+        navs = fetchdf(con.execute(
+            "SELECT scheme_code, nav_date, nav FROM nav_history WHERE scheme_code = ANY(%s) AND nav > 0 "
+            "AND (%s::date IS NULL OR nav_date >= %s::date) AND (%s::date IS NULL OR nav_date <= %s::date)",
+            (codes, lookback_start, lookback_start, end_date, end_date)))
+        last_ever = fetchdf(con.execute(
+            "SELECT scheme_code, max(nav_date) AS last_nav FROM nav_history WHERE scheme_code = ANY(%s) AND nav > 0 GROUP BY 1",
+            (codes,)))
     except Exception:
-        df_bench = pd.DataFrame()
+        return pd.DataFrame()
     finally:
         con.close()
+    if navs.empty:
+        return pd.DataFrame()
+    navs["nav_date"] = pd.to_datetime(navs["nav_date"])
+    wide = navs.pivot_table(index="nav_date", columns="scheme_code", values="nav", aggfunc="last").astype(float)
+    last_ever = pd.to_datetime(last_ever.set_index("scheme_code")["last_nav"]) if not last_ever.empty else pd.Series(dtype="datetime64[ns]")
+    avg = _peer_average_returns(wide, last_ever)
+    df_bench = pd.DataFrame({"nav_date": avg.index, "daily_return": avg.to_numpy()})
 
     if not df_bench.empty:
         df_bench["nav_date"] = pd.to_datetime(df_bench["nav_date"])
@@ -743,44 +1052,40 @@ def compute_tail_risk_metrics(
     navs = df_clean["nav"].values.astype(float)
     n_days = len(returns)
 
-    rf_daily = (1.0 + risk_free_rate_ann) ** (1.0 / 252.0) - 1.0
+    obs_per_year = get_obs_per_year(df_clean)
+    sqrt_obs = np.sqrt(obs_per_year)
 
     # Empirical VaR and CVaR
     var_95_daily = float(np.percentile(returns, 5.0))
     var_99_daily = float(np.percentile(returns, 1.0))
-    var_95_ann = var_95_daily * np.sqrt(252.0)
-    var_99_ann = var_99_daily * np.sqrt(252.0)
+    var_95_ann = var_95_daily * sqrt_obs
+    var_99_ann = var_99_daily * sqrt_obs
 
     tail_95 = returns[returns <= var_95_daily]
     cvar_95_daily = float(np.mean(tail_95)) if len(tail_95) > 0 else var_95_daily
-    cvar_95_ann = cvar_95_daily * np.sqrt(252.0)
+    cvar_95_ann = cvar_95_daily * sqrt_obs
 
     tail_99 = returns[returns <= var_99_daily]
     cvar_99_daily = float(np.mean(tail_99)) if len(tail_99) > 0 else var_99_daily
-    cvar_99_ann = cvar_99_daily * np.sqrt(252.0)
+    cvar_99_ann = cvar_99_daily * sqrt_obs
 
     # Cornish-Fisher adjusted VaR
     cf_var_95_daily = cornish_fisher_var(returns, 0.05)
     cf_var_99_daily = cornish_fisher_var(returns, 0.01)
-    cf_var_95_ann = cf_var_95_daily * np.sqrt(252.0)
-    cf_var_99_ann = cf_var_99_daily * np.sqrt(252.0)
+    cf_var_95_ann = cf_var_95_daily * sqrt_obs
+    cf_var_99_ann = cf_var_99_daily * sqrt_obs
 
     # Higher moments
     ret_series = pd.Series(returns)
     skew = float(ret_series.skew()) if not np.isnan(ret_series.skew()) else 0.0
     kurt = float(ret_series.kurtosis()) if not np.isnan(ret_series.kurtosis()) else 0.0
 
-    # Downside deviation & Sortino
-    downside_diff = returns[returns < rf_daily] - rf_daily
-    if len(downside_diff) > 0:
-        downside_dev_daily = float(np.sqrt(np.sum(downside_diff ** 2) / n_days))
-        downside_dev_ann = downside_dev_daily * np.sqrt(252.0)
-    else:
-        downside_dev_ann = 1e-6
-
-    total_ret = float((navs[-1] - navs[0]) / navs[0])
-    cagr = calendar_day_cagr(total_ret, df_clean["nav_date"].iloc[0], df_clean["nav_date"].iloc[-1])
-    sortino = (cagr - risk_free_rate_ann) / downside_dev_ann if downside_dev_ann > 1e-8 else 0.0
+    # Downside deviation & Sortino -- the same definition as compute_risk_adjusted_metrics
+    # and the Compare tab (period_risk_ratios), so the page never shows two Sortinos.
+    ratios = period_risk_ratios(returns, interval_days_before(df_fund).loc[df_clean.index].values,
+                                obs_per_year, risk_free_rate_ann)
+    downside_dev_ann = ratios["downside_dev_ann"] if ratios["downside_dev_ann"] else 1e-6
+    sortino = ratios["sortino"] if ratios["sortino"] is not None else 0.0
 
     # Drawdown duration & recovery metrics
     dd_metrics = compute_drawdown_duration_metrics(df_clean)
@@ -805,6 +1110,7 @@ def compute_tail_risk_metrics(
 
     return {
         "n_trading_days": n_days,
+        OBS_PER_YEAR_ATTR: round(obs_per_year, 2),
         "skewness": round(skew, 4),
         "kurtosis": round(kurt, 4),
         "var_95_daily_pct": round(var_95_daily * 100.0, 4),

@@ -19,14 +19,20 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import product_flags, settings
-from app.routers import admin, backtest, holdings, leaders, meta, overview, portfolio_advisor, quant, schemes, screener
+from app.routers import admin, backtest, holdings, leaders, meta, nse_ipo, overview, quant, schemes, screener
 
 app = FastAPI(title="Indian Mutual Funds API", version="0.1.0")
 _access_log = logging.getLogger("access")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Both spellings of the same local frontend: the browser's Origin is whatever the
+    # user typed, and only the Data Management page's SSE log stream is cross-origin
+    # at all (it bypasses Next's proxy, which gzips and so breaks SSE -- see
+    # frontend/lib/hooks.ts). With 127.0.0.1 missing, opening the app at
+    # http://127.0.0.1:3000 left that tab stuck on "Connecting..." with no entries,
+    # while http://localhost:3000 worked -- the same app, a different URL.
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,10 +64,10 @@ app.include_router(schemes.router)
 app.include_router(screener.router)
 app.include_router(leaders.router)
 app.include_router(backtest.router)
-app.include_router(portfolio_advisor.router)
 app.include_router(quant.router)
 app.include_router(admin.router)
 app.include_router(holdings.router)
+app.include_router(nse_ipo.router)
 
 
 @app.on_event("startup")

@@ -115,6 +115,19 @@ def test_goal_edge_states(client):
     assert client.get(f"/api/holdings/goals/{past['id']}/status").json()["state"] == "reached"
 
 
+def test_delete_goal_removes_row_and_missing_is_404(client):
+    pid = new_portfolio(client)
+    g = client.post("/api/holdings/goals", json={"name": "House", "target_amount": 900000, "target_date": "2031-01-01",
+                                                "portfolio_ids": [pid]}).json()
+    assert any(x["id"] == g["id"] for x in client.get("/api/holdings/goals").json())
+    r = client.delete(f"/api/holdings/goals/{g['id']}")
+    assert r.status_code == 200 and r.json()["deleted"] == g["id"]
+    assert all(x["id"] != g["id"] for x in client.get("/api/holdings/goals").json())
+    assert client.get(f"/api/holdings/goals/{g['id']}/status").status_code == 404
+    assert client.delete(f"/api/holdings/goals/{g['id']}").status_code == 404
+    assert client.delete("/api/holdings/goals/999999").status_code == 404
+
+
 # --- Insights --------------------------------------------------------------------------------
 
 def test_insights_price_regular_plans_from_official_ter_and_flag_dead_funds(client):
@@ -153,6 +166,69 @@ def test_bottom_quartile_is_flagged_against_same_category_and_plan_peers(client)
     items = client.get(f"/api/holdings/portfolios/{pid}/insights").json()["insights"]
     bq = next(i for i in items if i["kind"] == "bottom_quartile")
     assert bq["scheme_codes"] == [DIRECT] and bq["numbers"]["percentile"] <= 25 and bq["numbers"]["peers"] >= 8
+
+
+# --- Expense-ratio sanity & fund-type-aware concentration ----------------------------------------
+
+ARB = "Hybrid Scheme - Arbitrage Fund"
+ARB_SPREAD = {(ARB, "Direct"): {"peers": 89, "p10": 1.09, "median": 1.47, "p90": 2.20}}
+
+
+def _meta(ter, status="official", parts=(0.10, 0.11, 0.04, 0.75)):
+    keys = ("ter_base_expense_ratio", "ter_brokerage_cost_pct", "ter_transaction_cost_pct", "ter_statutory_levies_pct")
+    return {"category": ARB, "plan_type": "Direct", "expense_ratio": ter, "ter_status": status,
+            "ter_as_of_date": d(2026, 9, 21), **dict(zip(keys, parts))}
+
+
+@pytest.mark.parametrize("meta,expected", [
+    (_meta(1.00), "ok"),                                          # real Motilal Oswal Arbitrage Direct: 0.10 base + costs
+    (_meta(4.00, parts=(3.10, 0.11, 0.04, 0.75)), "high"),        # far above 1.25 x p90
+    (_meta(0.30, parts=(0.30, 0.0, 0.0, 0.0)), "low"),            # under half of p10
+    (_meta(1.00, parts=(0.10, 0.11, 0.04, 0.25)), "inconsistent"),  # components sum to 0.50
+    (_meta(1.00, status="estimated"), "unverified"),
+    (_meta(None), "missing"),
+])
+def test_ter_is_judged_against_its_own_category(monkeypatch, meta, expected):
+    from app.db import holdings as hdb
+    from app.services import holdings_service as svc
+
+    monkeypatch.setattr(hdb, "category_ter_spread", lambda groups: ARB_SPREAD)
+    ctx = svc.ter_context({153187: meta})[153187]
+    assert ctx["status"] == expected
+    if expected == "ok":
+        assert ctx["reason"] is None and sum(ctx["breakdown"].values()) == pytest.approx(1.00)
+        assert ctx["category_spread"]["median"] == 1.47
+
+
+def test_cash_equivalents_do_not_count_toward_concentration():
+    from app.services import holdings_insights as hi
+
+    def pos(code, cat, broad, value):
+        return {"scheme_code": code, "scheme_name": f"F{code}", "display_name": f"F{code} [{code}]",
+                "category": cat, "broad_category": broad, "current_value": value}
+
+    # Liquid 91% + arbitrage 9%: parking money, not a concentrated bet.
+    parked = [pos(1, "Income/Debt Oriented Schemes - Liquid Fund", "Debt", 1501149), pos(2, ARB, "Hybrid", 150150)]
+    assert hi.concentration(parked) == []
+    # Add two equity funds 80/20: concentration is measured over those alone.
+    mixed = parked + [pos(3, "Equity Scheme - Flexi Cap Fund", "Equity", 80000), pos(4, "Equity Scheme - Mid Cap Fund", "Equity", 20000)]
+    (c,) = hi.concentration(mixed)
+    assert c["numbers"]["top1_pct"] == pytest.approx(80.0) and "market-linked" in c["title"]
+
+
+def test_bad_ter_surfaces_as_a_data_quality_insight(client):
+    con = connection.get_connection()
+    con.execute("UPDATE schemes SET expense_ratio = 1.00, ter_base_expense_ratio = 0.10, ter_brokerage_cost_pct = 0.11, "
+                "ter_transaction_cost_pct = 0.04, ter_statutory_levies_pct = 0.25 WHERE scheme_code = %s", (LIQUID,))
+    con.close()
+    db.refresh_summary_table()
+    pid = new_portfolio(client)
+    _buy(client, pid, LIQUID, "2022-02-01", 50000)
+    items = client.get(f"/api/holdings/portfolios/{pid}/insights").json()["insights"]
+    check = next(i for i in items if i["kind"] == "ter_check")
+    assert check["numbers"]["status"] == "inconsistent" and check["scheme_codes"] == [LIQUID]
+    detail = client.get(f"/api/holdings/portfolios/{pid}/positions/{LIQUID}").json()["ter"]
+    assert detail["status"] == "inconsistent" and detail["breakdown"]["statutory_levies_pct"] == 0.25
 
 
 # --- Alerts ------------------------------------------------------------------------------------

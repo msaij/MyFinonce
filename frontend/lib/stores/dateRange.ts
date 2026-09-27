@@ -77,11 +77,15 @@ export function computeRangeForPreset(
   }
 }
 
+/** Fallbacks only. The real lists come from /api/meta/filters, which reads the values the
+ *  data actually holds -- including "Unspecified" for schemes AMFI never labelled. Keeping
+ *  a second hardcoded copy here is what let the dropdown drift from the database: 123
+ *  schemes answered to neither "Direct" nor "Regular" and could not be named at all. */
 export const PLAN_TYPE_OPTIONS = ["All Plans", "Direct", "Regular"] as const;
-export type PlanType = (typeof PLAN_TYPE_OPTIONS)[number];
+export type PlanType = string;
 
 export const OPTION_TYPE_OPTIONS = ["All Options", "Growth", "IDCW"] as const;
-export type OptionType = (typeof OPTION_TYPE_OPTIONS)[number];
+export type OptionType = string;
 
 interface DateRangeState {
   preset: Preset;

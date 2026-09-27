@@ -57,3 +57,61 @@ class TestStopTerBackfill:
         amfi_sync.TER_BACKFILL_STATE["should_stop"] = False
         amfi_sync.stop_ter_backfill()
         assert amfi_sync.get_ter_backfill_status()["should_stop"] is True
+
+
+class _FakeCon:
+    def close(self):
+        pass
+
+
+class TestTerBackfillRowAccounting:
+    """The worker drove its progress card and its checkpoint ledger off a counter nothing
+    ever incremented: a run that wrote 1.4M rows reported "0 records added" throughout, and
+    every checkpoint row recorded rows_written = 0. Driven here with the network and the
+    database stubbed out -- see this module's docstring on why a real run must never start."""
+
+    @pytest.fixture()
+    def marks(self, monkeypatch):
+        recorded = []
+        monkeypatch.setattr(amfi_sync.db, "get_connection", lambda *a, **k: _FakeCon())
+        monkeypatch.setattr(amfi_sync.bulk, "completed_units", lambda con, job: set())
+        monkeypatch.setattr(
+            amfi_sync.bulk, "checkpoint_mark",
+            lambda con, job, unit, state, rows_written=0, detail=None:
+                recorded.append({"unit": unit, "state": state, "rows_written": rows_written}),
+        )
+        return recorded
+
+    def test_rows_written_reaches_the_state_and_the_checkpoints(self, monkeypatch, marks):
+        per_month = {"09-2026": 1000, "08-2026": 2500}
+
+        def fake_sync(_trigger="manual", months=None, stats=None):
+            if stats is not None:
+                stats["rows_written"] = per_month[months[0]]
+            return True, "ok"
+
+        monkeypatch.setattr(amfi_sync, "sync_official_ter", fake_sync)
+        amfi_sync._ter_backfill_worker(2, resume=True)
+
+        assert amfi_sync.get_ter_backfill_status()["records_added"] == 3500
+        assert {m["unit"]: m["rows_written"] for m in marks} == {"09-2026": 1000, "08-2026": 2500}
+        assert all(m["state"] == "done" for m in marks)
+
+    def test_a_month_that_wrote_nothing_is_still_checkpointed_at_zero(self, monkeypatch, marks):
+        """A month AMFI has no disclosures for is legitimately empty; it must not be
+        mistaken for an unwritten counter, and must not be retried forever."""
+        monkeypatch.setattr(amfi_sync, "sync_official_ter",
+                            lambda _trigger="manual", months=None, stats=None: (True, "ok"))
+        amfi_sync._ter_backfill_worker(1, resume=True)
+
+        assert amfi_sync.get_ter_backfill_status()["records_added"] == 0
+        assert marks and marks[0]["rows_written"] == 0 and marks[0]["state"] == "done"
+
+    def test_a_failed_month_is_not_marked_done(self, monkeypatch, marks):
+        """completed_units() only skips 'done', so a rate-limited month has to stay 'failed'
+        for the next run to pick it up again."""
+        monkeypatch.setattr(amfi_sync, "sync_official_ter",
+                            lambda _trigger="manual", months=None, stats=None: (False, "rate limited"))
+        amfi_sync._ter_backfill_worker(1, resume=True)
+
+        assert marks and marks[0]["state"] == "failed"

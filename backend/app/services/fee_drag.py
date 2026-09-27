@@ -32,7 +32,8 @@ def _load_ter_histories(con: Any, direct_code: Optional[int], regular_code: Opti
         return pd.DataFrame(), pd.DataFrame()
     try:
         df = fetchdf(con.execute(
-            f"""SELECT scheme_code, ter_date, total_ter_pct
+            f"""SELECT scheme_code, ter_date, COALESCE(valid_to, ter_date) AS valid_to,
+                       total_ter_pct
                 FROM ter_history
                 WHERE scheme_code IN ({','.join(str(c) for c in codes)})
                 ORDER BY ter_date ASC"""
@@ -47,16 +48,41 @@ def _load_ter_histories(con: Any, direct_code: Optional[int], regular_code: Opti
 
 
 def _time_varying_ter_decimal(hist: pd.DataFrame, years: float) -> Optional[float]:
-    """Mean official TER (percent → decimal) when history is dense; else None."""
+    """Duration-weighted mean official TER (percent → decimal), or None if too thin.
+
+    History is stored as one row per change, so a row is an interval rather than a day and
+    rows can no longer be averaged evenly: a fee held for six months and one held for three
+    days would count the same. Weighting each row by the days it covers restores the figure
+    the old dense daily table produced by construction -- there, one row *was* one day, so
+    its plain mean was already duration-weighted.
+
+    The sufficiency test has to move with it. Counting rows was a proxy for "how much
+    calendar time do we have", and against change-point data it measures how *volatile* a
+    fund's TER is instead: a fund whose fee never moved would collapse to a single row and
+    be rejected for having too little history, precisely when the single row is the whole
+    answer. What matters is the span covered, so that is what is measured."""
     if hist is None or hist.empty or "total_ter_pct" not in hist.columns:
         return None
-    vals = hist["total_ter_pct"].dropna().astype(float)
-    if vals.empty:
+    rows = hist.dropna(subset=["total_ter_pct"]).copy()
+    if rows.empty:
         return None
+
+    starts = pd.to_datetime(rows["ter_date"])
+    ends = pd.to_datetime(rows["valid_to"]) if "valid_to" in rows.columns else starts
+    ends = ends.fillna(starts)
+    # Inclusive of both endpoints, so a single-day disclosure weighs 1 rather than 0.
+    weights = (ends - starts).dt.days.clip(lower=0).astype(float) + 1.0
+    covered_days = float(weights.sum())
+
+    # Deliberately the old threshold expressed in its real units. It read
+    # `len(vals) < max(8, span_days / 45)`, and under the dense daily table one row was one
+    # day, so it was already a test on days covered -- just spelled as a row count. Keeping
+    # the same numbers means no fund that qualified before stops qualifying now.
     span_days = max(365.0 * years, 365.0)
-    if len(vals) < max(8, int(span_days / 45.0)):
+    if covered_days < max(8.0, span_days / 45.0):
         return None
-    mean_pct = float(vals.mean())
+
+    mean_pct = float((rows["total_ter_pct"].astype(float) * weights).sum() / covered_days)
     return mean_pct / 100.0
 
 
@@ -175,10 +201,21 @@ def compute_fee_drag_attribution(
                     if c_r is not None:
                         horizon_cagrs_r[h] = c_r
 
+            def _label(row, code):
+                """The app-wide label. plan_type/option_type were already selected above
+                and then thrown away, so both panels showed the base name -- identical for
+                the Direct and Regular rows the panel exists to tell apart."""
+                if row is None:
+                    return None
+                from app.db.queries import format_scheme_display_name
+
+                return format_scheme_display_name(row.get("scheme_name"), row.get("plan_type"),
+                                                  row.get("option_type"), code)
+
             scheme_metadata = {
                 "direct_scheme": {
                     "scheme_code": direct_scheme_code,
-                    "scheme_name": row_d.get("scheme_name") if row_d is not None else None,
+                    "scheme_name": _label(row_d, direct_scheme_code),
                     "fund_house": row_d.get("fund_house") if row_d is not None else None,
                     "category": row_d.get("category") if row_d is not None else None,
                     "expense_ratio_pct": (ter_direct * 100.0) if ter_direct is not None else None,
@@ -187,7 +224,7 @@ def compute_fee_drag_attribution(
                 },
                 "regular_scheme": {
                     "scheme_code": regular_scheme_code,
-                    "scheme_name": row_r.get("scheme_name") if row_r is not None else None,
+                    "scheme_name": _label(row_r, regular_scheme_code),
                     "fund_house": row_r.get("fund_house") if row_r is not None else None,
                     "category": row_r.get("category") if row_r is not None else None,
                     "expense_ratio_pct": (ter_regular * 100.0) if ter_regular is not None else None,

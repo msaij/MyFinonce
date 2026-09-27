@@ -14,6 +14,7 @@ import {
   type TxnType,
 } from "@/lib/api/holdings";
 import { useDebouncedValue } from "@/lib/hooks";
+import { useDateRangeStore } from "@/lib/stores/dateRange";
 import {
   FORM_TXN_TYPES,
   OUTFLOW_TYPES,
@@ -60,6 +61,23 @@ export function TransactionDrawer({
   prefillScheme?: { code: number; name: string } | null;
 }) {
   const queryClient = useQueryClient();
+  // The header's Plan/Option pickers narrow what these dropdowns offer, the same way they do
+  // on Compare and Quant. They deliberately do not touch the saved transactions list below --
+  // that is a record of what was actually bought, not a view over the AMFI universe. If a
+  // fund is missing from the dropdown, widening the header filter back to "All" reveals it,
+  // which is why the placeholder says which filter is in force.
+  const { planType, optionType } = useDateRangeStore();
+  const schemeFilter = {
+    plan_type: planType !== "All Plans" ? planType : undefined,
+    option_type: optionType !== "All Options" ? optionType : undefined,
+  };
+  const filterNote =
+    schemeFilter.plan_type || schemeFilter.option_type
+      ? ` (${[planType !== "All Plans" ? planType : null, optionType !== "All Options" ? optionType : null]
+          .filter(Boolean)
+          .join(" • ")} only)`
+      : "";
+
   const [form, setForm] = useState<TxnFormState>(() => emptyForm(defaultPortfolioId, todayIso()));
   const [schemeLabel, setSchemeLabel] = useState("");
   const [switchLabel, setSwitchLabel] = useState("");
@@ -70,7 +88,7 @@ export function TransactionDrawer({
     setSaveError(null);
     if (editing) {
       setForm(formFromTransaction(editing));
-      setSchemeLabel(String(editing.scheme_name ?? editing.scheme_code));
+      setSchemeLabel(editing.display_name ?? String(editing.scheme_code));
     } else {
       const f = emptyForm(defaultPortfolioId, todayIso());
       if (prefillScheme) f.schemeCode = prefillScheme.code;
@@ -169,7 +187,8 @@ export function TransactionDrawer({
             </div>
           ) : (
             <SearchCombobox
-              placeholder="Search fund name or AMFI code…"
+              placeholder={`Search fund name or AMFI code${filterNote}…`}
+              extraParams={schemeFilter}
               onSelect={(s) => {
                 set("schemeCode", s.scheme_code);
                 setSchemeLabel(s.display_label ?? s.scheme_name);
@@ -189,7 +208,8 @@ export function TransactionDrawer({
               </div>
             ) : (
               <SearchCombobox
-                placeholder="Search the target fund…"
+                placeholder={`Search the target fund${filterNote}…`}
+                extraParams={schemeFilter}
                 onSelect={(s) => {
                   set("switchTo", s.scheme_code);
                   setSwitchLabel(s.display_label ?? s.scheme_name);

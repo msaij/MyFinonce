@@ -17,8 +17,6 @@ export interface MetaStatus {
 }
 
 export interface ProductFlags {
-  holdout_portfolios: boolean;
-  bl_ui: boolean;
   admin_auth_required: boolean;
   admin_token_configured: boolean;
   amfi_ssl_insecure: boolean;

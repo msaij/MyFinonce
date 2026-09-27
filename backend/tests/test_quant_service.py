@@ -130,7 +130,8 @@ class TestGetQuantAnalysis:
         )
         assert "error" not in result
         assert result["benchmark"]["available"] is True
-        assert result["benchmark"]["label"] == "Peer Large Cap Fund - Direct Plan - Growth"
+        # Carries the AMFI code now, like every other fund label in the app.
+        assert result["benchmark"]["label"] == "Peer Large Cap Fund - Direct Plan - Growth [222]"
 
     def test_gross_alpha_computed_when_ter_is_official(self, db_con):
         result = quant_service.get_quant_analysis(111, DATES[10], DATES[-1], bench_mode="Custom Peer Mutual Fund", custom_peer_code=222)

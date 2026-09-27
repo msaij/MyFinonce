@@ -1,6 +1,6 @@
 # Indian Mutual Funds Analytics (MyFinonce)
 
-AMFI-sourced mutual fund research dashboard: screen schemes, compare and backtest, attribute factor risk, and build hypothetical portfolios.
+AMFI-sourced mutual fund research dashboard: screen schemes, compare and backtest, attribute factor risk, and track your own holdings.
 
 This is analysis software, not investment advice.
 
@@ -43,7 +43,7 @@ A fresh clone starts with an empty database. Use **Data Management** at `/admin`
 | `/screener` | Filter and rank the scheme universe |
 | `/compare` | Side-by-side funds and SIP/lumpsum backtest |
 | `/quant` | Factor attribution, stress, fee drag, tail risk, Monte Carlo |
-| `/portfolio` | Questionnaire → rules / MVO / HRP allocation |
+| `/holdings` | Your own portfolios: transactions, performance, allocation, risk, goals |
 | `/scheme/[code]` | Single-scheme dossier |
 | `/admin` | Sync, backfill, logs |
 

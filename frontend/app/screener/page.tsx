@@ -50,14 +50,15 @@ const SCREENER_TABLE_COLUMNS: ColumnConfig[] = [
     label: "Scheme Name",
     render: (row) => (
       <Link href={`/scheme/${row.scheme_code}`} className="font-semibold" style={{ color: "var(--mf-accent)" }}>
-        {String(row.scheme_name ?? "")}
+        {String(row.display_name ?? row.scheme_name ?? "")}
       </Link>
     ),
   },
   { key: "fund_house", label: "AMC" },
   { key: "category", label: "Category" },
-  { key: "plan_type", label: "Plan" },
-  { key: "option_type", label: "Option" },
+  // No Plan/Option columns: the Scheme Name above is the app-wide label, which already ends
+  // in "(Direct - Growth) [149170]". Repeating both in their own columns pushed the return
+  // figures off the right edge to restate what every row already said.
   {
     key: "expense_ratio",
     label: "TER %",
@@ -74,7 +75,7 @@ const SCREENER_TABLE_COLUMNS: ColumnConfig[] = [
             </span>
             {totalTer !== null && Math.abs(totalTer - baseTer) > 0.001 && (
               <span className="text-[10px]" style={{ color: "var(--mf-muted)" }}>
-                Total: {totalTer.toFixed(2)}%
+                Total: {totalTer.toFixed(4)}%
               </span>
             )}
           </div>
@@ -84,7 +85,10 @@ const SCREENER_TABLE_COLUMNS: ColumnConfig[] = [
     },
   },
   { key: "ter_status", label: "TER Confidence" },
-  { key: "latest_nav", label: "Latest NAV", format: "inr" },
+  // A NAV is a per-unit price AMFI publishes to 4 decimals, not a rupee amount: currency
+  // formatting rounded 14.6773 to ₹14.68 on a page whose own caption promises 4-decimal
+  // precision, and units bought are computed from those decimals.
+  { key: "latest_nav", label: "Latest NAV", format: "number", decimals: 4 },
   { key: "latest_date", label: "NAV Date", format: "date" },
   { key: "change_1d_pct", label: "1D Chg %", format: "signed_pct" },
   { key: "return_7d_pct", label: "7D Return %", format: "signed_pct" },
@@ -202,6 +206,9 @@ function ScreenerContent() {
     setPlanType("All Plans");
     setOptionType("All Options");
     setTerLabel("All Expense Ratios");
+    // Was left on by "Reset Filters", so the list stayed quietly narrowed to schemes with
+    // an official TER after a reset that claimed to clear everything.
+    setOfficialTerOnly(false);
     setSortLabel("Selected Period Return %");
     setLimit(250);
     setSearchQuery("");
@@ -330,7 +337,7 @@ function ScreenerContent() {
           <StatCard
             title={`Period Return (${span}D)`}
             value={formatSignedPct(isolatedRow.period_return_pct as number | null)}
-            sub={String(isolatedRow.scheme_name)}
+            sub={String(isolatedRow.display_name ?? isolatedRow.scheme_name)}
             tone={toneOf(isolatedRow.period_return_pct as number | null)}
           />
         ) : kpis?.top_performer ? (
@@ -357,6 +364,13 @@ function ScreenerContent() {
           <StatCard title={`Lagging Performer (${span}D)`} value="-" sub="No data" />
         )}
       </div>
+      {!isolatedRow && (kpis?.top_performer || kpis?.lag_performer) && (
+        <p className="mt-2 text-xs" style={{ color: "var(--mf-muted)" }}>
+          {optionType === "IDCW"
+            ? "Option filter is set to IDCW, so these two cards include IDCW schemes. A scheme's NAV falls by whatever it distributes, so a payout reads as a loss here."
+            : "IDCW schemes are excluded from these two cards only: their NAV falls by whatever they distribute, so a payout is indistinguishable from a loss. Matching Schemes and the breadth figures below still count every scheme."}
+        </p>
+      )}
 
       {/* --- Chart --- */}
       <div className="mt-6 border-t pt-6" style={{ borderColor: "var(--mf-border)" }}>
@@ -410,8 +424,11 @@ function ScreenerContent() {
           <Select label="Fund House (AMC)" value={amc} onChange={setAmc} options={["All Fund Houses", ...(metaFilters?.amcs ?? [])]} />
           <Select label="Asset Class" value={broadCat} onChange={setBroadCat} options={["All Categories", ...(metaFilters?.broad_categories ?? [])]} />
           <Select label="Category" value={subCat} onChange={setSubCat} options={["All Sub-Categories", ...(metaFilters?.sub_categories ?? [])]} />
-          <Select label="Plan Type (Global)" value={planType} onChange={(v) => setPlanType(v as any)} options={["All Plans", "Direct", "Regular"]} />
-          <Select label="Option Type (Global)" value={optionType} onChange={(v) => setOptionType(v as any)} options={["All Options", "Growth", "IDCW"]} />
+          {/* Same lists as the header's global picker, read from the data rather than
+              written out again here -- this third hardcoded copy was why "Unspecified"
+              (123 schemes AMFI never labelled) could not be selected on this page. */}
+          <Select label="Plan Type (Global)" value={planType} onChange={setPlanType} options={metaFilters?.plans ?? ["All Plans"]} />
+          <Select label="Option Type (Global)" value={optionType} onChange={setOptionType} options={metaFilters?.options ?? ["All Options"]} />
           <Select label="Max TER %" value={terLabel} onChange={setTerLabel} options={Object.keys(TER_OPTIONS)} />
           <label className="flex items-end gap-2 text-xs font-medium pb-2" style={{ color: "var(--mf-muted)" }}>
             <input type="checkbox" checked={officialTerOnly} onChange={(e) => setOfficialTerOnly(e.target.checked)} />
@@ -453,14 +470,14 @@ function ScreenerContent() {
               }}
               onSelect={(scheme) => {
                 setSchemeCode(scheme.scheme_code);
-                setIsolatedName(scheme.scheme_name);
-                setSearchQuery(scheme.scheme_name);
+                setIsolatedName(scheme.display_label ?? scheme.scheme_name);
+                setSearchQuery(scheme.display_label ?? scheme.scheme_name);
               }}
             />
             {schemeCode && isolatedName && (
               <div className="mt-1.5 flex items-center gap-2">
                 <span className="text-xs font-semibold" style={{ color: "var(--mf-accent)" }}>
-                  Isolating fund: {isolatedName} [{schemeCode}]
+                  Isolating fund: {isolatedName}
                 </span>
                 <button
                   type="button"

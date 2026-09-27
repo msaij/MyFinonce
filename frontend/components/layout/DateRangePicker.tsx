@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { getMetaStatus } from "@/lib/api/meta";
+import { getMetaFilters, getMetaStatus } from "@/lib/api/meta";
 import { formatDate } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
 import {
@@ -38,17 +38,16 @@ export function DateRangePicker() {
     syncBounds,
   } = useDateRangeStore();
 
-  // Rehydrate initial state from URL parameters on first mount if specified
+  // Rehydrate initial state from URL parameters on first mount if specified. The value is
+  // passed through rather than checked against a fixed list: the valid set now comes from
+  // the data (see planOptions/optionOptions below), and an unknown value simply returns
+  // nothing rather than being silently ignored here.
   useEffect(() => {
     if (!searchParams) return;
     const urlPlan = searchParams.get("plan") || searchParams.get("plan_type");
-    if (urlPlan && (PLAN_TYPE_OPTIONS as readonly string[]).includes(urlPlan)) {
-      setPlanType(urlPlan as PlanType);
-    }
+    if (urlPlan) setPlanType(urlPlan as PlanType);
     const urlOption = searchParams.get("option") || searchParams.get("option_type");
-    if (urlOption && (OPTION_TYPE_OPTIONS as readonly string[]).includes(urlOption)) {
-      setOptionType(urlOption as OptionType);
-    }
+    if (urlOption) setOptionType(urlOption as OptionType);
     const urlStart = searchParams.get("start");
     const urlEnd = searchParams.get("end");
     if (urlStart && urlEnd && /^\d{4}-\d{2}-\d{2}$/.test(urlStart) && /^\d{4}-\d{2}-\d{2}$/.test(urlEnd)) {
@@ -86,6 +85,11 @@ export function DateRangePicker() {
     syncBounds(today, today, true);
   }, [status, syncBounds]);
 
+  // The values the database actually holds, so every scheme is reachable by some choice.
+  const { data: filters } = useQuery({ queryKey: ["meta-filters"], queryFn: () => getMetaFilters() });
+  const planOptions = filters?.plans?.length ? filters.plans : [...PLAN_TYPE_OPTIONS];
+  const optionOptions = filters?.options?.length ? filters.options : [...OPTION_TYPE_OPTIONS];
+
   const span = start && end ? Math.round((new Date(end).getTime() - new Date(start).getTime()) / 86400000) : 0;
   const isBeforeMin = status?.min_date && start && start < status.min_date;
 
@@ -104,7 +108,7 @@ export function DateRangePicker() {
             onChange={(e) => setPlanType(e.target.value as PlanType)}
             title="Global Plan Type filter: applies across all pages"
           >
-            {PLAN_TYPE_OPTIONS.map((opt) => (
+            {planOptions.map((opt) => (
               <option key={opt} value={opt} className="bg-white text-slate-900">
                 {opt}
               </option>
@@ -124,7 +128,7 @@ export function DateRangePicker() {
             onChange={(e) => setOptionType(e.target.value as OptionType)}
             title="Global Option Type filter: applies across all pages"
           >
-            {OPTION_TYPE_OPTIONS.map((opt) => (
+            {optionOptions.map((opt) => (
               <option key={opt} value={opt} className="bg-white text-slate-900">
                 {opt}
               </option>

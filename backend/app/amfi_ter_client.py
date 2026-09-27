@@ -2,7 +2,9 @@ import datetime
 import json
 import logging
 import ssl
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +23,14 @@ TER_API_URL = "https://www.amfiindia.com/api/populate-te-rdata-revised"
 # probing it directly) — requesting more than this does not fail, it just returns 100.
 MAX_PAGE_SIZE = 100
 
+#: Seconds to wait after a 429, multiplied by the attempt number.
+RETRY_BACKOFF_SECONDS = 4.0
+
+#: Concurrent page fetches. Ten was fine until AMFI began answering 429 to roughly a third
+#: of a month's pages (observed 2026-09-23); four keeps a month comfortably under a minute
+#: while staying inside what the portal now tolerates.
+DEFAULT_CONCURRENT_PAGES = 4
+
 
 class AmfiTerClient:
     """Official AMFI TER-portal API client (JSON, paginated).
@@ -34,11 +44,17 @@ class AmfiTerClient:
         self,
         user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         page_size: int = MAX_PAGE_SIZE,
-        max_concurrent_pages: int = 10,
+        max_concurrent_pages: int = DEFAULT_CONCURRENT_PAGES,
     ):
         self.headers = {"User-Agent": user_agent, "Accept": "application/json"}
         self.page_size = min(page_size, MAX_PAGE_SIZE)
         self.max_concurrent_pages = max(1, max_concurrent_pages)
+        # Pages that ran out of retries, so a caller can say how complete a month is
+        # instead of presenting a partial fetch as a clean one.
+        self.failed_pages: List[int] = []
+        #: Pages the portal said this fetch spans, summed across months.
+        self.total_pages = 0
+        self._failure_lock = threading.Lock()
         from app.core.config import amfi_ssl_context
         self.ssl_ctx = amfi_ssl_context()
 
@@ -65,7 +81,15 @@ class AmfiTerClient:
             except Exception as e:
                 last_err = e
             if attempt < attempts - 1:
-                time.sleep(1.0)
+                # A 429 means the portal is asking for less, not for a faster retry: on
+                # 2026-09-23 a third of one month's pages came back 429 and were dropped,
+                # so the sync reported success while a third of the data never arrived.
+                # Backing off in seconds (rather than a flat 1s) is what makes the retry
+                # worth having; RETRY_BACKOFF_SECONDS grows with each attempt.
+                is_rate_limited = isinstance(last_err, urllib.error.HTTPError) and last_err.code == 429
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1) if is_rate_limited else 1.0)
+        with self._failure_lock:
+            self.failed_pages.append(page)
         logger.warning(f"Giving up on TER page {page} for {month} after {attempts} attempts: {last_err}")
         return None
 
@@ -93,6 +117,7 @@ class AmfiTerClient:
             yield row
         meta = first.get("meta") or {}
         page_count = meta.get("pageCount", 1) or 1
+        self.total_pages += page_count
         if not rows or page_count <= 1:
             return
 

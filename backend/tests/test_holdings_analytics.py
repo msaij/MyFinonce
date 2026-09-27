@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.db import connection
 from app.main import app
 from app.services import holdings_analytics as ha
+from app.services import holdings_service as svc
 from tests.holdings_support import add_ok, business_days, nav_on, new_portfolio, seed
 
 d = datetime.date
@@ -36,6 +37,7 @@ def client(pg_db):
 @pytest.mark.parametrize("category,broad,name,expected", [
     ("Equity Scheme - Flexi Cap Fund", "Equity", "Parag Parikh Flexi Cap Fund", "Equity"),
     ("Debt Scheme - Liquid Fund", "Debt", "HDFC Liquid Fund", "Cash & Liquid"),
+    ("Hybrid Scheme - Arbitrage Fund", "Hybrid", "Motilal Oswal Arbitrage Fund", "Cash & Liquid"),
     ("Debt Scheme - Corporate Bond Fund", "Debt", "ICICI Corporate Bond Fund", "Debt"),
     ("Hybrid Scheme - Balanced Advantage", "Hybrid", "HDFC Balanced Advantage Fund", "Hybrid"),
     ("Other Scheme - Index Funds", "Other / Index / ETF", "UTI Nifty 50 Index Fund", "Equity"),
@@ -48,6 +50,211 @@ def client(pg_db):
 def test_every_scheme_gets_exactly_one_asset_class(category, broad, name, expected):
     assert ha.classify(category, broad, name) == expected
     assert expected in ha.ASSET_CLASSES
+
+
+# --- Recent-change tiles -------------------------------------------------------------
+
+def test_recent_change_tiles_measure_nav_days_not_calendar_days(client):
+    """"The last 2 days" over a weekend would otherwise be two days in which nothing
+    could have changed. The window opens N NAV rows back, so it spans N daily moves."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
+    body = client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()
+
+    assert [w["days"] for w in body["windows"]] == [2, 5, 7, 10]
+    two = next(w for w in body["windows"] if w["days"] == 2)
+    # With one fund the window return is that fund's own NAV move across the last two
+    # NAV dates -- taken from the seeded series rather than assumed.
+    days = list(business_days(d(2023, 1, 2), d(2024, 12, 31)))
+    expected = (nav_on(1001, days[-1]) / nav_on(1001, days[-3]) - 1) * 100
+    assert two["start"] == days[-3].isoformat()
+    assert two["change_pct"] == pytest.approx(expected, rel=1e-4)
+    assert two["avg_daily_pct"] == pytest.approx((1 + expected / 100) ** 0.5 * 100 - 100, rel=1e-4)
+
+
+def test_money_paid_in_during_the_window_is_not_reported_as_a_gain(client):
+    """The whole reason these are time-weighted: a fresh purchase raises the portfolio's
+    value without the holdings having moved, and must not show up as a return."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-02", units=10)
+    quiet = client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()
+    before = next(w for w in quiet["windows"] if w["days"] == 5)["change_pct"]
+
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-27", units=500)
+    after = next(w for w in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"]
+                 if w["days"] == 5)["change_pct"]
+    assert after == pytest.approx(before, rel=1e-6)
+
+
+def test_a_window_longer_than_the_history_says_so_instead_of_guessing(client):
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-27", units=10)
+    windows = {w["days"]: w for w in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"]}
+
+    assert windows[10]["available"] is False and windows[10]["change_pct"] is None
+    assert windows[10]["nav_days_held"] < 10
+    # A countdown the tile can show instead of a bare "not yet": N windows need N+1 rows.
+    assert windows[10]["days_needed"] == 11 - (windows[10]["nav_days_held"] + 1)
+    assert windows[2]["days_needed"] == 0
+
+
+def test_each_window_carries_the_same_window_of_the_benchmark(client):
+    """So a tile can say whether a move was the funds or just the market they sit in."""
+    pid = _pf(client)      # explicit benchmark 1003
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
+    two = next(w for w in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"] if w["days"] == 2)
+
+    days = list(business_days(d(2023, 1, 2), d(2024, 12, 31)))
+    bench = (nav_on(BENCHMARK, days[-1]) / nav_on(BENCHMARK, days[-3]) - 1) * 100
+    assert two["benchmark_change_pct"] == pytest.approx(bench, rel=1e-4)
+    assert two["excess_pp"] == pytest.approx(two["change_pct"] - bench, abs=1e-6)
+
+
+def test_the_kpis_carry_a_since_start_return_beside_the_benchmark(client):
+    """The headline a young portfolio can have before XIRR is allowed to show, on exactly
+    the basis of the Performance tab's "Since start" row so the two never disagree."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", amount=100000)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    since = next(p for p in client.get(f"/api/holdings/portfolios/{pid}/performance").json()["periods"]
+                 if p["label"] == "Since start")
+
+    assert k["benchmark_since_start_pct"] is not None
+    assert k["excess_since_start_pp"] == pytest.approx(k["twr_since_start_pct"] - k["benchmark_since_start_pct"], abs=1e-9)
+    # The Performance row annualises beyond a year; the tile is the plain cumulative figure.
+    assert since["annualised"] is True and k["twr_since_start_pct"] > since["twr_pct"]
+    assert k["total_gain_pct"] == pytest.approx(k["total_gain"] / k["net_contributed"] * 100.0)
+    assert k["first_investment_date"] == "2023-03-01" and k["xirr_available_on"] is None
+    # One purchase: the money-weighted average is simply the time since it.
+    assert k["days_since_first_investment"] > 600
+    assert k["avg_days_invested"] == pytest.approx(k["days_since_first_investment"])
+
+
+def test_average_days_invested_is_shorter_than_the_span_when_money_came_in_later(client):
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", amount=100000)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-09-02", amount=300000)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    span = k["days_since_first_investment"]
+    later = span - (d(2024, 9, 2) - d(2023, 3, 1)).days
+    assert k["avg_days_invested"] == pytest.approx((100000 * span + 300000 * later) / 400000, rel=1e-3)
+    assert k["avg_days_invested"] < span / 2
+
+
+def test_a_withheld_xirr_says_when_it_will_appear(client):
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-20", amount=10000)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    assert k["xirr_pct"] is None and k["xirr_note"] == "too_short"
+    assert k["xirr_available_on"] == "2025-01-19", "30 calendar days after the first cash flow"
+
+
+def test_an_empty_portfolio_reports_no_windows(client):
+    pid = _pf(client)
+    assert client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["empty"] is True
+
+
+def test_a_flow_free_window_is_exactly_the_change_in_value(client):
+    """Regression anchor for the sub-period split. On a day with no cash flow the split
+    must change nothing: the pre-flow book is the whole book, the second sub-period's
+    return is zero, and the day collapses to V_t / V_{t-1} - 1, which telescopes to
+    V_end / V_start over the window. Portfolio 1's independently verified trailing
+    figures (2d +0.04498261142422688, 5d +0.07783823316471761, 7d +0.14084264059792684)
+    were measured before this change and rest on exactly that."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2023-03-01", units=10)
+    days = list(business_days(d(2023, 1, 2), d(2024, 12, 31)))
+    windows = {w["days"]: w for w in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"]}
+
+    def value_on(day):
+        return 100 * nav_on(1001, day) + 10 * nav_on(1002, day)
+
+    for n in ha.RECENT_WINDOWS:
+        v_end, v_start = value_on(days[-1]), value_on(days[-(n + 1)])
+        assert windows[n]["change_pct"] == pytest.approx((v_end / v_start - 1) * 100, rel=1e-9)
+        assert windows[n]["gain"] == pytest.approx(v_end - v_start, abs=0.01)
+
+
+def test_a_large_deposit_into_a_tiny_portfolio_does_not_swamp_the_window(client):
+    """Portfolio 2's real shape: Rs ~1,500 on the books, then Rs 10,00,000 in one day.
+
+    The purchase does not add its full rupee amount to the book -- stamp duty comes out
+    of it and units round to 3 decimals -- and charging that shortfall to the Rs 1,500
+    opening base read as -1.35% for the day, then dragged the whole 10-day window red
+    while its rupee figure stayed green. Splitting the day at the flow charges it to the
+    post-flow book, where it is a rounding error."""
+    pid = _pf(client)
+    add_ok(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-16", amount=1500)
+    add_ok(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-18", amount=1_000_000)
+    w = next(x for x in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"] if x["days"] == 10)
+
+    assert w["available"] is True
+    # The headline and the rupee figure must at least agree on their sign.
+    assert w["gain"] > 0 and w["change_pct"] > 0
+    # 1002 only crawls upwards, so a time-weighted window over it is that fund's own NAV
+    # move, deposit or no deposit. The old one-line form gave about -3.2% here.
+    days = list(business_days(d(2023, 1, 2), d(2024, 12, 31)))
+    fund_move = (nav_on(1002, days[-1]) / nav_on(1002, days[-11]) - 1) * 100
+    assert w["change_pct"] == pytest.approx(fund_move, abs=0.02)
+
+
+# --- The 1-day KPI tile ----------------------------------------------------------------
+
+def test_the_kpi_day_change_and_the_window_tiles_come_from_one_engine(client):
+    """The tile used to have its own arithmetic. It is now the shortest trailing window,
+    so it carries the same convention as the tiles printed underneath it: the day's own
+    flow is taken out of the day's change in value."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    series = client.get(f"/api/holdings/portfolios/{pid}/performance").json()["series"]
+
+    last_day = (series["value"][-1] - series["value"][-2]) - (series["invested"][-1] - series["invested"][-2])
+    assert k["day_change"] == pytest.approx(last_day, abs=0.02)
+    assert k["day_change_pct"] == pytest.approx(ha.day_change(str(pid))["change_pct"])
+
+
+def test_units_bought_today_are_not_credited_with_todays_nav_move(client):
+    """The tile multiplied today's unit balance by today's NAV move with no date filter,
+    so a purchase allotted this morning collected a full day's gain it was never held
+    for. On the real ledger that was ~Rs 217 on a single Rs 10,00,000 purchase."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-02", units=100)
+    before = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]["day_change"]
+
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-31", units=100_000)
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    assert body["kpis"]["day_change"] == pytest.approx(before, abs=0.02)
+    # The per-fund column follows the same rule: only units held at the previous close
+    # earned the move, so today's 100,000 units add nothing and the column adds up to the tile.
+    assert body["positions"][0]["day_change"] == pytest.approx(before, abs=0.02)
+
+
+def test_the_per_fund_day_column_adds_up_to_the_tile_across_buys_and_sells_today(client):
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-11-01", units=300)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-11-01", units=40)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="REDEEM", trade_date="2024-12-31", units=120)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-31", units=900)
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+
+    prev, last = d(2024, 12, 30), d(2024, 12, 31)
+    # Units redeemed today were still held through today's move; units bought today were not.
+    assert body["positions"] and {p["scheme_code"]: p["day_change"] for p in body["positions"]} == pytest.approx({
+        1001: 300 * (nav_on(1001, last) - nav_on(1001, prev)),
+        1002: 40 * (nav_on(1002, last) - nav_on(1002, prev)),
+    }, abs=0.01)
+    assert sum(p["day_change"] for p in body["positions"]) == pytest.approx(body["kpis"]["day_change"], abs=0.02)
+
+
+def test_a_portfolio_with_one_nav_day_reports_no_day_change(client):
+    """Bought today: there is no previous close to have moved from, and inventing one
+    from the fund's own NAV history would credit a day the units were not held."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-31", units=100)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    assert k["day_change"] == 0.0 and k["day_change_pct"] is None
 
 
 # --- Time-weighted index -----------------------------------------------------------
@@ -104,6 +311,37 @@ def test_benchmark_is_indexed_to_100_and_excess_is_reported(client):
     assert one_y["excess_pct"] == pytest.approx(one_y["twr_pct"] - one_y["benchmark_pct"])
 
 
+def test_default_benchmark_is_each_funds_category_not_an_equity_index(client):
+    """No benchmark chosen: each holding is compared with its own SEBI category.
+    1001 is the only Flexi Cap fund here, so its category average IS the fund --
+    a lone holding must then track its benchmark exactly."""
+    pid = new_portfolio(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
+    perf = client.get(f"/api/holdings/portfolios/{pid}/performance").json()
+    b = perf["benchmark"]
+    assert b["kind"] == "category_blend" and b["scheme_code"] is None
+    assert b["components"] == [{"category": "Equity Scheme - Flexi Cap Fund", "weight_pct": 100.0}]
+    twr, bench = perf["series"]["twr_index"], perf["series"]["benchmark_index"]
+    assert bench[0] == pytest.approx(100.0) and bench[-1] == pytest.approx(twr[-1], rel=1e-3)
+
+
+def test_category_blend_weights_follow_the_portfolio(client):
+    pid = new_portfolio(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-02", amount=75000)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-02", amount=25000)
+    comps = {svc.sebi_category(c["category"]): c["weight_pct"]
+             for c in client.get(f"/api/holdings/portfolios/{pid}/performance").json()["benchmark"]["components"]}
+    alloc = {r["bucket"]: r["weight_pct"] for r in client.get(f"/api/holdings/portfolios/{pid}/allocation").json()["by_category"]}
+    assert comps == pytest.approx(alloc, abs=0.01)
+
+
+def test_an_explicit_benchmark_still_wins(client):
+    pid = _pf(client)      # benchmark set to 1003
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2023-03-01", amount=1000)
+    b = client.get(f"/api/holdings/portfolios/{pid}/performance").json()["benchmark"]
+    assert b["kind"] == "scheme" and b["scheme_code"] == BENCHMARK
+
+
 def test_attribution_sums_to_total_gain(client):
     pid = _pf(client)
     _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", amount=40000)
@@ -113,8 +351,27 @@ def test_attribution_sums_to_total_gain(client):
     assert sum(p["gain"] for p in parts) == pytest.approx(perf["attribution"]["total_gain"])
     assert perf["attribution"]["total_gain"] == pytest.approx(
         perf["series"]["value"][-1] - perf["series"]["invested"][-1], abs=0.05)
-    assert sum(p["share_pct"] for p in parts) == pytest.approx(100.0)
-    assert perf["monthly_flows"] == [{"month": "2023-03", "invested": 100000.0, "withdrawn": 0.0}]
+    # Both seeded funds rose, so the shares of the gain are plain shares of the total.
+    assert sum(p["gain_share_pct"] for p in parts) == pytest.approx(100.0)
+    assert sum(p["weight_pct"] for p in parts) == pytest.approx(100.0)
+    assert "monthly_flows" not in perf, "replaced by the share-of-money vs share-of-gain view"
+
+
+def test_gain_shares_stay_bounded_when_a_fund_loses_money():
+    """A share of the NET would be 150% / 100% / -150% here, and run away as the net nears
+    zero. Against gross gains and gross losses the winners sum to 100% and the losers to
+    -100%, whatever the net does."""
+    shares, gross_gain, gross_loss = ha.gain_shares([600.0, 400.0, -500.0])
+    assert shares == pytest.approx([60.0, 40.0, -100.0])
+    assert (gross_gain, gross_loss) == (1000.0, -500.0)
+
+    near_zero_net, _, _ = ha.gain_shares([1000.0, -999.0])
+    assert near_zero_net == pytest.approx([100.0, -100.0]), "no blow-up as the net approaches zero"
+
+
+def test_gain_shares_with_nothing_down_are_the_plain_share_of_the_total():
+    shares, _, gross_loss = ha.gain_shares([750.0, 250.0, 0.0])
+    assert shares == pytest.approx([75.0, 25.0, 0.0]) and gross_loss == 0.0
 
 
 def test_empty_portfolio_performance_is_explicitly_empty(client):
@@ -136,6 +393,82 @@ def test_allocation_groups_and_concentration(client):
     assert a["concentration"]["hhi"] == pytest.approx(sum(x * x for x in w), rel=1e-6)
     assert a["concentration"]["effective_funds"] == pytest.approx(1 / a["concentration"]["hhi"])
     assert a["targets"] is None and a["drift"] is None
+    assert a["basis"] == "current_value"
+    assert a["concentration"]["amc_count"] == 2
+    assert a["concentration"]["top_amc"] == "Alpha MF" and a["concentration"]["top_amc_pct"] > 70
+    assert a["by_portfolio"] is None, "one portfolio: nothing to split"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Income/Debt Oriented Schemes - Liquid Fund", "Liquid Fund"),
+    ("Debt Scheme - Liquid Fund", "Liquid Fund"),
+    ("Liquid", "Liquid Fund"),
+    ("Income/Debt Oriented Schemes - Banking and PSU Debt Fund", "Banking and PSU Fund"),
+    ("Debt Scheme - Banking and PSU Fund", "Banking and PSU Fund"),
+    ("Equity Scheme - Flexi Cap Fund", "Flexi Cap Fund"),
+    ("Other Scheme - FoF Overseas", "FoF Overseas"),
+    ("Fund of Funds - Overseas", "FoF Overseas"),
+    # Redefined by SEBI's 2017 recategorisation: kept, never guessed onto a modern name.
+    ("Income/Debt Oriented Schemes - Short Term Fund", "Short Term Fund"),
+    ("Income", "Income"),
+    (None, None),
+    ("  ", None),
+])
+def test_sebi_category_folds_amfis_two_labels_for_one_category(raw, expected):
+    assert svc.sebi_category(raw) == expected
+
+
+def test_legacy_and_modern_labels_for_one_category_are_one_bucket(client):
+    """The owner's liquid money read as 59.6% + 25.0% in two buckets, because AMFI files
+    Mirae Asset Liquid under its pre-2018 header and Motilal Oswal Liquid under the new one."""
+    days = list(business_days(d(2024, 11, 1), d(2024, 12, 31)))
+    seed([(1004, "Delta Liquid Fund - Direct Plan - Growth", "Delta MF", "Income/Debt Oriented Schemes - Liquid Fund", "Direct", "Growth")],
+         {1004: [(day, 2000.0 + 0.3 * i) for i, day in enumerate(days)]})
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-02", amount=60000)
+    _add(client, portfolio_id=pid, scheme_code=1004, txn_type="BUY", trade_date="2024-12-02", amount=40000)
+    a = client.get(f"/api/holdings/portfolios/{pid}/allocation").json()
+    assert [(r["bucket"], round(r["weight_pct"])) for r in a["by_category"]] == [("Liquid Fund", 100)]
+    assert {h["category"] for h in a["holdings"]} == {"Liquid Fund"}
+    assert {r["bucket"] for r in a["by_asset_class"]} == {"Cash & Liquid"}
+
+
+def test_household_allocation_is_traced_back_to_each_portfolio(client):
+    self_pid, spouse_pid = _pf(client, "Self"), _pf(client, "Spouse")
+    _add(client, portfolio_id=self_pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-02", amount=75000)
+    _add(client, portfolio_id=spouse_pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-02", amount=25000)
+    a = client.get("/api/holdings/portfolios/all/allocation").json()
+    rows = {r["bucket"]: r for r in a["by_portfolio"]}
+    assert set(rows) == {"Self", "Spouse"}
+    assert sum(r["weight_pct"] for r in rows.values()) == pytest.approx(100.0)
+    assert sum(r["value"] for r in rows.values()) == pytest.approx(a["total_value"], abs=0.01)
+    assert rows["Self"]["by_asset_class"] == pytest.approx({"Equity": 100.0})
+    assert rows["Spouse"]["by_asset_class"] == pytest.approx({"Cash & Liquid": 100.0})
+
+
+def test_positions_carry_the_yearly_fee_and_the_kpis_its_weighted_ter(client):
+    seed([(1005, "Epsilon Flexi Cap Fund - Direct Plan - Growth", "Epsilon MF", "Equity Scheme - Flexi Cap Fund", "Direct", "Growth", 0.75, "official")],
+         {1005: [(day, 50.0) for day in business_days(d(2024, 11, 1), d(2024, 12, 31))]})
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1005, txn_type="BUY", trade_date="2024-12-02", units=2000)   # Rs 1,00,000
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-12-02", amount=100000)  # no TER seeded
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    pos = {p["scheme_code"]: p for p in body["positions"]}
+    assert pos[1005]["annual_fee"] == pytest.approx(750.0)
+    assert pos[1002]["annual_fee"] is None
+    k = body["kpis"]
+    # Weighted over the money that HAS a TER, with the coverage stated beside it.
+    assert k["weighted_ter_pct"] == pytest.approx(0.75)
+    assert k["annual_fee"] == pytest.approx(750.0)
+    assert k["ter_coverage_pct"] == pytest.approx(pos[1005]["current_value"] / k["current_value"] * 100)
+    assert pos[1005]["sebi_category"] == "Flexi Cap Fund" and pos[1005]["asset_class"] == "Equity"
+
+
+def test_a_withheld_position_xirr_says_when_it_will_show(client):
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-20", units=10)
+    p = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"][0]
+    assert p["xirr_note"] == "too_short" and p["xirr_available_on"] == "2025-01-19"
 
 
 def test_targets_must_total_100_and_drive_drift(client):

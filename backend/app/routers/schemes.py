@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.serialize import df_to_records, sanitize_floats
+from app.db import holdings as hdb
 from app.db import queries as db
 
 router = APIRouter(prefix="/api/schemes", tags=["schemes"])
@@ -45,10 +46,41 @@ def nav_history(
     return df_to_records(df)
 
 
+@router.get("/compare")
+def compare(
+    codes: str = Query(..., description="Comma-separated scheme codes, at most 8"),
+    start: Optional[datetime.date] = None,
+    end: Optional[datetime.date] = None,
+    rf_pct: float = Query(6.5, ge=0.0, le=20.0, description="Annual risk-free rate, % (Sharpe/Sortino)"),
+) -> dict:
+    """The Compare tab's whole payload, measured over one common period -- see
+    app/services/compare.py. Registered before /{scheme_code} for the same reason as
+    /nav-history."""
+    from app.services import compare as compare_svc
+
+    try:
+        parsed = [int(c) for c in codes.split(",") if c.strip()]
+    except ValueError:
+        raise HTTPException(status_code=422, detail="codes must be comma-separated AMFI scheme codes")
+    scheme_codes = list(dict.fromkeys(parsed))  # de-duplicated, order kept
+    if not scheme_codes:
+        raise HTTPException(status_code=422, detail="Select at least one fund")
+    if len(scheme_codes) > compare_svc.MAX_FUNDS:
+        raise HTTPException(status_code=422, detail=f"Compare takes at most {compare_svc.MAX_FUNDS} funds")
+    if start and end and start > end:
+        raise HTTPException(status_code=422, detail="start must be on or before end")
+    return sanitize_floats(compare_svc.compare_funds(scheme_codes, start, end, rf_pct))
+
+
 @router.get("/{scheme_code}/ter-history")
 def ter_history(scheme_code: int) -> list[dict]:
     df = db.get_scheme_ter_history(scheme_code)
     return df_to_records(df)
+
+
+#: Horizons the dossier ranks a scheme on. summary_table only carries percentile-able
+#: return columns for these three; category_percentiles rejects anything else.
+PEER_RANK_HORIZONS = (("1y", "return_1y_pct"), ("3y", "return_3y_pct"), ("5y", "return_5y_pct"))
 
 
 @router.get("/{scheme_code}/profile")
@@ -56,6 +88,17 @@ def get_scheme_profile(scheme_code: int) -> dict:
     profile = db.get_scheme_profile_only(scheme_code)
     if profile is None:
         raise HTTPException(status_code=404, detail=f"Scheme {scheme_code} not found")
+    # The app-wide label ("Name (Plan - Option) [code]"), so the dossier names a fund the
+    # same way the charts, search box and Holdings do -- the stored scheme_name is only
+    # the base fund, which every plan/option variant shares.
+    profile["display_name"] = hdb.display_name(profile)
+    # "Good or bad?" needs a peer group, not just a number: percentile among ACTIVE
+    # schemes of the same category AND plan type, so a Direct fund is never flattered by
+    # being ranked against Regular plans carrying a distributor commission.
+    profile["peer_rank"] = {
+        horizon: hdb.category_percentiles([scheme_code], column).get(scheme_code)
+        for horizon, column in PEER_RANK_HORIZONS
+    }
     return sanitize_floats(profile)
 
 

@@ -68,7 +68,7 @@ def extract_option_type(scheme_name: str, option_type: Optional[str] = None) -> 
     Prioritizes explicit option_type when provided and valid ('growth' or 'idcw').
     Uses word-boundary regexes, safely distinguishing 'diversified' and 'dividend yield'.
     """
-    if option_type:
+    if isinstance(option_type, str):
         opt_lower = option_type.strip().lower()
         if opt_lower == "growth" or _GROWTH_WORD_RE.search(opt_lower):
             return "growth"
@@ -94,7 +94,7 @@ def extract_option_type(scheme_name: str, option_type: Optional[str] = None) -> 
                 return "growth"
             return "idcw"
 
-    if option_type:
+    if isinstance(option_type, str):
         ot = option_type.strip().lower()
         if ot:
             return ot
@@ -102,8 +102,12 @@ def extract_option_type(scheme_name: str, option_type: Optional[str] = None) -> 
 
 
 def extract_plan_type(scheme_name: str, plan_type: Optional[str] = None) -> str:
-    """Classifies a scheme as 'Direct' or 'Regular'."""
-    if plan_type:
+    """Classifies a scheme as 'Direct' or 'Regular'.
+
+    isinstance, not truthiness: these values come from pandas, where a NULL plan is float
+    NaN -- truthy, so it reached .strip() and raised. Since the parser stopped guessing
+    "Regular" for the ~40% of AMFI rows that state no plan, NULL is now common."""
+    if isinstance(plan_type, str):
         pt = plan_type.strip().lower()
         if pt == "direct":
             return "direct"

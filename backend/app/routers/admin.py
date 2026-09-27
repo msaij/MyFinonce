@@ -10,13 +10,14 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from app import amfi_sync, app_logging, auth
+from app import amfi_sync, app_logging, auth, data_audit
 from app.core.config import settings
 from app.core.serialize import sanitize_floats
+from app.db import holdings as hdb
 from app.db import queries as db
-from app.schemas.admin import HistoricalBackfillStartRequest, TerBackfillStartRequest
+from app.schemas.admin import AuditRun, HistoricalBackfillStartRequest, TerBackfillStartRequest
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -38,6 +39,7 @@ def get_status() -> dict:
             "sync_history": amfi_sync.get_sync_history(),
             "ter_sync_history": amfi_sync.get_ter_sync_history(),
             "cost_coverage": db.get_cost_data_coverage(),
+            "full_refresh": amfi_sync.get_full_refresh_status(),
             "ter_backfill_status": amfi_sync.get_ter_backfill_status(),
             "backfill_status": amfi_sync.get_backfill_status(),
             # Durable, unlike backfill_status, which only describes the current
@@ -51,6 +53,12 @@ def get_status() -> dict:
 
 
 class FactorProxyUpdate(BaseModel):
+    # Reject unknown keys instead of ignoring them: pydantic drops extra fields by
+    # default, so a typo'd proxy name used to be dropped silently and the request
+    # answered {"success": true} having changed nothing -- and the guard below,
+    # which exists to catch exactly that, could never see the key to reject it.
+    model_config = ConfigDict(extra="forbid")
+
     factor_proxy_market: Optional[int] = None
     factor_proxy_market_fallback: Optional[int] = None
     factor_proxy_market_fallback_2: Optional[int] = None
@@ -71,6 +79,11 @@ def set_factor_proxies(req: FactorProxyUpdate, _auth: None = Depends(_require_ad
     for key, val in payload.items():
         if key not in DEFAULT_FACTOR_PROXIES:
             raise HTTPException(status_code=422, detail=f"Unknown proxy key {key}")
+        # A code with no scheme behind it is accepted happily by sync_meta and only
+        # shows up later as "factor proxy funds lack NAV data" on the pages that use
+        # it, with nothing pointing back at the typo that caused it.
+        if not hdb.scheme_exists(int(val)):
+            raise HTTPException(status_code=422, detail=f"No scheme with AMFI code {int(val)} for {key}")
         db.set_sync_meta_value(key, str(int(val)))
     with _factor_lock:
         fm._cached_base_factor_df = None
@@ -82,6 +95,40 @@ def set_factor_proxies(req: FactorProxyUpdate, _auth: None = Depends(_require_ad
 # --- Manual actions (all synchronous/blocking, matching the original's st.spinner() UX --
 # a page load fires a POST and waits for it to resolve, exactly as the original blocked on
 # the button click). ---
+
+
+@router.post("/sync/all")
+def trigger_full_refresh(_auth: None = Depends(_require_admin)) -> dict:
+    """Starts NAVs -> plan/option resolution -> TER -> one summary rebuild, in that order
+    because each step depends on the one before it.
+
+    Returns as soon as the job starts: the chain takes minutes against live AMFI, which is
+    far longer than a proxy will hold a POST open. Progress and the per-step outcome arrive
+    through /status's full_refresh block."""
+    if not amfi_sync.start_full_refresh(_trigger="manual"):
+        raise HTTPException(status_code=409, detail="A full refresh is already running.")
+    return {"success": True, "message": "Full refresh started. Progress appears below and in the Activity Log."}
+
+
+@router.get("/verify")
+def verify() -> dict:
+    """Reconciliation of what the database actually holds after a sync."""
+    return sanitize_floats(amfi_sync.verify_sync())
+
+
+@router.post("/audit", response_model=AuditRun)
+def run_audit(_auth: None = Depends(_require_admin)) -> dict:
+    """Row-level audit: names the rows that contradict themselves, where /verify only counts.
+
+    Synchronous, unlike /sync/all: every check is an indexed read and the whole run takes
+    a few seconds on the live database, well inside what a proxy holds a POST open for.
+    Admin-gated although it only reads, because it writes the stored run history."""
+    return sanitize_floats(data_audit.run_data_audit(trigger="manual"))
+
+
+@router.get("/audit/latest", response_model=AuditRun)
+def get_latest_audit() -> dict:
+    return sanitize_floats(data_audit.latest_audit())
 
 
 @router.post("/sync/daily")
@@ -112,7 +159,7 @@ def recompute_summary(_auth: None = Depends(_require_admin)) -> dict:
 
 @router.post("/backfill/ter/start")
 def start_ter_backfill(req: TerBackfillStartRequest, _auth: None = Depends(_require_admin)) -> dict:
-    ok = amfi_sync.start_ter_backfill(n_months=req.n_months)
+    ok = amfi_sync.start_ter_backfill(n_months=req.n_months, resume=req.resume)
     if not ok:
         raise HTTPException(status_code=409, detail="A TER backfill job is already running.")
     return {"success": True}
@@ -125,6 +172,15 @@ def stop_ter_backfill(_auth: None = Depends(_require_admin)) -> dict:
 
 
 # --- Multi-year historical NAV backfill (background thread; poll /status for progress) ---
+
+
+@router.get("/backfill/ter/month-count")
+def ter_backfill_month_count(start_year: int = Query(2018, ge=2000)) -> dict:
+    """What "since <year>" means in months, from the engine that will do the work -- the
+    portal's own 2018 floor is applied here, so the button cannot promise more."""
+    months = amfi_sync.ter_months_since(start_year)
+    return {"start_year": start_year, "total_months": len(months),
+            "oldest_month": months[-1] if months else None, "newest_month": months[0] if months else None}
 
 
 @router.get("/backfill/chunk-count")

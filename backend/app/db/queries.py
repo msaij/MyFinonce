@@ -106,75 +106,87 @@ def normalize_nav_splits() -> int:
     with WRITE_LOCK:
         return _normalize_nav_splits_impl()
 
+def find_nav_split_events(con, since: Optional[datetime.date] = None) -> List[Dict[str, Any]]:
+    """Unit-split / face-value-reset events still unadjusted in nav_history.
+
+    Detection runs in the database rather than pandas: the old implementation pulled every
+    NAV row into a DataFrame to compute one ratio column, which at 27M rows is a few GB and
+    got the container OOM-killed -- so the normalizer could not be run at all on real data.
+    Postgres computes the same lag() ratio over an index scan and returns only the handful
+    of rows that match.
+
+    A "segregated portfolio" (a side-pocket created when a debt scheme's paper defaults)
+    settles with a lump-sum recovery distribution that can land near a clean ratio -- a
+    one-time payout, not a redenomination. Back-adjusting one would fabricate continuous
+    history, so those schemes are excluded by name."""
+    candidates = sorted({float(f) for f in _SPLIT_CANDIDATES})
+    rows = con.execute(
+        """
+        WITH ratios AS (
+            SELECT n.scheme_code, n.nav_date,
+                   n.nav / NULLIF(lag(n.nav) OVER (PARTITION BY n.scheme_code ORDER BY n.nav_date), 0) AS ratio
+            FROM nav_history n
+            WHERE (%s::date IS NULL OR n.nav_date >= %s::date)
+        )
+        SELECT r.scheme_code, r.nav_date, r.ratio
+        FROM ratios r
+        JOIN schemes s ON s.scheme_code = r.scheme_code
+        WHERE r.ratio IS NOT NULL
+          AND s.scheme_name NOT ILIKE '%%segregat%%'
+          AND EXISTS (
+              SELECT 1 FROM unnest(%s::double precision[]) AS c(v)
+              WHERE abs(r.ratio - c.v) / c.v < %s
+          )
+        ORDER BY r.scheme_code, r.nav_date
+        """,
+        (since, since, candidates, _SPLIT_TOLERANCE),
+    ).fetchall()
+    return [{"scheme_code": int(r[0]), "nav_date": r[1], "ratio": float(r[2])} for r in rows]
+
+
 def _normalize_nav_splits_impl() -> int:
     """Detects unit-split/face-value-reset events in nav_history and back-adjusts every
     NAV before the split date by the split's own measured ratio, so the series is
-    continuous for return calculations â€” the same "split-adjusted price" convention
+    continuous for return calculations -- the same "split-adjusted price" convention
     every stock/ETF data provider uses. Only ever multiplies real, already-published NAVs
     by a precisely measured factor; never invents a value. Idempotent: once adjusted, the
-    boundary ratio settles near 1.0 and is never re-flagged on a later run."""
-    con = get_connection()
-    df = _fetchdf(con.execute("SELECT scheme_code, nav_date, nav FROM nav_history ORDER BY scheme_code, nav_date"))
-    # A "segregated portfolio" (a side-pocket created when a debt scheme's underlying paper
-    # defaults) settles with a final lump-sum recovery distribution that can coincidentally
-    # land near a clean ratio â€” that's a one-time debt recovery, not a unit-price
-    # redenomination, and back-adjusting it would fabricate a fake continuous history.
-    # These are also already excluded from "current" returns by the is_active staleness
-    # guard in summary_table; exclude them here too so raw nav_history charts stay honest.
-    # ILIKE, not LIKE: SQLite's LIKE is ASCII case-insensitive by default and this
-    # query relied on that, but PostgreSQL's LIKE is case-SENSITIVE. Left as LIKE
-    # after the port, this would have quietly stopped matching "Segregated
-    # Portfolio ..." scheme names -- which fails in the dangerous direction, by
-    # back-adjusting debt-recovery distributions as if they were unit splits and
-    # fabricating continuous history. Every other LIKE in this file was audited
-    # for the same reason.
-    segregated_codes = set(
-        _fetchdf(con.execute("SELECT scheme_code FROM schemes WHERE scheme_name ILIKE '%segregat%'"))["scheme_code"]
-    )
-    con.close()
-    if df.empty:
-        return 0
+    boundary ratio settles near 1.0 and is never re-flagged on a later run.
 
-    df["nav"] = df["nav"].astype(float)
-    df["ratio"] = df["nav"] / df.groupby("scheme_code")["nav"].shift(1)
-    splits = df[df["ratio"].apply(_is_clean_split_ratio) & ~df["scheme_code"].isin(segregated_codes)][["scheme_code", "nav_date", "ratio"]]
-    if splits.empty:
-        return 0
-
-    df["adj_factor"] = 1.0
-    for scheme_code, group in splits.groupby("scheme_code"):
-        scheme_mask = df["scheme_code"] == scheme_code
-        for _, row in group.iterrows():
-            df.loc[scheme_mask & (df["nav_date"] < row["nav_date"]), "adj_factor"] *= row["ratio"]
-
-    changed = df[df["adj_factor"] != 1.0].copy()
-    if changed.empty:
-        return 0
-    changed["nav"] = (changed["nav"] * changed["adj_factor"]).round(4)
-
-    logger_msg_schemes = splits["scheme_code"].nunique()
+    Returns the number of NAV rows rewritten."""
     con = get_connection()
     try:
-        # One explicit transaction: pooled connections are autocommit, so without
-        # this the staging load and the UPDATE that consumes it would be separate
-        # transactions, and a failure between them would leave the staging table
-        # populated and the adjustment half-applied.
+        events = find_nav_split_events(con)
+        if not events:
+            return 0
+        scheme_codes = sorted({e["scheme_code"] for e in events})
+        # One row per (scheme, split date, ratio); every NAV strictly before a split date
+        # is multiplied by the product of the ratios of all later splits for that scheme.
+        # exp(sum(ln(ratio))) is that product -- every ratio here is positive by
+        # construction, so the log is always defined.
         con.begin()
-        staging = changed[["scheme_code", "nav_date", "nav"]]
-        # like_table/key_columns are what make this join an index seek rather than a
-        # full scan of the staging table per nav_history row -- see
-        # write_staging_table()'s docstring for the type-affinity reason.
-        _write_staging_table(con, "stg_nav_adjust", staging,
-                             like_table="nav_history",
-                             key_columns=["scheme_code", "nav_date"])
-        con.execute("""
-            UPDATE nav_history
-            SET nav = s.nav
-            FROM stg_nav_adjust s
-            WHERE s.scheme_code = nav_history.scheme_code
-              AND s.nav_date = nav_history.nav_date;
-        """)
-        con.execute("DROP TABLE IF EXISTS stg_nav_adjust")
+        con.execute("DROP TABLE IF EXISTS stg_nav_splits")
+        con.execute("CREATE TEMP TABLE stg_nav_splits (scheme_code INTEGER, split_date DATE, ratio DOUBLE PRECISION)")
+        con.executemany(
+            "INSERT INTO stg_nav_splits (scheme_code, split_date, ratio) VALUES (%s, %s, %s)",
+            [(e["scheme_code"], e["nav_date"], e["ratio"]) for e in events],
+        )
+        changed = con.execute(
+            """
+            UPDATE nav_history n
+            SET nav = round((n.nav * f.factor)::numeric, 4)
+            FROM (
+                SELECT h.scheme_code, h.nav_date, exp(sum(ln(e.ratio))) AS factor
+                FROM nav_history h
+                JOIN stg_nav_splits e
+                  ON e.scheme_code = h.scheme_code AND e.split_date > h.nav_date
+                WHERE h.scheme_code = ANY(%s)
+                GROUP BY h.scheme_code, h.nav_date
+            ) f
+            WHERE f.scheme_code = n.scheme_code AND f.nav_date = n.nav_date
+            """,
+            (scheme_codes,),
+        ).rowcount
+        con.execute("DROP TABLE IF EXISTS stg_nav_splits")
         con.commit()
     except Exception:
         try:
@@ -184,8 +196,11 @@ def _normalize_nav_splits_impl() -> int:
         raise
     finally:
         con.close()
-    print(f"NAV split normalization: adjusted {len(changed):,} historical NAV rows across {logger_msg_schemes} scheme(s).")
-    return len(changed)
+    print(f"NAV split normalization: adjusted {changed:,} historical NAV rows "
+          f"across {len({e['scheme_code'] for e in events})} scheme(s).")
+    invalidate_database_stats_cache()
+    return changed
+
 
 def refresh_summary_table():
     """Recomputes and materializes the summary table for instant UI rendering.
@@ -232,6 +247,11 @@ def _refresh_summary_table_impl():
             ter_statutory_levies_pct DOUBLE PRECISION,
             latest_date DATE,
             latest_nav DOUBLE PRECISION,
+            -- The NAV the 1-day figures are measured against, kept rather than
+            -- discarded once change_1d_pct is derived from it. Holdings needs the
+            -- rupee move of a position, units x (latest_nav - nav_1d_ago); rebuilding
+            -- yesterday's NAV from a percentage rounded to 4 dp loses paise per fund.
+            nav_1d_ago DOUBLE PRECISION,
             -- BOOLEAN, not the INTEGER this was under SQLite: a comparison there
             -- evaluated to 0/1, so the column held an int. In PostgreSQL
             -- `a >= b` is a genuine boolean and inserting it into an integer
@@ -262,7 +282,7 @@ def _refresh_summary_table_impl():
             option_type, isin, expense_ratio, ter_status, ter_source, ter_source_url,
             ter_as_of_date, ter_base_expense_ratio, ter_brokerage_cost_pct,
             ter_transaction_cost_pct, ter_statutory_levies_pct,
-            latest_date, latest_nav, is_active, change_1d_pct, return_7d_pct,
+            latest_date, latest_nav, nav_1d_ago, is_active, change_1d_pct, return_7d_pct,
             return_30d_pct, return_90d_pct, return_1y_pct, return_3y_pct, return_5y_pct, return_10y_pct,
             return_1y, return_3y, return_5y, return_10y,
             high_52w, low_52w, dist_from_52w_high_pct
@@ -293,6 +313,11 @@ def _refresh_summary_table_impl():
             ) n1
             WHERE l.latest_date >= (f.global_max_date - 30)
         ),
+        -- Each trailing return starts from the fund's NAV as of N days ago: the last NAV on or
+        -- before that date, within a few days for weekends and holidays -- AMFI's own convention.
+        -- The nearest NAV on EITHER side used to be taken from a wide band (330..420 days for
+        -- 1Y), so a fund 342 days old reported its since-launch return as a "1-year" return
+        -- (52 live schemes) and was ranked beside real one-year records; ties had no order.
         nav_7d AS (
             SELECT l.scheme_code, n7.nav as nav_7d_ago
             FROM latest_nav l, db_freshness f
@@ -300,9 +325,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 5)
-                  AND nav_date >= (l.latest_date - 14)
-                ORDER BY ABS(nav_date - (l.latest_date - 7))
+                  AND nav_date <= (l.latest_date - 7)
+                  AND nav_date >= (l.latest_date - 11)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n7
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -314,9 +339,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 25)
-                  AND nav_date >= (l.latest_date - 45)
-                ORDER BY ABS(nav_date - (l.latest_date - 30))
+                  AND nav_date <= (l.latest_date - 30)
+                  AND nav_date >= (l.latest_date - 37)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n30
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -328,9 +353,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 75)
-                  AND nav_date >= (l.latest_date - 120)
-                ORDER BY ABS(nav_date - (l.latest_date - 90))
+                  AND nav_date <= (l.latest_date - 90)
+                  AND nav_date >= (l.latest_date - 100)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n90
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -342,9 +367,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 330)
-                  AND nav_date >= (l.latest_date - 420)
-                ORDER BY ABS(nav_date - (l.latest_date - 365))
+                  AND nav_date <= (l.latest_date - 365)
+                  AND nav_date >= (l.latest_date - 375)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n1y
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -356,9 +381,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 1000)
-                  AND nav_date >= (l.latest_date - 1200)
-                ORDER BY ABS(nav_date - (l.latest_date - 1095))
+                  AND nav_date <= (l.latest_date - 1095)
+                  AND nav_date >= (l.latest_date - 1110)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n3y
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -370,9 +395,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 1700)
-                  AND nav_date >= (l.latest_date - 1950)
-                ORDER BY ABS(nav_date - (l.latest_date - 1826))
+                  AND nav_date <= (l.latest_date - 1826)
+                  AND nav_date >= (l.latest_date - 1841)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n5y
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -384,9 +409,9 @@ def _refresh_summary_table_impl():
                 SELECT nav
                 FROM nav_history
                 WHERE scheme_code = l.scheme_code
-                  AND nav_date <= (l.latest_date - 3500)
-                  AND nav_date >= (l.latest_date - 3800)
-                ORDER BY ABS(nav_date - (l.latest_date - 3652))
+                  AND nav_date <= (l.latest_date - 3652)
+                  AND nav_date >= (l.latest_date - 3672)
+                ORDER BY nav_date DESC
                 LIMIT 1
             ) n10y
             WHERE l.latest_date >= (f.global_max_date - 30)
@@ -433,6 +458,10 @@ def _refresh_summary_table_impl():
             s.ter_statutory_levies_pct,
             l.latest_date,
             l.latest_nav,
+            -- Gated exactly like change_1d_pct below: a scheme too stale to get a
+            -- 1-day percentage must not get a 1-day NAV either.
+            CASE WHEN l.latest_date >= (f.global_max_date - 30)
+                 THEN n1.nav_1d_ago END as nav_1d_ago,
             (l.latest_date >= (f.global_max_date - 30)) as is_active,
             CASE WHEN l.latest_date >= (f.global_max_date - 30)
                  THEN ROUND((((l.latest_nav - n1.nav_1d_ago) / NULLIF(n1.nav_1d_ago, 0) * 100.0))::numeric, 4)::double precision END as change_1d_pct,
@@ -503,6 +532,15 @@ def _refresh_summary_table_impl():
         # behind it indefinitely. (The ROLLBACK above already ends the transaction on
         # failure; this close() is the same belt-and-suspenders guard as before.)
         con.close()
+    # Stamp when this cache was last rebuilt. get_data_quality() has always read this
+    # key, but nothing ever wrote it, so it reported "never built" however often the
+    # rebuild ran. Deliberately after the commit and on its own connection: inside the
+    # rebuild transaction, any failure here (a database predating sync_meta, say) would
+    # abort the whole rebuild, and a missing timestamp must never cost a good rebuild.
+    try:
+        set_sync_meta_value("summary_table_built_at", datetime.datetime.now().isoformat(timespec="seconds"))
+    except Exception as e:
+        print(f"Could not stamp summary_table_built_at: {e}")
     invalidate_database_stats_cache()
     bump_data_version()
 
@@ -607,200 +645,436 @@ def get_amcs() -> List[str]:
 @cached(ttl=600)
 def get_broad_categories() -> List[str]:
     con = get_connection()
-    res = con.execute("SELECT DISTINCT broad_category FROM summary_table WHERE broad_category IS NOT NULL ORDER BY broad_category;").fetchall()
+    # Every other panel on this filter counts only active schemes; without this a wound-up
+    # asset class could still offer a filter pill that leads to an empty table.
+    res = con.execute("SELECT DISTINCT broad_category FROM summary_table WHERE is_active AND broad_category IS NOT NULL ORDER BY broad_category;").fetchall()
     con.close()
     return [r[0] for r in res]
 
 @cached(ttl=600)
 def get_subcategories(broad_category: Optional[str] = None) -> List[str]:
     con = get_connection()
+    # Same is_active gap as get_broad_categories -- without it a wound-up category could
+    # still offer a filter pill that leads to an empty table.
     if broad_category and broad_category != "All Categories":
         res = con.execute(
-            "SELECT DISTINCT category FROM summary_table WHERE broad_category = %s AND category IS NOT NULL ORDER BY category;",
+            "SELECT DISTINCT category FROM summary_table WHERE is_active AND broad_category = %s AND category IS NOT NULL ORDER BY category;",
             [broad_category]
         ).fetchall()
     else:
         res = con.execute(
-            "SELECT DISTINCT category FROM summary_table WHERE category IS NOT NULL ORDER BY category;"
+            "SELECT DISTINCT category FROM summary_table WHERE is_active AND category IS NOT NULL ORDER BY category;"
         ).fetchall()
     con.close()
     return [r[0] for r in res]
 
-def get_options_list() -> List[str]:
-    return ["All Options", "Growth", "IDCW"]
+#: Offered whenever some active scheme has no plan (or no option) AMFI ever stated, so
+#: those schemes stay reachable. Without it they answer to no filter at all: "Direct" and
+#: "Regular" between them returned 8,741 of 8,864 schemes, and nothing named the other 123.
+UNSPECIFIED_FILTER = "Unspecified"
 
-def get_plans_list() -> List[str]:
-    return ["All Plans", "Direct", "Regular"]
+#: Legacy spelling of "unknown" written by the parser before it started recording an
+#: absent value as NULL. Inactive schemes keep it forever, since nothing re-syncs them.
+_UNKNOWN_OPTION_VALUES = ("Other",)
+
+
+def plan_option_clauses(plan_type: str, option_type: str, alias: str = "s") -> Tuple[str, List[Any]]:
+    """SQL for the global Plan/Option picker, as `AND ...` fragments plus their params.
+
+    One implementation because four call sites need identical semantics -- the screener,
+    the macro trend, the market-pulse aggregates and the category matrix. "Unspecified"
+    needs its own predicate: NULL never satisfies `= 'Unspecified'`, and schemes that no
+    longer re-sync still carry the older "Other" spelling of the same idea."""
+    sql, params = "", []
+    for column, value, head in ((f"{alias}.plan_type", plan_type, "All Plans"),
+                                (f"{alias}.option_type", option_type, "All Options")):
+        if not value or value == head:
+            continue
+        if value == UNSPECIFIED_FILTER:
+            sql += f" AND ({column} IS NULL OR {column} = ANY(%s))"
+            params.append(list(_UNKNOWN_OPTION_VALUES))
+        else:
+            sql += f" AND {column} = %s"
+            params.append(value)
+    return sql, params
+
+
+def _filter_values(column: str, head: str) -> List[str]:
+    """The values this column actually holds among active schemes, so a dropdown can never
+    drift from the data (these were two hardcoded lists, one here and one in the browser)."""
+    con = get_connection()
+    try:
+        rows = con.execute(
+            f"SELECT DISTINCT {column} FROM summary_table WHERE is_active AND {column} IS NOT NULL"
+        ).fetchall()
+        has_unknown = con.execute(
+            f"SELECT 1 FROM summary_table WHERE is_active AND ({column} IS NULL OR {column} = ANY(%s)) LIMIT 1",
+            (list(_UNKNOWN_OPTION_VALUES),),
+        ).fetchone() is not None
+    except Exception:
+        return [head]
+    finally:
+        con.close()
+    values = sorted({str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip() not in _UNKNOWN_OPTION_VALUES})
+    return [head] + values + ([UNSPECIFIED_FILTER] if has_unknown else [])
+
 
 @cached(ttl=600)
-def get_market_overview_stats() -> Dict[str, Any]:
+def get_options_list() -> List[str]:
+    return _filter_values("option_type", "All Options")
+
+
+@cached(ttl=600)
+def get_plans_list() -> List[str]:
+    return _filter_values("plan_type", "All Plans")
+
+#: A house with one or two ranked schemes would otherwise top a performance ranking on noise --
+#: one lucky fund posting +40% in a year says nothing about the AMC.
+MIN_AMC_SCHEMES_FOR_RANKING = 5
+#: As MIN_PEERS_FOR_ALPHA below: a peer group smaller than this has no meaningful median.
+_MIN_PEERS = 5
+_HORIZONS = {"1d": "change_1d_pct", "7d": "return_7d_pct", "30d": "return_30d_pct",
+             "90d": "return_90d_pct", "1y": "return_1y_pct"}
+
+# Feed asset-class ids -> the SEBI broad label classification.classify() reads, for a fund
+# in the AUM snapshot that no scheme of ours matched (so there is no category to read).
+_FEED_BROAD = {1: ("Equity", "Equity Scheme"), 2: ("Debt", "Debt Scheme"), 3: ("Hybrid", "Hybrid Scheme"),
+               4: ("Solution Oriented", "Solution Oriented Scheme"), 6: ("Solution Oriented", "Solution Oriented Scheme")}
+
+
+@cached(ttl=600)
+def _pulse_universe(plan_type: str = "All Plans", option_type: str = "All Options") -> pd.DataFrame:
+    """Every live scheme with its trailing returns, asset class, SEBI category and IDCW flag."""
+    from app.classification import classify, is_idcw, sebi_category
+
+    filt, filt_params = plan_option_clauses(plan_type, option_type, alias="s")
     con = get_connection()
-    total_schemes = con.execute("SELECT count(*) FROM schemes;").fetchone()[0]
-    total_amcs = con.execute("SELECT count(DISTINCT fund_house) FROM schemes WHERE fund_house IS NOT NULL;").fetchone()[0]
-    total_nav_records = con.execute("SELECT count(*) FROM nav_history;").fetchone()[0]
-    date_row = con.execute("SELECT min(nav_date), max(nav_date) FROM nav_history;").fetchone()
+    try:
+        df = _fetchdf(con.execute(f"""
+            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.broad_category,
+                   s.plan_type, s.option_type, s.expense_ratio, s.dist_from_52w_high_pct,
+                   s.change_1d_pct, s.return_7d_pct, s.return_30d_pct, s.return_90d_pct, s.return_1y_pct
+            FROM summary_table s
+            WHERE s.is_active{filt}
+        """, filt_params or None))
+    finally:
+        con.close()
+    if df.empty:
+        return df.assign(asset_class=[], peer_category=[], is_idcw=[], display_name=[])
+    names = df["scheme_name"].tolist()
+    df["asset_class"] = [classify(c, b, n) for c, b, n in zip(df["category"], df["broad_category"], names)]
+    df["peer_category"] = [sebi_category(c) or "Uncategorised" for c in df["category"]]
+    df["is_idcw"] = [is_idcw(o, n) for o, n in zip(df["option_type"], names)]
+    df["display_name"] = [format_scheme_display_name(n, p, o, c) for n, p, o, c in
+                          zip(names, df["plan_type"].tolist(), df["option_type"].tolist(), df["scheme_code"].tolist())]
+    return df
 
-    # Asset class distribution with multi-horizon returns
-    asset_dist = _fetchdf(con.execute("""
-        SELECT broad_category, count(*) as count,
-               ROUND((AVG(change_1d_pct))::numeric, 4)::double precision as avg_1d,
-               ROUND((AVG(return_7d_pct))::numeric, 4)::double precision as avg_7d,
-               ROUND((AVG(return_30d_pct))::numeric, 4)::double precision as avg_30d,
-               ROUND((AVG(return_90d_pct))::numeric, 4)::double precision as avg_90d,
-               ROUND((AVG(return_1y_pct))::numeric, 4)::double precision as avg_1y,
-               ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY return_30d_pct))::numeric, 4)::double precision as med_30d,
-               ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY return_90d_pct))::numeric, 4)::double precision as med_90d
-        FROM summary_table
-        GROUP BY broad_category
-        ORDER BY count DESC;
-    """))
 
-    # Top 15 AMCs by scheme volume and average returns
-    top_amcs = _fetchdf(con.execute("""
-        SELECT
-            s.fund_house,
-            count(*) as schemes_count,
-            ROUND((AVG(st.return_30d_pct))::numeric, 4)::double precision as avg_30d,
-            ROUND((AVG(st.return_90d_pct))::numeric, 4)::double precision as avg_90d,
-            ROUND((AVG(st.return_1y_pct))::numeric, 4)::double precision as avg_1y
-        FROM schemes s
-        LEFT JOIN summary_table st ON s.scheme_code = st.scheme_code
-        WHERE s.fund_house IS NOT NULL AND s.fund_house != ''
-        GROUP BY s.fund_house
-        ORDER BY schemes_count DESC
-        LIMIT 15;
-    """))
+def _returns_pool(uni: pd.DataFrame, option_type: str) -> pd.DataFrame:
+    """The schemes whose NAV return means what it says. An IDCW plan's NAV falls by every
+    payout, so averaging it in reported Debt's trailing year at 2.55% when its Growth plans'
+    median was 5.41%. Only when the page is filtered to IDCW are they the pool."""
+    if uni.empty:
+        return uni
+    want_idcw = str(option_type or "").strip().upper() == "IDCW"
+    return uni[uni["is_idcw"] == want_idcw]
 
-    # Best performing category (30D)
-    best_cat = con.execute("""
-        SELECT category, ROUND((AVG(return_30d_pct))::numeric, 4)::double precision as avg_30d
-        FROM summary_table
-        WHERE return_30d_pct IS NOT NULL
-        GROUP BY category
-        ORDER BY avg_30d DESC
-        LIMIT 1;
-    """).fetchone()
 
-    con.close()
+@cached(ttl=600)
+def _fund_aum() -> pd.DataFrame:
+    """AMFI's per-FUND assets (one row per fund, all plans together) with the fund's asset
+    class and SEBI category. Empty until the first fund-performance snapshot is taken."""
+    from app.classification import classify, sebi_category
+
+    con = get_connection()
+    try:
+        snap = _fetchdf(con.execute("""
+            SELECT f.fund_name, f.sub_category, f.category_id, f.fund_house, f.aum_cr, f.as_of,
+                   s.category, s.broad_category, s.scheme_name
+            FROM amfi_fund_snapshot f
+            LEFT JOIN LATERAL (
+                SELECT st.category, st.broad_category, st.scheme_name FROM summary_table st
+                WHERE st.scheme_code = ANY(f.scheme_codes) LIMIT 1
+            ) s ON TRUE
+            WHERE f.aum_cr IS NOT NULL
+        """))
+    except Exception:
+        return pd.DataFrame(columns=["fund_name", "fund_house", "aum_cr", "as_of", "asset_class", "peer_category"])
+    finally:
+        con.close()
+    if snap.empty:
+        return snap.assign(asset_class=[], peer_category=[])
+    classes, cats = [], []
+    for r in snap.itertuples(index=False):
+        category, broad = r.category, r.broad_category
+        if not isinstance(category, str) or not category:
+            # No scheme of ours matched: rebuild the label from the feed's own taxonomy.
+            broad, prefix = _FEED_BROAD.get(int(r.category_id or 0), ("", "Other Scheme"))
+            sub = str(r.sub_category or "")
+            if "index" in sub.lower() or "etf" in sub.lower():
+                sub = "Index Funds"
+            elif "fof" in sub.lower():
+                sub = "FoF Domestic"
+            elif not sub.lower().endswith("fund") and broad in ("Debt", "Hybrid"):
+                sub = f"{sub} Fund"
+            category = f"{prefix} - {sub}"
+        classes.append(classify(category, broad, r.fund_name))
+        cats.append(sebi_category(category) or "Uncategorised")
+    snap["asset_class"] = classes
+    snap["peer_category"] = cats
+    return snap
+
+
+def _peer_alpha(pool: pd.DataFrame, column: str) -> pd.Series:
+    """Each scheme's return minus the median of its peers: same asset class, SEBI category
+    and plan. NaN where the peer group is too small to have a meaningful median."""
+    plan = pool["plan_type"].fillna(UNSPECIFIED_FILTER)
+    grp = pool.groupby([pool["asset_class"], pool["peer_category"], plan])[column]
+    med = grp.transform("median")
+    n = grp.transform("count")
+    return (pool[column] - med).where(n >= _MIN_PEERS)
+
+
+@cached(ttl=600)
+def get_market_overview_stats(plan_type: str = "All Plans", option_type: str = "All Options") -> Dict[str, Any]:
+    """Market-pulse aggregates.
+
+    Counts are of schemes that still publish NAVs, not of every scheme ever listed: about
+    two thirds of the table is matured FMPs and wound-up plans. `total_schemes` keeps the
+    all-time figure alongside, since the two answer different questions. Honours the global
+    Plan/Option picker, like the rest of the page.
+
+    Returns are over Growth-type plans only (see _returns_pool) and grouped by the asset
+    class the money is actually in (classification.classify) rather than SEBI's broad
+    buckets, whose "Other / Index / ETF" put Nifty 50 index funds, gilt ETFs and gold in one
+    average. Medians sit beside means: one fund's 40% month moves a mean, not a median.
+
+    Fund houses are sized by AMFI's reported assets (fund level, all plans) and scored by
+    skill rather than mix: the median gap between each of their schemes and its own peer
+    median. An equal-weighted average return mostly measured how much equity a house runs."""
+    from app.classification import ASSET_CLASSES
+
+    filt, filt_params = plan_option_clauses(plan_type, option_type, alias="s")
+    con = get_connection()
+    try:
+        total_schemes = con.execute(f"SELECT count(*) FROM schemes s WHERE TRUE{filt};", filt_params).fetchone()[0]
+        total_nav_records = con.execute("SELECT count(*) FROM nav_history;").fetchone()[0]
+        date_row = con.execute("SELECT min(nav_date), max(nav_date) FROM nav_history;").fetchone()
+    finally:
+        con.close()
+
+    uni = _pulse_universe(plan_type, option_type)
+    pool = _returns_pool(uni, option_type)
+    aum = _fund_aum()
+    aum_total = float(aum["aum_cr"].sum()) if not aum.empty else 0.0
+
+    # --- Asset classes ---------------------------------------------------------------
+    asset_rows = []
+    for cls in ASSET_CLASSES:
+        part = pool[pool["asset_class"] == cls] if not pool.empty else pool
+        live = int((uni["asset_class"] == cls).sum()) if not uni.empty else 0
+        if live == 0:
+            continue
+        row: Dict[str, Any] = {"asset_class": cls, "broad_category": cls, "count": int(len(part)), "schemes_all": live}
+        for h, col in _HORIZONS.items():
+            vals = part[col].dropna() if not part.empty else pd.Series(dtype=float)
+            row[f"avg_{h}"] = round(float(vals.mean()), 4) if len(vals) else None
+            row[f"med_{h}"] = round(float(vals.median()), 4) if len(vals) else None
+            row[f"n_{h}"] = int(len(vals))
+        cls_aum = float(aum.loc[aum["asset_class"] == cls, "aum_cr"].sum()) if not aum.empty else 0.0
+        row["aum_cr"] = round(cls_aum, 2) if cls_aum else None
+        row["aum_share_pct"] = round(cls_aum / aum_total * 100.0, 2) if aum_total else None
+        asset_rows.append(row)
+    asset_dist = pd.DataFrame(asset_rows)
+
+    # --- Fund houses by assets ----------------------------------------------------------
+    amc_aum = pd.DataFrame(columns=["fund_house", "aum_cr", "share_pct", "funds"])
+    if not aum.empty:
+        g = aum.dropna(subset=["fund_house"]).groupby("fund_house").agg(aum_cr=("aum_cr", "sum"), funds=("fund_name", "count"))
+        g["share_pct"] = (g["aum_cr"] / aum_total * 100.0).round(4)
+        amc_aum = g.sort_values("aum_cr", ascending=False).reset_index()
+        amc_aum["aum_cr"] = amc_aum["aum_cr"].round(2)
+
+    # --- Fund-house scorecard (peer alpha) ------------------------------------------------
+    scorecard = pd.DataFrame(columns=["fund_house", "ranked_schemes", "median_alpha_1y", "beat_peers_pct",
+                                      "median_alpha_90d", "schemes_count", "aum_cr"])
+    if not pool.empty:
+        p = pool.copy()
+        p["alpha_1y"] = _peer_alpha(p, "return_1y_pct")
+        p["alpha_90d"] = _peer_alpha(p, "return_90d_pct")
+        ranked = p.dropna(subset=["alpha_1y"])
+        if not ranked.empty:
+            s = ranked.groupby("fund_house").agg(
+                ranked_schemes=("alpha_1y", "count"),
+                median_alpha_1y=("alpha_1y", "median"),
+                beat_peers_pct=("alpha_1y", lambda a: float((a > 0).mean() * 100.0)),
+                median_alpha_90d=("alpha_90d", "median"),
+            )
+            s = s[s["ranked_schemes"] >= MIN_AMC_SCHEMES_FOR_RANKING]
+            s["schemes_count"] = pool.groupby("fund_house").size().reindex(s.index).fillna(0).astype(int)
+            if not amc_aum.empty:
+                s["aum_cr"] = amc_aum.set_index("fund_house")["aum_cr"].reindex(s.index)
+            else:
+                s["aum_cr"] = None
+            for c in ("median_alpha_1y", "median_alpha_90d", "beat_peers_pct"):
+                s[c] = s[c].astype(float).round(4)
+            scorecard = s.sort_values("median_alpha_1y", ascending=False).reset_index()
+
+    # --- Best category (30D, by median, big enough to mean something) ----------------------
+    best_cat = None
+    if not pool.empty:
+        # Distinct funds, not schemes: Direct and Regular are one fund counted twice.
+        cats = pool.dropna(subset=["return_30d_pct"]).groupby(["asset_class", "peer_category"]).agg(
+            median=("return_30d_pct", "median"), count=("scheme_name", "nunique"))
+        cats = cats[cats["count"] >= _MIN_PEERS].sort_values("median", ascending=False)
+        if not cats.empty:
+            (cls, cat), top = cats.index[0], cats.iloc[0]
+            best_cat = {"name": f"{cat} ({cls})", "return_pct": round(float(top["median"]), 4)}
+
     return {
         "total_schemes": total_schemes,
-        "total_amcs": total_amcs,
+        "active_schemes": int(len(uni)),
+        "total_amcs": int(uni["fund_house"].dropna().nunique()) if not uni.empty else 0,
         "total_nav_records": total_nav_records,
         "min_date": date_row[0],
         "max_date": date_row[1],
+        "returns_pool": int(len(pool)),
+        "idcw_excluded": int(len(uni) - len(pool)),
+        "asset_classes": [r["asset_class"] for r in asset_rows],
         "asset_dist": asset_dist,
-        "top_amcs": top_amcs,
-        "best_cat": {"name": best_cat[0], "return_pct": best_cat[1]} if best_cat else None
+        "amc_aum": amc_aum,
+        "amc_scorecard": scorecard,
+        "aum_total_cr": round(aum_total, 2) if aum_total else None,
+        "aum_as_of": aum["as_of"].max() if not aum.empty else None,
+        "best_cat": best_cat,
     }
 
+
 @cached(ttl=600)
-def get_category_performance_matrix(broad_category: str = "All") -> pd.DataFrame:
-    con = get_connection()
-    where_sql = ""
-    params = []
+def get_category_performance_matrix(broad_category: str = "All", plan_type: str = "All Plans",
+                                    option_type: str = "All Options") -> pd.DataFrame:
+    """Per-category aggregates for the Overview: one row per (asset class, SEBI category),
+    over the same Growth-type pool and live schemes as the rest of Market Pulse. Grouped on
+    the normalised category, so the "Liquid Fund" filed under AMFI's pre-2018 header and the
+    one filed under the new header are one row, and "Index Funds" is split by what the fund
+    tracks. `broad_category` takes an asset class (or, for older links, a SEBI broad bucket)."""
+    columns = ["Asset Class", "Category", "Schemes", "AUM (Rs cr)", "Avg TER %", "Median 1D %", "Median 7D %",
+               "Median 30D %", "Median 90D %", "Median 1Y %", "Funds with 1Y", "Median 52W High Gap %",
+               "Top Fund (30D) %", "Top Fund (30D)", "Bottom Fund (30D) %", "Bottom Fund (30D)"]
+    uni = _pulse_universe(plan_type, option_type)
+    pool = _returns_pool(uni, option_type)
+    if pool.empty:
+        return pd.DataFrame(columns=columns)
     if broad_category and broad_category != "All":
-        where_sql = "AND broad_category = %s"
-        params = [broad_category]
-    df = _fetchdf(con.execute(f"""
-        SELECT
-            broad_category AS "Asset Class",
-            category AS "Category",
-            count(*) AS "Schemes",
-            ROUND((AVG(expense_ratio))::numeric, 4)::double precision AS avg_ter,
-            ROUND((AVG(change_1d_pct))::numeric, 4)::double precision AS avg_1d,
-            ROUND((AVG(return_7d_pct))::numeric, 4)::double precision AS avg_7d,
-            ROUND((AVG(return_30d_pct))::numeric, 4)::double precision AS avg_30d,
-            ROUND((AVG(return_90d_pct))::numeric, 4)::double precision AS avg_90d,
-            ROUND((AVG(return_1y_pct))::numeric, 4)::double precision AS avg_1y,
-            ROUND((AVG(dist_from_52w_high_pct))::numeric, 4)::double precision AS dist_52w_high,
-            ROUND((MAX(return_30d_pct))::numeric, 4)::double precision AS top_fund_30d,
-            ROUND((MIN(return_30d_pct))::numeric, 4)::double precision AS bottom_fund_30d
-        FROM summary_table
-        WHERE category IS NOT NULL {where_sql}
-        GROUP BY broad_category, category
-        ORDER BY avg_30d DESC NULLS LAST;
-    """, params if params else None))
-    con.close()
-    if not df.empty:
-        df = df.rename(columns={
-            "avg_ter": "Avg TER %",
-            "avg_1d": "Avg 1D %",
-            "avg_7d": "Avg 7D %",
-            "avg_30d": "Avg 30D %",
-            "avg_90d": "Avg 90D %",
-            "avg_1y": "Avg 1Y %",
-            "dist_52w_high": "52W High Gap %",
-            "top_fund_30d": "Top Fund (30D) %",
-            "bottom_fund_30d": "Bottom Fund (30D) %",
+        pool = pool[(pool["asset_class"] == broad_category) | (pool["broad_category"] == broad_category)]
+        if pool.empty:
+            return pd.DataFrame(columns=columns)
+    aum = _fund_aum()
+    aum_by = aum.groupby(["asset_class", "peer_category"])["aum_cr"].sum() if not aum.empty else pd.Series(dtype=float)
+    rows = []
+    for (cls, cat), part in pool.groupby(["asset_class", "peer_category"]):
+        r30 = part.dropna(subset=["return_30d_pct"])
+        top = r30.loc[r30["return_30d_pct"].idxmax()] if not r30.empty else None
+        bottom = r30.loc[r30["return_30d_pct"].idxmin()] if not r30.empty else None
+
+        def med(col: str) -> Optional[float]:
+            v = part[col].dropna()
+            return round(float(v.median()), 4) if len(v) else None
+
+        ter = part["expense_ratio"].dropna()
+        cat_aum = aum_by.get((cls, cat)) if len(aum_by) else None
+        rows.append({
+            "Asset Class": cls, "Category": cat, "Schemes": int(len(part)),
+            "AUM (Rs cr)": round(float(cat_aum), 2) if cat_aum else None,
+            "Avg TER %": round(float(ter.mean()), 4) if len(ter) else None,
+            "Median 1D %": med("change_1d_pct"), "Median 7D %": med("return_7d_pct"),
+            "Median 30D %": med("return_30d_pct"), "Median 90D %": med("return_90d_pct"),
+            "Median 1Y %": med("return_1y_pct"), "Funds with 1Y": int(part["return_1y_pct"].notna().sum()),
+            "Median 52W High Gap %": med("dist_from_52w_high_pct"),
+            "Top Fund (30D) %": round(float(top["return_30d_pct"]), 4) if top is not None else None,
+            "Top Fund (30D)": top["display_name"] if top is not None else None,
+            "Bottom Fund (30D) %": round(float(bottom["return_30d_pct"]), 4) if bottom is not None else None,
+            "Bottom Fund (30D)": bottom["display_name"] if bottom is not None else None,
         })
-    else:
-        df = pd.DataFrame(columns=[
-            "Asset Class", "Category", "Schemes", "Avg TER %", "Avg 1D %",
-            "Avg 7D %", "Avg 30D %", "Avg 90D %", "Avg 1Y %", "52W High Gap %",
-            "Top Fund (30D) %", "Bottom Fund (30D) %"
-        ])
-    return df
+    out = pd.DataFrame(rows, columns=columns)
+    return out.sort_values("Median 30D %", ascending=False, na_position="last").reset_index(drop=True)
+
 
 @cached(ttl=600)
 def get_macro_asset_class_trend(start_date: datetime.date, end_date: datetime.date, plan_type: str = "All Plans", option_type: str = "All Options") -> pd.DataFrame:
     """
-    Computes an indexed base-100 time series for the major asset classes (Equity, Debt, Hybrid)
-    over the chosen date range for institutional macro trajectory visualization.
+    An indexed base-100 line per asset class (the same classes as the rest of Market Pulse)
+    over the chosen window: the equal-weighted average fund in each class.
     """
     start_date, end_date = _normalize_date_range(start_date, end_date)
+    empty = pd.DataFrame(columns=["nav_date", "Asset Class", "Indexed Performance"])
     if not start_date or not end_date:
-        return pd.DataFrame(columns=["nav_date", "Asset Class", "Indexed Performance"])
-    con = get_connection()
-    plan_clause = "AND s.plan_type = %s" if plan_type and plan_type != "All Plans" else ""
-    opt_clause = "AND s.option_type = %s" if option_type and option_type != "All Options" else ""
-    extra_params = []
-    if plan_clause:
-        extra_params.append(plan_type)
-    if opt_clause:
-        extra_params.append(option_type)
+        return empty
+    uni = _pulse_universe(plan_type, option_type)
+    pool = _returns_pool(uni, option_type)
+    # "Other" is the classifier's catch-all, not an asset class anyone can hold a view on.
+    pool = pool[pool["asset_class"] != "Other"] if not pool.empty else pool
+    if pool.empty:
+        return empty
+    codes = [int(c) for c in pool["scheme_code"]]
+    classes = pool["asset_class"].tolist()
 
-    sql = f"""
+    # Equal-weighted index of a FIXED basket: each fund is indexed to its own first NAV in
+    # the window, and those ratios are averaged. The obvious-looking alternative -- average
+    # the raw NAVs each day and divide by day one's average -- measures the population, not
+    # performance, and that is what this did. Two reasons it fails:
+    #   * Funds enter and leave daily (2,399 equity funds on day one, 2,438 ninety days
+    #     later). A fund launching at Rs 10 into a pool averaging Rs 90 drags the mean down
+    #     although nothing lost value; a matured Rs 10 FMP dropping out pushes it up.
+    #   * Within one class NAVs span Rs 10 to Rs 3,000, so the mean tracks the biggest
+    #     numbers rather than the typical fund.
+    # Measured over 2026-06-24..2026-09-22 the old form reported Equity at 98.93 (down 1.1%)
+    # while the funds were up 1.3%, and Debt at 102.99 against an actual 0.5%.
+    sql = """
         WITH matching_schemes AS (
-            SELECT s.scheme_code, s.broad_category
-            FROM summary_table s
-            WHERE s.broad_category IN ('Equity', 'Debt', 'Hybrid')
-              {plan_clause}
-              {opt_clause}
+            SELECT * FROM unnest(%s::bigint[], %s::text[]) AS m(scheme_code, asset_class)
         ),
-        daily_navs AS (
-            SELECT
-                nh.nav_date,
-                ms.broad_category,
-                AVG(nh.nav) as mean_nav
+        first_nav AS (
+            SELECT DISTINCT ON (nh.scheme_code)
+                   nh.scheme_code, ms.asset_class, nh.nav AS base_nav, nh.nav_date AS base_date
             FROM nav_history nh
             JOIN matching_schemes ms ON nh.scheme_code = ms.scheme_code
-            WHERE nh.nav_date >= %s AND nh.nav_date <= %s
-            GROUP BY nh.nav_date, ms.broad_category
+            WHERE nh.nav_date >= %s AND nh.nav_date <= %s AND nh.nav > 0
+            ORDER BY nh.scheme_code, nh.nav_date ASC
         ),
-        base_navs AS (
-            SELECT broad_category, mean_nav as base_nav
-            FROM (
-                SELECT broad_category, mean_nav,
-                       ROW_NUMBER() OVER (PARTITION BY broad_category ORDER BY nav_date ASC) as rn
-                FROM daily_navs
-            ) sub WHERE rn = 1
+        window_start AS (SELECT min(base_date) AS d0 FROM first_nav),
+        basket AS (
+            -- Present when the window opened. A fund launched mid-window would otherwise
+            -- join the average at exactly 100 and flatten everyone else's movement.
+            SELECT f.* FROM first_nav f, window_start w
+            WHERE f.base_date <= w.d0 + INTERVAL '7 days'
         )
         SELECT
-            d.nav_date,
-            d.broad_category as "Asset Class",
-            ROUND(((d.mean_nav / NULLIF(b.base_nav, 0)) * 100.0)::numeric, 2)::double precision as "Indexed Performance"
-        FROM daily_navs d
-        JOIN base_navs b ON d.broad_category = b.broad_category
-        ORDER BY d.nav_date ASC;
+            nh.nav_date,
+            b.asset_class as "Asset Class",
+            ROUND((AVG(nh.nav / b.base_nav) * 100.0)::numeric, 2)::double precision as "Indexed Performance",
+            count(*) AS "Funds"
+        FROM nav_history nh
+        JOIN basket b ON b.scheme_code = nh.scheme_code
+        WHERE nh.nav_date >= %s AND nh.nav_date <= %s
+        GROUP BY nh.nav_date, b.asset_class
+        ORDER BY nh.nav_date ASC;
     """
-    params = extra_params + [start_date, end_date]
+    con = get_connection()
     try:
-        df = _fetchdf(con.execute(sql, params))
+        df = _fetchdf(con.execute(sql, [codes, classes, start_date, end_date, start_date, end_date]))
     except Exception:
-        df = pd.DataFrame(columns=["nav_date", "Asset Class", "Indexed Performance"])
+        df = empty
     finally:
         con.close()
-    return df
+    if df.empty:
+        return df
+    # A point is an average only of the funds that priced that day. Overseas FoFs publish a
+    # day late, so the latest date carried 26 of ~130 international funds; a weekend carries
+    # only the liquid funds that price every calendar day. Such thin days are dropped rather
+    # than let a quarter of the basket speak for all of it.
+    full = df.groupby("Asset Class")["Funds"].transform("max")
+    return df[df["Funds"] >= 0.6 * full].reset_index(drop=True)
 
 def _parse_date(val: Any) -> Optional[datetime.date]:
     if val is None or val == "":
@@ -836,21 +1110,57 @@ def _normalize_date_range(start_date: Any, end_date: Any) -> Tuple[Optional[date
         sd, ed = ed, sd
     return sd, ed
 
+def idcw_exclusion_clause(option_type: Any, alias: str = "s") -> str:
+    """Predicate that keeps IDCW schemes out of "best/worst single fund" rankings.
+
+    An IDCW scheme's NAV drops by exactly what it distributes, so a payout is indistinguishable
+    from a crash to any return formula. On live data the worst 30-day "performer" in the whole
+    market was an HDFC FMP IDCW plan at -20.95%, which had simply paid out; the worst fund that
+    actually lost money was down 7.00%. A card that names one fund as the market's worst has to
+    exclude them, or it reports a distribution as a loss every time.
+
+    Returns "" when the user has explicitly filtered to IDCW -- then they asked for these
+    schemes and an empty card would be the wrong answer. Matching on the name as well as the
+    column catches the 46 live schemes AMFI labels "Growth" while naming them IDCW."""
+    if str(option_type or "").strip().upper() == "IDCW":
+        return ""
+    p = f"{alias}." if alias else ""
+    # "dividend" not followed by "yield": a Growth Dividend Yield fund is named for the stocks
+    # it picks, and a bare '%%dividend%%' silently dropped all 62 of them from every ranking.
+    return (f" AND ({p}option_type IS NULL OR {p}option_type <> 'IDCW')"
+            f" AND {p}scheme_name NOT ILIKE '%%IDCW%%'"
+            f" AND {p}scheme_name !~* 'dividend(?!\\s*yield)'")
+
+
 @cached(ttl=600)
 def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub-Categories", plan_type="All Plans", option_type="All Options", search_term="", start_date=None, end_date=None, scheme_code=None, max_expense_ratio=None, official_ter_only=False) -> Dict[str, Any]:
     con = get_connection()
     start_date, end_date = _normalize_date_range(start_date, end_date)
     where_sql, params = _build_screener_where(amc, broad_cat, sub_cat, plan_type, option_type, search_term, scheme_code=scheme_code, max_expense_ratio=max_expense_ratio, official_ter_only=official_ter_only)
+    # Isolating one scheme by code is the user pointing at that exact fund, so the IDCW rule
+    # is suspended there -- it exists to stop a payout winning a market-wide ranking, and
+    # there is no ranking when the pool is a single fund the user chose.
+    # period_calc exposes bare column names; the `filtered` CTE is aliased f.
+    idcw_excl = "" if scheme_code else idcw_exclusion_clause(option_type, alias="")
+    idcw_excl_f = "" if scheme_code else idcw_exclusion_clause(option_type, alias="f")
 
     try:
+        # Counted over the same window as every other KPI below, and as the table the user
+        # is looking at. Without this the headline spanned all of history -- 25,377 schemes
+        # against the 8,864 actually listed, because ~16,600 of them stopped publishing
+        # years ago (merged or wound up) and only the table excluded them.
+        overview_where, overview_params = where_sql, list(params)
+        if start_date:
+            overview_where = f"{where_sql} AND s.latest_date >= %s" if where_sql else "WHERE s.latest_date >= %s"
+            overview_params = list(params) + [start_date]
         sql_overview = f"""
             SELECT
                 count(*) as total_schemes,
                 MAX(latest_date) as latest_date
             FROM summary_table s
-            {where_sql};
+            {overview_where};
         """
-        row = con.execute(sql_overview, params).fetchone()
+        row = con.execute(sql_overview, overview_params).fetchone()
         total_schemes = row[0] if row else 0
         latest_date = row[1] if row else None
 
@@ -869,7 +1179,8 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
             where_sql_active = f"{where_sql} {extra_cond}"
             sql_combined = f"""
                 WITH period_calc AS (
-                    SELECT s.scheme_name, s.broad_category, s.category,
+                    SELECT s.scheme_name, s.plan_type, s.option_type, s.scheme_code,
+                           s.broad_category, s.category,
                            CASE
                                WHEN ps.nav IS NULL OR ps.nav <= 0 THEN NULL
                                ELSE ROUND((((COALESCE(pe.nav, s.latest_nav) - ps.nav) / NULLIF(ps.nav, 0) * 100.0))::numeric, 4)::double precision
@@ -891,10 +1202,6 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                 ),
                 kpi_stats AS (
                     SELECT
-                        (SELECT scheme_name FROM period_calc WHERE period_return_pct IS NOT NULL ORDER BY period_return_pct DESC LIMIT 1) as top_name,
-                        MAX(period_return_pct) as top_return,
-                        (SELECT scheme_name FROM period_calc WHERE period_return_pct IS NOT NULL ORDER BY period_return_pct ASC LIMIT 1) as lag_name,
-                        MIN(period_return_pct) as lag_return,
                         COUNT(CASE WHEN period_return_pct > 0 THEN 1 END) as advancers,
                         COUNT(CASE WHEN period_return_pct < 0 THEN 1 END) as decliners,
                         COUNT(CASE WHEN period_return_pct = 0 THEN 1 END) as unchanged,
@@ -902,6 +1209,28 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                         ROUND((AVG(period_return_pct))::numeric, 4)::double precision as avg_return
                     FROM period_calc
                     WHERE period_return_pct IS NOT NULL
+                ),
+                -- The pool the single-fund cards rank over: IDCW schemes are dropped here
+                -- (see idcw_exclusion_clause) but deliberately kept in kpi_stats above, which
+                -- measures how the whole market moved rather than naming one fund.
+                rankable AS (
+                    SELECT * FROM period_calc
+                    WHERE period_return_pct IS NOT NULL{idcw_excl}
+                ),
+                -- The winner/laggard carry their plan, option and code so the caller can
+                -- build the app-wide label. Selecting scheme_name alone put a bare base
+                -- name on the KPI card -- ambiguous, since every plan/option variant of a
+                -- fund shares it, and inconsistent with the Leaders tables beside it. They
+                -- carry their own return too, so the number on the card is always the named
+                -- fund's -- a MAX()/MIN() over the unfiltered pool would caption an excluded
+                -- IDCW scheme's payout with the surviving fund's name.
+                top_row AS (
+                    SELECT scheme_name, plan_type, option_type, scheme_code, period_return_pct
+                    FROM rankable ORDER BY period_return_pct DESC LIMIT 1
+                ),
+                lag_row AS (
+                    SELECT scheme_name, plan_type, option_type, scheme_code, period_return_pct
+                    FROM rankable ORDER BY period_return_pct ASC LIMIT 1
                 ),
                 best_cat AS (
                     SELECT category, ROUND((AVG(period_return_pct))::numeric, 4)::double precision as avg_cat_ret
@@ -911,34 +1240,52 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                     ORDER BY avg_cat_ret DESC
                     LIMIT 1
                 )
-                SELECT k.*, b.category as best_cat_name, b.avg_cat_ret as best_cat_return
+                SELECT k.*, b.category as best_cat_name, b.avg_cat_ret as best_cat_return,
+                       t.scheme_name, t.plan_type, t.option_type, t.scheme_code, t.period_return_pct,
+                       l.scheme_name, l.plan_type, l.option_type, l.scheme_code, l.period_return_pct
                 FROM kpi_stats k
-                LEFT JOIN best_cat b ON TRUE;
+                LEFT JOIN best_cat b ON TRUE
+                LEFT JOIN top_row t ON TRUE
+                LEFT JOIN lag_row l ON TRUE;
             """
             all_p = [start_date, end_date, start_date, end_date] + params + [start_date]
             kpi_row = con.execute(sql_combined, all_p).fetchone()
-            if kpi_row and kpi_row[0] is not None:
-                top_performer = {"name": kpi_row[0], "return_pct": kpi_row[1]}
-                lag_performer = {"name": kpi_row[2], "return_pct": kpi_row[3]}
-                advancers = kpi_row[4] or 0
-                decliners = kpi_row[5] or 0
-                unchanged = kpi_row[6] or 0
-                median_return = kpi_row[7] or 0.0
-                avg_return = kpi_row[8] or 0.0
-            if kpi_row and kpi_row[9] is not None:
-                best_cat = {"name": kpi_row[9], "return_pct": kpi_row[10]}
+            # k.* is: advancers, decliners, unchanged, median, avg; then best_cat_name and
+            # best_cat_return; then top and lag, each as name/plan/option/code/return. The
+            # single-fund cards are gated on their own return rather than on the breadth
+            # counts: filtering to a lone IDCW scheme empties `rankable` while leaving
+            # thousands of rows in kpi_stats.
+            if kpi_row:
+                advancers = kpi_row[0] or 0
+                decliners = kpi_row[1] or 0
+                unchanged = kpi_row[2] or 0
+                median_return = kpi_row[3] or 0.0
+                avg_return = kpi_row[4] or 0.0
+                if kpi_row[5] is not None:
+                    best_cat = {"name": kpi_row[5], "return_pct": kpi_row[6]}
+                if kpi_row[11] is not None:
+                    top_performer = {"name": format_scheme_display_name(kpi_row[7], kpi_row[8], kpi_row[9], kpi_row[10]),
+                                     "return_pct": kpi_row[11]}
+                if kpi_row[16] is not None:
+                    lag_performer = {"name": format_scheme_display_name(kpi_row[12], kpi_row[13], kpi_row[14], kpi_row[15]),
+                                     "return_pct": kpi_row[16]}
         else:
             sql_summary_kpi = f"""
                 WITH filtered AS MATERIALIZED (
-                    SELECT s.scheme_name, s.return_30d_pct
+                    SELECT s.scheme_name, s.plan_type, s.option_type, s.scheme_code, s.return_30d_pct
                     FROM summary_table s
                     {where_sql} {'AND' if where_sql else 'WHERE'} s.return_30d_pct IS NOT NULL
+                ),
+                -- Same split as the windowed branch above: the named-fund cards rank over
+                -- the IDCW-free pool, the breadth counts still cover every scheme.
+                rankable AS (
+                    SELECT * FROM filtered f WHERE TRUE{idcw_excl_f}
                 )
                 SELECT
-                    (SELECT scheme_name FROM filtered ORDER BY return_30d_pct DESC LIMIT 1) as top_name,
-                    MAX(return_30d_pct) as top_return,
-                    (SELECT scheme_name FROM filtered ORDER BY return_30d_pct ASC LIMIT 1) as lag_name,
-                    MIN(return_30d_pct) as lag_return,
+                    (SELECT to_jsonb(r) FROM rankable r ORDER BY r.return_30d_pct DESC LIMIT 1) as top_row,
+                    (SELECT MAX(return_30d_pct) FROM rankable) as top_return,
+                    (SELECT to_jsonb(r) FROM rankable r ORDER BY r.return_30d_pct ASC LIMIT 1) as lag_row,
+                    (SELECT MIN(return_30d_pct) FROM rankable) as lag_return,
                     COUNT(CASE WHEN return_30d_pct > 0 THEN 1 END) as advancers,
                     COUNT(CASE WHEN return_30d_pct < 0 THEN 1 END) as decliners,
                     COUNT(CASE WHEN return_30d_pct = 0 THEN 1 END) as unchanged,
@@ -947,9 +1294,17 @@ def get_kpis(amc="All Fund Houses", broad_cat="All Categories", sub_cat="All Sub
                 FROM filtered;
             """
             kpi_row = con.execute(sql_summary_kpi, params).fetchone()
-            if kpi_row and kpi_row[0] is not None:
-                top_performer = {"name": kpi_row[0], "return_pct": kpi_row[1]}
-                lag_performer = {"name": kpi_row[2], "return_pct": kpi_row[3]}
+            if kpi_row:
+                def _label(row: Optional[Dict[str, Any]]) -> Optional[str]:
+                    if not row:
+                        return None
+                    return format_scheme_display_name(row.get("scheme_name"), row.get("plan_type"),
+                                                      row.get("option_type"), row.get("scheme_code"))
+
+                if kpi_row[0] is not None:
+                    top_performer = {"name": _label(kpi_row[0]), "return_pct": kpi_row[1]}
+                if kpi_row[2] is not None:
+                    lag_performer = {"name": _label(kpi_row[2]), "return_pct": kpi_row[3]}
                 advancers = kpi_row[4] or 0
                 decliners = kpi_row[5] or 0
                 unchanged = kpi_row[6] or 0
@@ -1007,13 +1362,18 @@ def _build_screener_where(amc="All Fund Houses", broad_cat="All Categories", sub
         clauses.append("s.category = %s")
         params.append(sub_cat)
 
-    if plan_type and plan_type != "All Plans":
-        clauses.append("s.plan_type = %s")
-        params.append(plan_type)
-
-    if option_type and option_type != "All Options":
-        clauses.append("s.option_type = %s")
-        params.append(option_type)
+    for column, value, head in (("s.plan_type", plan_type, "All Plans"), ("s.option_type", option_type, "All Options")):
+        if not value or value == head:
+            continue
+        if value == UNSPECIFIED_FILTER:
+            # NULL never satisfies `= 'Unspecified'`, so this needs its own predicate --
+            # and it must also catch the legacy "Other" spelling still held by schemes
+            # that no longer re-sync.
+            clauses.append(f"({column} IS NULL OR {column} = ANY(%s))")
+            params.append(list(_UNKNOWN_OPTION_VALUES))
+        else:
+            clauses.append(f"{column} = %s")
+            params.append(value)
 
     if search_term and search_term.strip():
         # Advanced multi-token all-words matching: extracts alphanumeric tokens so words match in any order and punctuation is safely ignored
@@ -1194,15 +1554,31 @@ def get_screener_dataframe(
             df = _fetchdf(con.execute(sql, params))
     finally:
         con.close()
+    # The app-wide label, alongside the raw name the callers already sort and search on --
+    # the results table showed the bare base name, which every plan/option variant shares.
+    if not df.empty and "scheme_name" in df.columns:
+        df["display_name"] = [
+            format_scheme_display_name(n, p, o, c)
+            for n, p, o, c in zip(df["scheme_name"], df.get("plan_type", ""), df.get("option_type", ""), df["scheme_code"])
+        ]
     return df
 
 get_screener_data = get_screener_dataframe
 
 def format_scheme_display_name(name: str, plan: str = "", option: str = "", code: Any = "") -> str:
-    name = (name or "").strip()
-    plan = (plan or "").strip()
-    option = (option or "").strip()
-    code_str = str(code).strip() if code else ""
+    """The app-wide fund label: "Name (Plan - Option) [AMFI code]".
+
+    Callers hand this values straight out of pandas, where a NULL plan arrives as float
+    NaN -- which is truthy, so `(plan or "").strip()` raised AttributeError rather than
+    treating it as absent. Since AMFI leaves the plan blank for ~40% of its rows, that is
+    the common case, not an edge one."""
+    def text(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    name = text(name)
+    plan = text(plan)
+    option = text(option)
+    code_str = str(code).strip() if code is not None and code == code and code != "" else ""
 
     parts = []
     if plan and plan.lower() not in name.lower() and plan.lower() != "all plans":
@@ -1434,7 +1810,131 @@ def get_gainers_losers(
         )
     return df_gainers, df_losers
 
+#: A fund must be priced within this many calendar days of the window's first and last NAV
+#: date to be ranked. Long enough for a weekend plus a market holiday (Diwali, Holi), short
+#: enough that a fund launched a week into a 30-day window does not compete on 23 days.
+LEADERS_EDGE_DAYS = 5
+#: Fewer peers than this and "the category median" is one or two other funds: an alpha or a
+#: quartile against them is noise, so neither is reported.
+MIN_PEERS_FOR_ALPHA = 5
+
+
+def recent_days_for(start_date: datetime.date, end_date: datetime.date) -> int:
+    """The "recent" stretch rotation looks at: the last third of the window, at least a week
+    (a 90-day window -> its last 30 days; a year -> its last 122)."""
+    return max(7, round((end_date - start_date).days / 3))
+
+
+def _vol_start_for(vol_lookback: str, start_date: datetime.date, end_date: datetime.date) -> datetime.date:
+    if vol_lookback in ("6M", "6m", "180d", "180"):
+        return max(start_date, end_date - datetime.timedelta(days=180))
+    if vol_lookback in ("3Y", "3y", "1095d", "1095"):
+        return max(start_date, end_date - datetime.timedelta(days=1095))
+    if vol_lookback in ("all", "full", "Full Window", "Full"):
+        return start_date
+    return max(start_date, end_date - datetime.timedelta(days=365))  # default "1Y"
+
+
 @cached(ttl=600)
+def _leaders_universe(start_date: datetime.date, end_date: datetime.date, vol_lookback: str) -> pd.DataFrame:
+    """Every scheme alive in the window, with its window return, volatility, drawdown and the
+    flags that decide whether it may be RANKED. Unfiltered on purpose: peer medians are a
+    property of the market, not of whatever the page is filtered to, so they are computed
+    over this and the page's filters are applied afterwards (get_advanced_leaders_dataframe)."""
+    from app.classification import classify, is_idcw, sebi_category
+
+    vol_start = _vol_start_for(vol_lookback, start_date, end_date)
+    recent_start = end_date - datetime.timedelta(days=recent_days_for(start_date, end_date))
+    con = get_connection()
+    try:
+        _configure_parallel_planner(con)
+        df = _fetchdf(con.execute("""
+            WITH universe AS MATERIALIZED (
+                SELECT s.scheme_code FROM summary_table s WHERE s.latest_date >= %(start)s
+            ),
+            navs AS (
+                SELECT nh.scheme_code, nh.nav_date, nh.nav,
+                       LAG(nh.nav) OVER w AS prev_nav,
+                       MAX(nh.nav) OVER (w ROWS UNBOUNDED PRECEDING) AS run_max
+                FROM nav_history nh JOIN universe u ON u.scheme_code = nh.scheme_code
+                WHERE nh.nav_date >= %(start)s AND nh.nav_date <= %(end)s AND nh.nav > 0
+                WINDOW w AS (PARTITION BY nh.scheme_code ORDER BY nh.nav_date)
+            ),
+            per AS (
+                SELECT scheme_code,
+                       min(nav_date) AS start_nav_date,
+                       max(nav_date) AS end_nav_date,
+                       (array_agg(nav ORDER BY nav_date ASC))[1] AS start_nav,
+                       (array_agg(nav ORDER BY nav_date DESC))[1] AS end_nav,
+                       (array_agg(nav ORDER BY nav_date ASC) FILTER (WHERE nav_date >= %(recent)s))[1] AS recent_nav,
+                       min(nav / run_max - 1.0) AS max_dd,
+                       stddev_samp(nav / prev_nav - 1.0) FILTER (WHERE nav_date >= %(vol_start)s AND prev_nav > 0) AS sd,
+                       count(*) FILTER (WHERE nav_date >= %(vol_start)s AND prev_nav > 0) AS n_ret,
+                       count(*) FILTER (WHERE nav_date >= %(vol_start)s AND prev_nav > 0 AND nav > prev_nav) AS up_days,
+                       min(nav_date) FILTER (WHERE nav_date >= %(vol_start)s AND prev_nav > 0) AS vol_first,
+                       max(nav_date) FILTER (WHERE nav_date >= %(vol_start)s AND prev_nav > 0) AS vol_last
+                FROM navs
+                GROUP BY scheme_code
+            )
+            SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category, s.broad_category,
+                   s.plan_type, s.option_type, s.expense_ratio, s.latest_nav,
+                   s.dist_from_52w_high_pct, s.high_52w, s.low_52w,
+                   p.start_nav_date, p.end_nav_date, p.start_nav, p.end_nav, p.recent_nav, p.max_dd,
+                   p.sd, p.n_ret, p.up_days, p.vol_first, p.vol_last
+            FROM per p JOIN summary_table s ON s.scheme_code = p.scheme_code
+        """, {"start": start_date, "end": end_date, "vol_start": vol_start, "recent": recent_start}))
+    finally:
+        con.close()
+    if df.empty:
+        return df
+
+    df["period_return_pct"] = ((df["end_nav"] / df["start_nav"] - 1.0) * 100.0).round(4)
+    # The window's closing stretch (see recent_days_for): what category rotation compares
+    # against the whole window to tell a category gaining leadership from one losing it.
+    df["recent_return_pct"] = ((df["end_nav"] / df["recent_nav"] - 1.0) * 100.0).round(4)
+    # Annualised at the rate this scheme actually publishes. sqrt(252) assumes trading
+    # days; a liquid fund prices every calendar day, and scaling its 365 daily moves as if
+    # there were 252 understated its volatility by a sixth.
+    span_days = (pd.to_datetime(df["vol_last"]) - pd.to_datetime(df["vol_first"])).dt.days
+    obs_per_year = (df["n_ret"] - 1).clip(lower=1) / (span_days / 365.25)
+    obs_per_year = obs_per_year.where(span_days >= 7).clip(lower=12, upper=366)
+    df["obs_per_year"] = obs_per_year.round(1)
+    df["annualized_vol_pct"] = (df["sd"] * np.sqrt(obs_per_year) * 100.0).round(4)
+    df["n_trading_days"] = df["n_ret"].fillna(0).astype(int)
+    df["win_rate_pct"] = (df["up_days"] * 100.0 / df["n_ret"].where(df["n_ret"] > 0)).round(2)
+    df["max_drawdown_pct"] = (df["max_dd"] * 100.0).round(4)
+
+    names, plans, options, codes = (df["scheme_name"].tolist(), df["plan_type"].tolist(),
+                                    df["option_type"].tolist(), df["scheme_code"].tolist())
+    df["display_name"] = [format_scheme_display_name(n, p, o, c) for n, p, o, c in zip(names, plans, options, codes)]
+    df["asset_class"] = [classify(c, b, n) for c, b, n in zip(df["category"], df["broad_category"], names)]
+    df["peer_category"] = [sebi_category(c) for c in df["category"]]
+    df["is_idcw"] = [is_idcw(o, n) for o, n in zip(options, names)]
+
+    # Ranked only over the whole window: a fund priced from its launch a week in, or one that
+    # stopped publishing before the end, would otherwise compete on a shorter period.
+    first_common = pd.to_datetime(df["start_nav_date"]).min()
+    last_common = pd.to_datetime(df["end_nav_date"]).max()
+    edge = pd.Timedelta(days=LEADERS_EDGE_DAYS)
+    df["full_window"] = ((pd.to_datetime(df["start_nav_date"]) <= first_common + edge)
+                         & (pd.to_datetime(df["end_nav_date"]) >= last_common - edge))
+    return df.drop(columns=["end_nav", "recent_nav", "max_dd", "sd", "up_days", "vol_first", "vol_last"])
+
+
+def _plan_key(plan: Any) -> str:
+    if not isinstance(plan, str) or not plan.strip() or plan.strip() in _UNKNOWN_OPTION_VALUES:
+        return UNSPECIFIED_FILTER
+    return plan.strip()
+
+
+def _matches_filter(series: pd.Series, value: Optional[str], head: str) -> pd.Series:
+    if not value or value == head:
+        return pd.Series(True, index=series.index)
+    if value == UNSPECIFIED_FILTER:
+        return series.isna() | series.isin(list(_UNKNOWN_OPTION_VALUES))
+    return series == value
+
+
 def get_advanced_leaders_dataframe(
     broad_cat="All Categories",
     sub_cat="All Sub-Categories",
@@ -1444,218 +1944,245 @@ def get_advanced_leaders_dataframe(
     end_date=None,
     vol_lookback="1Y"
 ) -> pd.DataFrame:
-    """
-    Computes comprehensive relative alpha, peer category medians, quartiles,
-    annualized volatility, win rate, and drawdown metrics across all matching funds
-    over the active date window for institutional leadership analysis.
-    Supports configurable volatility lookback windows (1Y, 6M, 3Y, Full Window).
-    """
-    con = get_connection()
+    """Funds ranked against their peers over the window: return, the peer median, category
+    alpha (the gap to it), rank and quartile among peers, volatility, drawdown, win rate.
+
+    What makes a fair ranking, and what this used to get wrong:
+      * Peers are the same asset class, the same SEBI category (AMFI's legacy label folded
+        in, see classification.sebi_category) and the same PLAN. Direct is compared with
+        Direct: a Regular plan trails its own Direct twin by the distributor commission,
+        which is a cost, not skill. "Index Funds" is split by asset class, because a Nifty 50
+        fund and a G-sec index fund share that SEBI category and nothing else.
+      * IDCW plans are left out (unless IDCW is what the filter asks for): a payout drops the
+        NAV by exactly what it pays, so on NAV it reads as a loss and ranked them as laggards.
+      * Only funds priced across the whole window are ranked.
+      * Peer medians come from the whole market, so the Asset-class or category filter
+        changes which funds are LISTED, never their alpha.
+    The frame carries `attrs["exclusions"]` counting what was left out and why."""
     start_date, end_date = _normalize_date_range(start_date, end_date)
-    where_sql, params = _build_screener_where("All Fund Houses", broad_cat, sub_cat, plan_type, option_type, "")
+    if not start_date or not end_date:
+        # No window: nothing to rank on. The page always sends one.
+        return pd.DataFrame()
 
-    try:
-        if start_date and end_date:
-            _configure_parallel_planner(con)
-            extra_cond = "AND s.latest_date >= %s" if where_sql else "WHERE s.latest_date >= %s"
-            where_sql_active = f"{where_sql} {extra_cond}"
-            if vol_lookback in ("6M", "6m", "180d", "180"):
-                vol_start = max(start_date, end_date - datetime.timedelta(days=180))
-            elif vol_lookback in ("3Y", "3y", "1095d", "1095"):
-                vol_start = max(start_date, end_date - datetime.timedelta(days=1095))
-            elif vol_lookback in ("all", "full", "Full Window", "Full"):
-                vol_start = start_date
-            else:  # default "1Y"
-                vol_start = max(start_date, end_date - datetime.timedelta(days=365))
-            sql = f"""
-                WITH matching_schemes AS MATERIALIZED (
-                    SELECT s.scheme_code
-                    FROM summary_table s
-                    {where_sql_active}
-                ),
-                daily_returns AS (
-                    SELECT
-                        nh.scheme_code,
-                        nh.nav_date,
-                        (nh.nav - LAG(nh.nav, 1) OVER (PARTITION BY nh.scheme_code ORDER BY nh.nav_date ASC)) / NULLIF(LAG(nh.nav, 1) OVER (PARTITION BY nh.scheme_code ORDER BY nh.nav_date ASC), 0) as daily_ret
-                    FROM nav_history nh
-                    JOIN matching_schemes ms ON nh.scheme_code = ms.scheme_code
-                    WHERE nh.nav_date >= %s AND nh.nav_date <= %s
-                ),
-                vol_calc AS (
-                    SELECT
-                        scheme_code,
-                        ROUND((stddev_samp(daily_ret) * SQRT(252.0) * 100.0)::numeric, 4)::double precision as annualized_vol_pct,
-                        COUNT(CASE WHEN daily_ret > 0 THEN 1 END) as up_days,
-                        COUNT(daily_ret) as trading_days
-                    FROM daily_returns
-                    WHERE daily_ret IS NOT NULL
-                    GROUP BY scheme_code
-                ),
-                scheme_perf AS (
-                    SELECT
-                        s.scheme_code,
-                        s.scheme_name,
-                        s.fund_house,
-                        s.category,
-                        s.broad_category,
-                        s.plan_type,
-                        s.option_type,
-                        s.expense_ratio,
-                        s.latest_nav,
-                        s.dist_from_52w_high_pct,
-                        s.high_52w,
-                        s.low_52w,
-                        CASE
-                            WHEN ps.nav IS NULL OR ps.nav <= 0 THEN NULL
-                            ELSE ROUND((((COALESCE(pe.nav, s.latest_nav) - ps.nav) / NULLIF(ps.nav, 0) * 100.0))::numeric, 4)::double precision
-                        END as period_return_pct,
-                        v.annualized_vol_pct as annualized_vol_pct,
-                        COALESCE(v.trading_days, 0) as n_trading_days,
-                        ROUND(((COALESCE(v.up_days, 0) * 100.0 / NULLIF(v.trading_days, 0)))::numeric, 2)::double precision as win_rate_pct
-                    FROM summary_table s
-                    LEFT JOIN LATERAL (
-                        SELECT nav, nav_date FROM nav_history
-                        WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
-                        ORDER BY nav_date ASC
-                        LIMIT 1
-                    ) ps ON TRUE
-                    LEFT JOIN LATERAL (
-                        SELECT nav, nav_date FROM nav_history
-                        WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
-                        ORDER BY nav_date DESC
-                        LIMIT 1
-                    ) pe ON TRUE
-                    LEFT JOIN vol_calc v ON s.scheme_code = v.scheme_code
-                    {where_sql_active}
-                )
-                SELECT *
-                FROM scheme_perf
-                WHERE period_return_pct IS NOT NULL;
-            """
-            all_p = params + [start_date] + [vol_start, end_date, start_date, end_date, start_date, end_date] + params + [start_date]
-            df = _fetchdf(con.execute(sql, all_p))
+    uni = _leaders_universe(start_date, end_date, str(vol_lookback or "1Y"))
+    if uni.empty:
+        return uni
 
-            # True peer-category median: scoped only by broad/sub-category (which is what "category"
-            # means) and NOT by the Plan/Option filters above.
-            # When looking across all plans and options, the in-view df already contains the full population,
-            # so we can compute the true category median directly in pandas with zero additional DB round-trips.
-            if (not plan_type or plan_type == "All Plans") and (not option_type or option_type == "All Options") and not df.empty:
-                df_cat_median = (
-                    df.dropna(subset=["category", "period_return_pct"])
-                    .groupby("category", as_index=False)["period_return_pct"]
-                    .median()
-                    .rename(columns={"period_return_pct": "true_cat_median"})
-                )
-            else:
-                where_sql_cat, params_cat = _build_screener_where("All Fund Houses", broad_cat, sub_cat, "All Plans", "All Options", "")
-                extra_cond_cat = "AND s.latest_date >= %s" if where_sql_cat else "WHERE s.latest_date >= %s"
-                where_sql_cat_active = f"{where_sql_cat} {extra_cond_cat}"
-                cat_median_sql = f"""
-                    WITH period_calc AS (
-                        SELECT s.category,
-                               CASE
-                                   WHEN ps.nav IS NULL OR ps.nav <= 0 THEN NULL
-                                   ELSE ROUND((((COALESCE(pe.nav, s.latest_nav) - ps.nav) / NULLIF(ps.nav, 0) * 100.0))::numeric, 4)::double precision
-                               END as period_return_pct
-                        FROM summary_table s
-                        LEFT JOIN LATERAL (
-                            SELECT nav, nav_date FROM nav_history
-                            WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
-                            ORDER BY nav_date ASC
-                            LIMIT 1
-                        ) ps ON TRUE
-                        LEFT JOIN LATERAL (
-                            SELECT nav, nav_date FROM nav_history
-                            WHERE scheme_code = s.scheme_code AND nav_date >= %s AND nav_date <= %s
-                            ORDER BY nav_date DESC
-                            LIMIT 1
-                        ) pe ON TRUE
-                        {where_sql_cat_active}
-                    )
-                    SELECT s.category,
-                           percentile_cont(0.5) WITHIN GROUP (ORDER BY period_return_pct) as true_cat_median
-                    FROM period_calc s
-                    WHERE s.category IS NOT NULL AND s.period_return_pct IS NOT NULL
-                    GROUP BY s.category;
-                """
-                cat_median_params = [start_date, end_date, start_date, end_date] + params_cat + [start_date]
-                try:
-                    df_cat_median = _fetchdf(con.execute(cat_median_sql, cat_median_params))
-                except Exception:
-                    df_cat_median = pd.DataFrame(columns=["category", "true_cat_median"])
-        else:
-            filter_cond = f"{where_sql} {'AND' if where_sql else 'WHERE'} s.latest_nav IS NOT NULL"
-            sql = f"""
-                SELECT
-                    s.scheme_code,
-                    s.scheme_name,
-                    s.fund_house,
-                    s.category,
-                    s.broad_category,
-                    s.plan_type,
-                    s.option_type,
-                    s.expense_ratio,
-                    s.latest_nav,
-                    s.dist_from_52w_high_pct,
-                    s.high_52w,
-                    s.low_52w,
-                    COALESCE(s.return_30d_pct, s.return_7d_pct, s.change_1d_pct, 0.0) as period_return_pct,
-                    CAST(NULL AS DOUBLE PRECISION) as annualized_vol_pct,
-                    0 as n_trading_days,
-                    50.0 as win_rate_pct
-                FROM summary_table s
-                {filter_cond};
-            """
-            df = _fetchdf(con.execute(sql, params))
-            df_cat_median = pd.DataFrame(columns=["category", "true_cat_median"])
-    finally:
-        con.close()
-    if not df.empty:
-        # Standardized display label (fast zip comprehension avoids 15,000 pd.Series allocations)
-        names = df["scheme_name"].tolist()
-        plans = df["plan_type"].fillna("").tolist() if "plan_type" in df else [""] * len(df)
-        options = df["option_type"].fillna("").tolist() if "option_type" in df else [""] * len(df)
-        codes = df["scheme_code"].tolist()
-        df["display_name"] = [
-            format_scheme_display_name(n, p, o, c) for n, p, o, c in zip(names, plans, options, codes)
-        ]
-        # Peer Category Median Return: the true (Plan/Option-independent) median where available,
-        # falling back to the in-view median for the no-date-range branch or any category it missed.
-        if not df_cat_median.empty:
-            df = df.merge(df_cat_median, on="category", how="left")
-            df["cat_median_return"] = df["true_cat_median"].round(4)
-            in_view_median = df.groupby("category")["period_return_pct"].transform("median").round(4)
-            df["cat_median_return"] = df["cat_median_return"].fillna(in_view_median)
-            df = df.drop(columns=["true_cat_median"])
-        else:
-            df["cat_median_return"] = df.groupby("category")["period_return_pct"].transform("median").round(4)
+    want_idcw = str(option_type or "").strip().upper() == "IDCW"
+    usable = uni["period_return_pct"].notna()
+    ranked_pool = uni[usable & uni["full_window"] & (uni["is_idcw"] == want_idcw)].copy()
+    exclusions = {
+        "partial_window": int((usable & ~uni["full_window"]).sum()),
+        "idcw": int((usable & uni["full_window"] & (uni["is_idcw"] != want_idcw)).sum()),
+    }
 
-        # Category Alpha (Peer Outperformance)
-        df["cat_alpha_pct"] = (df["period_return_pct"] - df["cat_median_return"]).round(4)
+    df = ranked_pool
+    df["plan_key"] = [_plan_key(p) for p in df["plan_type"]]
+    group = df.groupby(["asset_class", "peer_category", "plan_key"], dropna=False)["period_return_pct"]
+    df["peer_count"] = group.transform("count").astype(int)
+    df["cat_median_return"] = group.transform("median").round(4)
+    df["peer_rank"] = group.rank(ascending=False, method="min").astype(int)
+    thin = df["peer_count"] < MIN_PEERS_FOR_ALPHA
+    df["cat_alpha_pct"] = (df["period_return_pct"] - df["cat_median_return"]).round(4).where(~thin)
+    df.loc[thin, "cat_median_return"] = np.nan
+    # 1 = top quarter. From the rank, so ties share a quartile instead of being split by row order.
+    df["quartile"] = np.ceil(df["peer_rank"] * 4.0 / df["peer_count"]).clip(1, 4).where(~thin)
+    # Share of peers this fund beat: 100 = best of its group.
+    df["peer_percentile"] = (100.0 * (df["peer_count"] - df["peer_rank"]) / (df["peer_count"] - 1).clip(lower=1)).round(1).where(~thin)
+    # Risk judged the same way as return: against the fund's own peers. A liquid fund at 0.5%
+    # volatility is not "calm" next to a small-cap fund at 18% -- it is calm or not next to
+    # other liquid funds. Compared across the whole market, volatility just sorted funds by
+    # asset class (241 of 242 liquid funds came out "low risk").
+    vol_group = df.groupby(["asset_class", "peer_category", "plan_key"], dropna=False)["annualized_vol_pct"]
+    df["peer_median_vol"] = vol_group.transform("median").where(~thin).round(4)
+    df["vol_vs_peers_pct"] = ((df["annualized_vol_pct"] / df["peer_median_vol"].where(df["peer_median_vol"] > 0) - 1.0)
+                              * 100.0).round(2)
+    df["return_to_risk"] = np.where(df["annualized_vol_pct"] > 0.01,
+                                    (df["period_return_pct"] / df["annualized_vol_pct"]).round(4), np.nan)
 
-        # Quartile ranking within category (1 = Q1 top 25%, 4 = Q4 bottom 25%)
-        def _calc_q(s):
-            n = len(s)
-            if n < 4:
-                return s.rank(ascending=False, method="min").astype(int).clip(upper=4)
-            try:
-                ranks = s.rank(ascending=False, method="first")
-                return pd.qcut(ranks, q=4, labels=[1, 2, 3, 4]).astype(int)
-            except Exception:
-                return pd.Series(1, index=s.index)
-
-        df["quartile"] = df.groupby("category")["period_return_pct"].transform(_calc_q)
-
-        # Return to Risk Ratio
-        df["return_to_risk"] = np.where(
-            df["annualized_vol_pct"] > 0.01,
-            (df["period_return_pct"] / df["annualized_vol_pct"]).round(4),
-            0.0
-        )
-    return df
+    # The page's filters, applied after the medians so they never move them. The asset-class
+    # filter takes the classes this page shows; the older SEBI broad buckets still work.
+    mask = pd.Series(True, index=df.index)
+    if broad_cat and broad_cat != "All Categories":
+        mask &= (df["asset_class"] == broad_cat) | (df["broad_category"] == broad_cat)
+    if sub_cat and sub_cat != "All Sub-Categories":
+        mask &= (df["peer_category"] == sub_cat) | (df["category"] == sub_cat)
+    mask &= _matches_filter(df["plan_type"], plan_type, "All Plans")
+    mask &= _matches_filter(df["option_type"], option_type, "All Options") | (want_idcw & df["is_idcw"])
+    out = df[mask].drop(columns=["plan_key"]).reset_index(drop=True)
+    out.attrs["exclusions"] = exclusions
+    # The filter choices, from the whole ranked pool -- taken from the filtered rows they
+    # would shrink to whatever is already selected.
+    pairs = df[["asset_class", "peer_category"]].dropna().drop_duplicates()
+    out.attrs["categories_by_class"] = {cls: sorted(g["peer_category"]) for cls, g in pairs.groupby("asset_class")}
+    out.attrs["window"] = {
+        "first_nav_date": uni["start_nav_date"].min(), "last_nav_date": uni["end_nav_date"].max(),
+        "vol_start": _vol_start_for(str(vol_lookback or "1Y"), start_date, end_date),
+    }
+    return out
 
 get_leaders_laggards = get_advanced_leaders_dataframe
+
+
+@cached(ttl=600)
+def get_official_returns_by_scheme() -> pd.DataFrame:
+    """Per scheme: its fund's SEBI benchmark and AMFI's own 1Y/3Y returns for the scheme's
+    plan and for that benchmark, from amfi_fund_snapshot. Only for Growth-type schemes --
+    AMFI computes these on the Growth NAV, and pinning them on an IDCW scheme would state a
+    return it never delivered. Empty (not an error) before the first snapshot exists."""
+    con = get_connection()
+    try:
+        df = _fetchdf(con.execute("""
+            SELECT code AS scheme_code, f.benchmark, f.as_of AS official_as_of,
+                   CASE WHEN s.plan_type = 'Direct' THEN f.return_1y_direct
+                        WHEN s.plan_type = 'Regular' THEN f.return_1y_regular END AS official_1y_pct,
+                   f.return_1y_benchmark AS benchmark_1y_pct,
+                   CASE WHEN s.plan_type = 'Direct' THEN f.return_3y_direct
+                        WHEN s.plan_type = 'Regular' THEN f.return_3y_regular END AS official_3y_pct,
+                   f.return_3y_benchmark AS benchmark_3y_pct
+            FROM amfi_fund_snapshot f
+            CROSS JOIN LATERAL unnest(f.scheme_codes) AS code
+            JOIN schemes s ON s.scheme_code = code
+            WHERE (s.option_type IS NULL OR s.option_type <> 'IDCW')
+        """))
+    except Exception:
+        return pd.DataFrame(columns=["scheme_code", "benchmark", "official_as_of", "official_1y_pct",
+                                     "benchmark_1y_pct", "official_3y_pct", "benchmark_3y_pct"])
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    df["excess_1y_pp"] = (df["official_1y_pct"] - df["benchmark_1y_pct"]).round(4)
+    df["excess_3y_pp"] = (df["official_3y_pct"] - df["benchmark_3y_pct"]).round(4)
+    return df.drop_duplicates("scheme_code")
+
+
+ROTATION_LEADING, ROTATION_WEAKENING, ROTATION_LAGGING, ROTATION_IMPROVING = "Leading", "Weakening", "Lagging", "Improving"
+#: Categories with fewer distinct funds than this are not shown: one or two funds are a fund
+#: story, not a category one.
+MIN_FUNDS_FOR_ROTATION = 3
+
+
+def _rotation_quadrant(strength: float, momentum: float) -> str:
+    if strength >= 0:
+        return ROTATION_LEADING if momentum >= 0 else ROTATION_WEAKENING
+    return ROTATION_IMPROVING if momentum >= 0 else ROTATION_LAGGING
+
+
+def _one_row_per_fund(df: pd.DataFrame) -> pd.DataFrame:
+    """A fund's Direct and Regular plans are one portfolio: counted twice, a category with
+    ten funds reads as twenty and every median weights each fund double. Keeps the Direct
+    plan where a fund has one."""
+    key = df["scheme_name"].fillna("").str.strip().str.lower() + "||" + df["option_type"].fillna("").str.lower()
+    direct_first = df.assign(_k=key, _d=(df["plan_type"] != "Direct").astype(int)).sort_values(["_k", "_d"])
+    return direct_first.drop_duplicates("_k").drop(columns=["_k", "_d"])
+
+
+@cached(ttl=600)
+def get_category_rotation(start_date=None, end_date=None, plan_type: str = "All Plans", option_type: str = "All Options",
+                          broad_cat: str = "All Categories") -> Dict[str, Any]:
+    """Which categories are gaining or losing leadership, relative-rotation style.
+
+    For each (asset class, SEBI category), over the same fair pool the Leaders tab ranks:
+      * strength  = the category's median return over the window minus the market's median;
+      * momentum  = the same over the window's closing stretch (its last third, see
+                    recent_days_for) -- is the category ahead of the market lately?
+    Leading (strong, still ahead lately), Weakening (strong, but behind lately), Lagging,
+    Improving (weak over the window, ahead lately). Plus the category's median return in each
+    week (month, for windows over four months) -- the rotation itself, period by period.
+
+    One row per fund (Direct plan kept) so a fund's two plans are not counted as two funds.
+    The market medians are always the whole market's; `broad_cat` only narrows which
+    categories are listed."""
+    start_date, end_date = _normalize_date_range(start_date, end_date)
+    empty: Dict[str, Any] = {"categories": [], "periods": [], "market_period_median": [], "unit": None,
+                             "recent_days": None, "market_median": None, "market_recent_median": None}
+    if not start_date or not end_date:
+        return empty
+    df = get_advanced_leaders_dataframe(plan_type=plan_type, option_type=option_type,
+                                        start_date=start_date, end_date=end_date)
+    if df.empty:
+        return empty
+    if not plan_type or plan_type == "All Plans":
+        df = _one_row_per_fund(df)
+    market_med = float(df["period_return_pct"].median())
+    market_recent = float(df["recent_return_pct"].median())
+    if broad_cat and broad_cat != "All Categories":
+        df = df[(df["asset_class"] == broad_cat) | (df["broad_category"] == broad_cat)]
+    if df.empty:
+        return {**empty, "market_median": market_med, "market_recent_median": market_recent}
+
+    # --- Period-by-period returns ---------------------------------------------------------
+    span = (end_date - start_date).days
+    unit = "month" if span > 120 else "week"
+    codes = [int(c) for c in df["scheme_code"]]
+    con = get_connection()
+    try:
+        closes = _fetchdf(con.execute("""
+            SELECT scheme_code, date_trunc(%s, nav_date)::date AS bucket,
+                   (array_agg(nav ORDER BY nav_date DESC))[1] AS close
+            FROM nav_history
+            WHERE scheme_code = ANY(%s) AND nav_date >= %s AND nav_date <= %s AND nav > 0
+            GROUP BY 1, 2
+        """, (unit, codes, start_date, end_date)))
+    finally:
+        con.close()
+    periods: List[datetime.date] = []
+    per_bucket = pd.DataFrame(columns=["scheme_code", "bucket", "ret"])
+    if not closes.empty:
+        closes = closes.sort_values(["scheme_code", "bucket"])
+        start_nav = df.set_index("scheme_code")["start_nav"]
+        prev = closes.groupby("scheme_code")["close"].shift(1)
+        # The first period runs from the window's opening NAV, not from nothing.
+        prev = prev.fillna(closes["scheme_code"].map(start_nav))
+        closes["ret"] = (closes["close"] / prev - 1.0) * 100.0
+        per_bucket = closes[["scheme_code", "bucket", "ret"]]
+        periods = sorted(per_bucket["bucket"].unique())
+    tagged = per_bucket.merge(df[["scheme_code", "asset_class", "peer_category"]], on="scheme_code")
+    heat = tagged.groupby(["asset_class", "peer_category", "bucket"])["ret"].median() if not tagged.empty else pd.Series(dtype=float)
+    market_by_period = per_bucket.groupby("bucket")["ret"].median() if not per_bucket.empty else pd.Series(dtype=float)
+
+    aum = _fund_aum()
+    aum_by = aum.groupby(["asset_class", "peer_category"])["aum_cr"].sum() if not aum.empty else pd.Series(dtype=float)
+
+    def r4(v: Any) -> Optional[float]:
+        return None if v is None or pd.isna(v) else round(float(v), 4)
+
+    rows = []
+    for (cls, cat), part in df.groupby(["asset_class", "peer_category"]):
+        if len(part) < MIN_FUNDS_FOR_ROTATION:
+            continue
+        med = float(part["period_return_pct"].median())
+        recent = part["recent_return_pct"].dropna()
+        recent_med = float(recent.median()) if len(recent) else None
+        strength = med - market_med
+        momentum = (recent_med - market_recent) if recent_med is not None else None
+        ter = part["expense_ratio"].dropna()
+        cat_aum = aum_by.get((cls, cat)) if len(aum_by) else None
+        rows.append({
+            "asset_class": cls, "category": cat, "funds": int(len(part)),
+            "aum_cr": r4(cat_aum) if cat_aum else None,
+            "median_return": r4(med), "recent_median_return": r4(recent_med),
+            "strength_pp": r4(strength), "momentum_pp": r4(momentum),
+            "quadrant": _rotation_quadrant(strength, momentum) if momentum is not None else None,
+            "p25_return": r4(part["period_return_pct"].quantile(0.25)),
+            "p75_return": r4(part["period_return_pct"].quantile(0.75)),
+            "pct_up": r4((part["period_return_pct"] > 0).mean() * 100.0),
+            "median_vol": r4(part["annualized_vol_pct"].median()),
+            "median_drawdown": r4(part["max_drawdown_pct"].median()),
+            "avg_ter": r4(ter.mean()) if len(ter) else None,
+            "heat": [r4(heat.get((cls, cat, p))) for p in periods],
+        })
+    rows.sort(key=lambda r: -(r["median_return"] or 0))
+    return {
+        "categories": rows,
+        "periods": [p.isoformat() for p in periods],
+        "market_period_median": [r4(market_by_period.get(p)) for p in periods],
+        "unit": unit,
+        "recent_days": recent_days_for(start_date, end_date),
+        "market_median": r4(market_med),
+        "market_recent_median": r4(market_recent),
+    }
 
 @cached(ttl=600)
 def get_scheme_profile(scheme_code: int) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
@@ -1667,6 +2194,13 @@ def get_scheme_profile(scheme_code: int) -> Tuple[Optional[Dict[str, Any]], pd.D
     con.close()
 
     profile = summary.to_dict(orient="records")[0] if not summary.empty else None
+    if profile is not None:
+        # The sibling get_scheme_profile_only() has always carried this; this one did not,
+        # which is why the Quant page header, its factor and stress chart titles, and every
+        # Compare table and legend showed a bare base name.
+        profile["display_name"] = format_scheme_display_name(
+            profile.get("scheme_name"), profile.get("plan_type"),
+            profile.get("option_type"), profile.get("scheme_code"))
     return profile, history
 
 
@@ -1777,12 +2311,17 @@ def get_scheme_identity_map() -> pd.DataFrame:
 @cached(ttl=600)
 def get_scheme_ter_history(scheme_code: int) -> pd.DataFrame:
     """Full dated Regulation 66 TER disclosure history for one scheme, oldest first â€”
-    only populated once amfi_sync.sync_official_ter has matched that scheme at least once."""
+    only populated once amfi_sync.sync_official_ter has matched that scheme at least once.
+
+    One row per change, not per day: `ter_date` is when these figures took effect and
+    `valid_to` the last date they were disclosed. A consumer plotting this must draw steps,
+    since joining the points with straight lines would invent a gradual slide between two
+    fee levels that actually jumped."""
     con = get_connection()
     df = _fetchdf(con.execute(
         """
-        SELECT ter_date, base_expense_ratio_pct, brokerage_cost_pct, transaction_cost_pct,
-               statutory_levies_pct, total_ter_pct, source_url
+        SELECT ter_date, valid_to, base_expense_ratio_pct, brokerage_cost_pct,
+               transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url
         FROM ter_history
         WHERE scheme_code = %s
         ORDER BY ter_date ASC;
@@ -1793,38 +2332,132 @@ def get_scheme_ter_history(scheme_code: int) -> pd.DataFrame:
     return df
 
 
-def upsert_ter_history(records: pd.DataFrame) -> int:
+def upsert_ter_history(records: pd.DataFrame, authoritative: bool = False) -> int:
     """Serialized via WRITE_LOCK â€” see refresh_summary_table()."""
     with WRITE_LOCK:
-        return _upsert_ter_history_impl(records)
+        return _upsert_ter_history_impl(records, authoritative=authoritative)
 
 
-def _upsert_ter_history_impl(records: pd.DataFrame) -> int:
+#: Columns whose combined value defines "the TER changed".
+_TER_VALUE_COLS = ("base_expense_ratio_pct", "brokerage_cost_pct", "transaction_cost_pct",
+                   "statutory_levies_pct", "total_ter_pct")
+
+
+def _upsert_ter_history_impl(records: pd.DataFrame, authoritative: bool = False) -> int:
+    """Merges a batch of daily AMFI disclosures into the change-point table.
+
+    `records` arrives dense -- one row per scheme per calendar day, exactly as the portal
+    publishes it. What gets stored is one row per *change*, so this cannot be the old
+    delete-by-key-then-insert: a day landing inside an existing run has to split it, and a
+    day matching its neighbours has to disappear into them.
+
+    The merge is defined over *days* rather than over the stored rows, which is what keeps it
+    order-independent. Runs in the affected window are expanded back to the days they assert,
+    the incoming batch contributes its own days, the batch wins wherever both describe the
+    same date, and runs are recomputed from that union. Re-running the same batch therefore
+    lands on exactly the same table, and the historical backfill can keep walking months
+    backwards into data that already exists -- which the resume/checkpoint logic depends on.
+
+    `authoritative` says the batch is a complete fetch of the window it covers, so what is
+    already stored for those days should be discarded rather than merged. The caller sets it
+    only when AMFI returned every page, because the merge is otherwise what protects days a
+    dropped page failed to re-deliver. It is what makes a deliberate re-fetch able to *undo*
+    bad data: a merge can add days and correct figures, but it can never remove a day that
+    should not be there, since the stored value simply survives as an observation."""
     if records.empty:
         return 0
+    value_cols = ", ".join(_TER_VALUE_COLS)
     con = get_connection()
     try:
         con.begin()
         _write_staging_table(con, "stg_ter_history", records,
                              like_table="ter_history",
                              key_columns=["scheme_code", "ter_date"])
+        # Only the window the batch can affect is rebuilt: the runs it overlaps, plus any
+        # immediately abutting it so an unchanged figure either side of the boundary still
+        # coalesces into one run. Runs elsewhere in the scheme's history are left alone, so
+        # the cost of a monthly sync does not grow with the depth of history behind it.
         con.execute("""
-            DELETE FROM ter_history
-            WHERE EXISTS (
-                SELECT 1 FROM stg_ter_history s
-                WHERE ter_history.scheme_code = s.scheme_code AND ter_history.ter_date = s.ter_date
-            );
+            CREATE TEMP TABLE stg_ter_window AS
+            SELECT scheme_code, min(ter_date) AS lo, max(ter_date) AS hi
+            FROM stg_ter_history GROUP BY scheme_code;
+        """)
+        # Expanded back to one row per day, which is what makes the merge exact: a stored
+        # run is an assertion about every day it spans, and re-deriving runs from the days
+        # (rather than from the two endpoints) is what lets an incoming day split a run it
+        # lands inside, or extend one it abuts.
+        # An authoritative batch keeps only the days outside its own span, so that days the
+        # batch does not claim are dropped rather than resurrected. Days either side of the
+        # span are still carried in, or a re-fetch of one month would sever the periods
+        # running up to and away from it.
+        carry_in = "AND (gs::date < w.lo OR gs::date > w.hi)" if authoritative else ""
+        con.execute(f"""
+            CREATE TEMP TABLE stg_ter_days AS
+            SELECT DISTINCT ON (scheme_code, obs_date) scheme_code, obs_date, {value_cols}, source_url
+            FROM (
+                SELECT s.scheme_code, s.ter_date AS obs_date, {value_cols}, s.source_url, 0 AS src_rank
+                FROM stg_ter_history s
+                UNION ALL
+                SELECT h.scheme_code, gs::date AS obs_date, {value_cols}, h.source_url, 1 AS src_rank
+                FROM ter_history h
+                JOIN stg_ter_window w USING (scheme_code)
+                CROSS JOIN LATERAL generate_series(h.ter_date,
+                                                   COALESCE(h.valid_to, h.ter_date),
+                                                   interval '1 day') gs
+                WHERE h.ter_date <= w.hi + 1
+                  AND COALESCE(h.valid_to, h.ter_date) >= w.lo - 1
+                  {carry_in}
+            ) u
+            ORDER BY scheme_code, obs_date, src_rank;
+        """)
+        con.execute(f"""
+            CREATE TEMP TABLE stg_ter_runs AS
+            WITH marked AS (
+                SELECT *,
+                       CASE WHEN ({value_cols}) IS DISTINCT FROM
+                                 LAG(({value_cols})) OVER (PARTITION BY scheme_code ORDER BY obs_date)
+                              OR LAG(obs_date) OVER (PARTITION BY scheme_code ORDER BY obs_date)
+                                 IS DISTINCT FROM obs_date - 1
+                            THEN 1 ELSE 0 END AS starts_run
+                FROM stg_ter_days
+            ), grouped AS (
+                SELECT *, SUM(starts_run) OVER (PARTITION BY scheme_code ORDER BY obs_date
+                                                ROWS UNBOUNDED PRECEDING) AS run_id
+                FROM marked
+            )
+            SELECT scheme_code,
+                   min(obs_date) AS ter_date,
+                   max(obs_date) AS valid_to,
+                   min(base_expense_ratio_pct) AS base_expense_ratio_pct,
+                   min(brokerage_cost_pct)     AS brokerage_cost_pct,
+                   min(transaction_cost_pct)   AS transaction_cost_pct,
+                   min(statutory_levies_pct)   AS statutory_levies_pct,
+                   min(total_ter_pct)          AS total_ter_pct,
+                   min(source_url)             AS source_url
+            FROM grouped
+            GROUP BY scheme_code, run_id;
         """)
         con.execute("""
+            DELETE FROM ter_history h
+            USING stg_ter_window w
+            WHERE h.scheme_code = w.scheme_code
+              AND h.ter_date <= w.hi + 1
+              AND COALESCE(h.valid_to, h.ter_date) >= w.lo - 1;
+        """)
+        written = con.execute("""
             INSERT INTO ter_history (
-                scheme_code, ter_date, base_expense_ratio_pct, brokerage_cost_pct,
+                scheme_code, ter_date, valid_to, base_expense_ratio_pct, brokerage_cost_pct,
                 transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url
             )
-            SELECT scheme_code, ter_date, base_expense_ratio_pct, brokerage_cost_pct,
+            SELECT scheme_code, ter_date, valid_to, base_expense_ratio_pct, brokerage_cost_pct,
                    transaction_cost_pct, statutory_levies_pct, total_ter_pct, source_url
-            FROM stg_ter_history;
-        """)
+            FROM stg_ter_runs
+            RETURNING 1;
+        """).fetchall()
         con.execute("DROP TABLE IF EXISTS stg_ter_history")
+        con.execute("DROP TABLE IF EXISTS stg_ter_window")
+        con.execute("DROP TABLE IF EXISTS stg_ter_days")
+        con.execute("DROP TABLE IF EXISTS stg_ter_runs")
         con.commit()
     except Exception:
         try:
@@ -1836,7 +2469,7 @@ def _upsert_ter_history_impl(records: pd.DataFrame) -> int:
         con.close()
     bump_data_version()
     invalidate_database_stats_cache()
-    return len(records)
+    return len(written)
 
 
 def apply_latest_official_ter(records: pd.DataFrame) -> Dict[str, Any]:
@@ -1889,7 +2522,15 @@ def _apply_latest_official_ter_impl(records: pd.DataFrame) -> Dict[str, Any]:
         raise
     finally:
         con.close()
-    refresh_summary_table()
+    # summary_table is built FROM schemes, so if the regression guard above blocked every
+    # row there is nothing for a rebuild to pick up. That is the common case during a
+    # historical backfill: it walks backwards from the current month, so each month it
+    # fetches carries an as-of date older than the one already stored and updates nothing
+    # (the exception is a scheme with no official TER at all, which the first month that
+    # names it fills in). Every one of those no-op months was still paying 7.7s to rebuild
+    # a 25,377-scheme cache from 27M NAV rows to arrive at exactly the same table.
+    if updated:
+        refresh_summary_table()
     return {"updated": len(updated)}
 
 

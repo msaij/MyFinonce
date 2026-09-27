@@ -147,11 +147,13 @@ def get_factor_attribution(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    figures = factor_model.build_factor_figures(regression_result, profile.get("scheme_name", f"Scheme {scheme_code}"))
+    # The app-wide label, so the waterfall's title names the exact plan/option analysed.
+    figures = factor_model.build_factor_figures(
+        regression_result, profile.get("display_name") or profile.get("scheme_name", f"Scheme {scheme_code}"))
 
     response = {
         "scheme_code": scheme_code,
-        "scheme_name": profile.get("scheme_name", ""),
+        "scheme_name": profile.get("display_name") or profile.get("scheme_name", ""),
         "category": profile.get("category", ""),
         "window": {
             "start": str(cov_fund["actual_start"]),
@@ -212,7 +214,7 @@ def get_stress_test(
 
     response = {
         "scheme_code": scheme_code,
-        "scheme_name": profile.get("scheme_name", ""),
+        "scheme_name": profile.get("display_name") or profile.get("scheme_name", ""),
         "category": profile.get("category", ""),
         "scenarios": stress_result["scenarios"],
         "parametric_simulation": sim,
@@ -272,7 +274,7 @@ def get_tail_risk(
 
     response = {
         "scheme_code": scheme_code,
-        "scheme_name": profile.get("scheme_name", ""),
+        "scheme_name": profile.get("display_name") or profile.get("scheme_name", ""),
         "category": cat_name,
         "coverage": {
             "n_trading_days": cov_fund["n_trading_days"],

@@ -82,15 +82,122 @@ class TestManualActions:
         assert resp.json()["success"] is True
 
 
+class TestFactorProxies:
+    """The Data Management page's factor-proxy editor. Quant's factor attribution and
+    Holdings' risk tab both name this screen when a proxy has no NAVs for the window."""
+
+    def test_get_returns_current_values_and_defaults(self, client):
+        body = client.get("/api/admin/factor-proxies").json()
+        assert set(body) == {"proxies", "defaults"}
+        assert "factor_proxy_market" in body["proxies"]
+
+    def test_setting_a_proxy_to_a_real_scheme_sticks(self, client):
+        resp = client.post("/api/admin/factor-proxies", json={"factor_proxy_market": 222})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["proxies"]["factor_proxy_market"] == 222
+        assert client.get("/api/admin/factor-proxies").json()["proxies"]["factor_proxy_market"] == 222
+
+    def test_a_code_with_no_scheme_is_refused(self, client):
+        """Accepting it would only surface much later, as 'proxy funds lack NAV data'
+        on a different page, with nothing pointing back at the typo."""
+        resp = client.post("/api/admin/factor-proxies", json={"factor_proxy_market": 999999})
+        assert resp.status_code == 422 and "999999" in resp.json()["detail"]
+        assert client.get("/api/admin/factor-proxies").json()["proxies"]["factor_proxy_market"] != 999999
+
+    def test_an_unknown_proxy_name_is_refused_not_silently_ignored(self, client):
+        before = client.get("/api/admin/factor-proxies").json()["proxies"]
+        resp = client.post("/api/admin/factor-proxies", json={"factor_proxy_typo": 111})
+        assert resp.status_code == 422
+        assert client.get("/api/admin/factor-proxies").json()["proxies"] == before
+
+
+class TestDataAudit:
+    """The row-level audit's HTTP surface; the checks themselves are in test_data_audit.py."""
+
+    def test_latest_is_empty_before_the_first_run(self, client):
+        resp = client.get("/api/admin/audit/latest")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["empty"] is True and body["checks"] == []
+
+    def test_run_then_latest_returns_the_same_stored_run(self, client):
+        resp = client.post("/api/admin/audit")
+        assert resp.status_code == 200, resp.text
+        run = resp.json()
+        assert run["empty"] is False and run["trigger"] == "manual"
+        names = [c["name"] for c in run["checks"]]
+        assert "option_vs_isin" in names and "orphan_history" in names
+        # The fixture's two schemes are internally consistent: nothing must be flagged as an error.
+        assert run["summary"]["errors"] == 0 and run["summary"]["check_failures"] == 0
+
+        latest = client.get("/api/admin/audit/latest").json()
+        assert latest["run_id"] == run["run_id"]
+        assert [c["count"] for c in latest["checks"]] == [c["count"] for c in run["checks"]]
+
+    def test_running_the_audit_requires_the_admin_token(self, client, monkeypatch):
+        monkeypatch.setattr(settings, "admin_token_optional", False)
+        monkeypatch.setattr(settings, "admin_token", "s3cret")
+        assert client.post("/api/admin/audit").status_code == 401
+        assert client.post("/api/admin/audit", headers={"X-Admin-Token": "wrong"}).status_code == 401
+        assert client.post("/api/admin/audit", headers={"X-Admin-Token": "s3cret"}).status_code == 200
+        # Reading the stored result is open, like /verify and /status.
+        assert client.get("/api/admin/audit/latest").status_code == 200
+
+
+class TestBackfillCounts:
+    """Both "since <year>" buttons must state what the engine will actually do. The TER
+    estimate used to be computed in the browser and was wrong twice over: a stray constant
+    (a nine-month "since 2026" was offered as 18 months) and no awareness of AMFI's 2018
+    floor (a "since 2015" claimed 150 months for a range holding 105)."""
+
+    def test_ter_month_count_spans_january_of_that_year_to_this_month(self, client):
+        today = datetime.date.today()
+        body = client.get(f"/api/admin/backfill/ter/month-count?start_year={today.year}").json()
+        assert body["total_months"] == today.month
+        assert body["oldest_month"] == f"01-{today.year}"
+        assert body["newest_month"] == today.strftime("%m-%Y")
+
+    def test_ter_month_count_stops_at_the_portals_own_earliest_year(self, client):
+        deep = client.get("/api/admin/backfill/ter/month-count?start_year=2005").json()
+        floor = client.get("/api/admin/backfill/ter/month-count?start_year=2018").json()
+        assert deep["total_months"] == floor["total_months"]
+        assert deep["oldest_month"] == "01-2018"
+
+    def test_nav_chunk_count_matches_the_chunks_the_worker_would_run(self, client):
+        body = client.get("/api/admin/backfill/chunk-count?start_year=2024").json()
+        assert body["total_chunks"] == len(amfi_sync.generate_backfill_chunks(2024))
+
+
 class TestBackfillControls:
     def test_start_ter_backfill(self, client, monkeypatch):
-        monkeypatch.setattr(amfi_sync, "start_ter_backfill", lambda n_months: True)
+        captured = {}
+
+        def fake_start(n_months, resume):
+            captured.update(n_months=n_months, resume=resume)
+            return True
+
+        monkeypatch.setattr(amfi_sync, "start_ter_backfill", fake_start)
         resp = client.post("/api/admin/backfill/ter/start", json={"n_months": 6})
         assert resp.status_code == 200
         assert resp.json()["success"] is True
+        assert captured == {"n_months": 6, "resume": True}, "resume defaults to resuming"
+
+    def test_start_ter_backfill_can_be_told_to_refetch_completed_months(self, client, monkeypatch):
+        """Repairing stored data needs the months that are already marked done, since being
+        wrong is not the same as being absent -- the default would skip exactly those."""
+        captured = {}
+
+        def fake_start(n_months, resume):
+            captured.update(n_months=n_months, resume=resume)
+            return True
+
+        monkeypatch.setattr(amfi_sync, "start_ter_backfill", fake_start)
+        resp = client.post("/api/admin/backfill/ter/start", json={"n_months": 6, "resume": False})
+        assert resp.status_code == 200
+        assert captured == {"n_months": 6, "resume": False}
 
     def test_start_ter_backfill_conflict_is_409(self, client, monkeypatch):
-        monkeypatch.setattr(amfi_sync, "start_ter_backfill", lambda n_months: False)
+        monkeypatch.setattr(amfi_sync, "start_ter_backfill", lambda n_months, resume: False)
         resp = client.post("/api/admin/backfill/ter/start", json={"n_months": 6})
         assert resp.status_code == 409
 

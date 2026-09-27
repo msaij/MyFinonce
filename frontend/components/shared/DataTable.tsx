@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState } from "react";
 import { formatDate, formatInr, formatSignedPct } from "@/lib/format";
+import { FormulaTooltip } from "./FormulaTooltip";
 
 /**
  * Generic table with a per-column formatting config, replacing the pervasive
@@ -17,7 +18,10 @@ import { formatDate, formatInr, formatSignedPct } from "@/lib/format";
  * Clicking a different column resets sort and sorts that column ascending.
  */
 
-export type ColumnFormat = "text" | "number" | "signed_pct" | "inr" | "date";
+// "pct" is an unsigned percentage. Returns are signed -- a fund is up or down -- but a cost
+// is not, and TER wearing "signed_pct" printed AMFI's published 0.4500% as "+0.45%": a sign
+// that means nothing on a fee, and two decimals where the source publishes four.
+export type ColumnFormat = "text" | "number" | "signed_pct" | "pct" | "inr" | "date";
 
 export type SortDirection = "asc" | "desc" | null;
 
@@ -29,12 +33,16 @@ export interface ColumnConfig {
   render?: (row: Record<string, unknown>, value: unknown) => React.ReactNode;
   sortable?: boolean;
   sortValue?: (row: Record<string, unknown>) => unknown;
+  /** What the column means, shown behind an ⓘ beside the header. */
+  tooltip?: string;
 }
 
 export interface DataTableProps {
   columns: ColumnConfig[];
   rows: Record<string, unknown>[];
   keyField?: string;
+  /** A totals row pinned under the body, keyed by column; it never takes part in sorting. */
+  footer?: Record<string, React.ReactNode>;
   initialSortKey?: string | null;
   initialSortDirection?: SortDirection;
   sortKey?: string | null;
@@ -54,6 +62,11 @@ function formatCell(value: unknown, format: ColumnFormat = "text", decimals = 2)
       if (typeof value === "string" && value.trim() === "") return "-";
       const n = typeof value === "number" ? value : Number(value);
       return formatSignedPct(Number.isFinite(n) ? n : null, decimals);
+    }
+    case "pct": {
+      if (typeof value === "string" && value.trim() === "") return "-";
+      const n = typeof value === "number" ? value : Number(value);
+      return Number.isFinite(n) ? `${n.toFixed(decimals)}%` : "-";
     }
     case "inr": {
       if (typeof value === "string" && value.trim() === "") return "-";
@@ -283,7 +296,7 @@ export function parseDateValue(val: unknown, format?: ColumnFormat): number | nu
  */
 export function isMissingOrInvalid(value: unknown, format?: ColumnFormat): boolean {
   if (isMissingValue(value)) return true;
-  if (format === "number" || format === "signed_pct" || format === "inr") {
+  if (format === "number" || format === "signed_pct" || format === "pct" || format === "inr") {
     return parseNumericValue(value) === null;
   }
   if (format === "date") {
@@ -401,8 +414,8 @@ export function compareTableValues(
     }
   }
 
-  // 2. Explicit or Inferred Numeric formats: number, signed_pct, inr
-  if (effectiveFormat === "number" || effectiveFormat === "signed_pct" || effectiveFormat === "inr") {
+  // 2. Explicit or Inferred Numeric formats: number, signed_pct, pct, inr
+  if (effectiveFormat === "number" || effectiveFormat === "signed_pct" || effectiveFormat === "pct" || effectiveFormat === "inr") {
     const numA = parseNumericValue(valA);
     const numB = parseNumericValue(valB);
     if (numA !== null && numB !== null) {
@@ -514,6 +527,7 @@ export function DataTable({
   columns = [],
   rows = [],
   keyField = "scheme_code",
+  footer,
   initialSortKey = null,
   initialSortDirection = null,
   sortKey: controlledSortKey,
@@ -621,6 +635,12 @@ export function DataTable({
                 >
                   <div className="inline-flex items-center gap-1.5">
                     <span>{col.label}</span>
+                    {col.tooltip && (
+                      // Hovering or tapping the ⓘ must not also re-sort the table.
+                      <span onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()} className="-ml-1.5">
+                        <FormulaTooltip fixed label={col.label} description={col.tooltip} />
+                      </span>
+                    )}
                     {isSortable && (
                       <span
                         className="inline-flex items-center text-[10px] leading-none"
@@ -681,6 +701,17 @@ export function DataTable({
             </tr>
           )}
         </tbody>
+        {footer && sortedRows.length > 0 && (
+          <tfoot>
+            <tr style={{ borderTop: "2px solid var(--mf-border)", background: "var(--mf-card-bg)" }}>
+              {columns.map((col) => (
+                <td key={col.key} className="px-3 py-2 whitespace-nowrap font-bold" style={{ color: "var(--mf-fg)" }}>
+                  {footer[col.key] ?? ""}
+                </td>
+              ))}
+            </tr>
+          </tfoot>
+        )}
       </table>
     </div>
   );

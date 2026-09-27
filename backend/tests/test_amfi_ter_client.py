@@ -158,3 +158,21 @@ class TestParseRow:
         assert AmfiTerClient.parse_row(row_no_name) is None
         assert AmfiTerClient.parse_row(row_no_date) is None
 
+
+
+def test_a_single_plan_etf_reads_the_columns_amfi_actually_filled():
+    """AMFI discloses an ETF's one plan under the Direct columns and publishes the Regular ones
+    as 0.0000. We label ETFs "Regular", so 108 live ETFs came out with a TER of exactly 0 --
+    Nippon Gold BeES shows 0.8100 on AMFI. All-zero columns mean the plan does not exist."""
+    from app import amfi_sync
+
+    zeros = {f"r_{k}": 0.0 for k in ("ber", "brokerage", "transaction", "statutory", "ter")}
+    row = {**zeros, "d_ber": 0.69, "d_brokerage": 0.0, "d_transaction": 0.0, "d_statutory": 0.12, "d_ter": 0.81}
+    assert amfi_sync._ter_columns_for(row, "r_", {"r_"}) == "d_"
+    # A fund we DO hold in both plans keeps each plan's own columns, zeros and all.
+    assert amfi_sync._ter_columns_for(row, "r_", {"r_", "d_"}) == "r_"
+    # A real Regular disclosure is never swapped.
+    real = {**row, "r_ber": 1.5, "r_ter": 1.7}
+    assert amfi_sync._ter_columns_for(real, "r_", {"r_"}) == "r_"
+    # Both sets zero: nothing better to read.
+    assert amfi_sync._ter_columns_for({**zeros, **{f"d_{k}": 0.0 for k in ("ber", "brokerage", "transaction", "statutory", "ter")}}, "r_", {"r_"}) == "r_"

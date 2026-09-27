@@ -21,7 +21,17 @@ import pandas as pd
 MIN_TRADING_DAYS_FOR_RANKING = 5
 
 
+#: A category needs this many ranked funds before it can be named the "leading category":
+#: a four-fund legacy label topping the market on one lucky fund is not a market signal.
+MIN_FUNDS_FOR_LEADING_CATEGORY = 5
+
+
 def quartile_badge(q: Any) -> str:
+    if q is None or (isinstance(q, float) and q != q):
+        # Too few peers to rank against (see db.queries.MIN_PEERS_FOR_ALPHA). Calling that
+        # "Q4" -- what this used to fall through to -- branded a fund bottom-quartile for
+        # having no competitors.
+        return "Unranked (under 5 peers)"
     if q == 1:
         return "Q1 (Top 25%)"
     elif q == 2:
@@ -31,27 +41,57 @@ def quartile_badge(q: Any) -> str:
     return "Q4 (Bottom 25%)"
 
 
-def classify_quadrant(period_return_pct: float, annualized_vol_pct: float, med_ret: float, med_vol: float) -> str:
-    if period_return_pct >= med_ret and annualized_vol_pct <= med_vol:
-        return "Institutional Alpha Stars (High Return, Low Risk)"
-    elif period_return_pct >= med_ret and annualized_vol_pct > med_vol:
-        return "High-Beta Momentum (High Return, High Risk)"
-    elif period_return_pct < med_ret and annualized_vol_pct <= med_vol:
-        return "Defensive Anchors (Low Return, Low Risk)"
-    else:
-        return "Value Traps / Laggards (Low Return, High Risk)"
+QUADRANT_AHEAD_CALMER = "Ahead of peers, calmer"
+QUADRANT_AHEAD_BUMPIER = "Ahead of peers, bumpier"
+QUADRANT_BEHIND_CALMER = "Behind peers, calmer"
+QUADRANT_BEHIND_BUMPIER = "Behind peers, bumpier"
 
 
-def diagnose_laggard(cat_median_return: float, cat_alpha_pct: float, dist_from_52w_high_pct: Optional[float]) -> str:
-    dd = dist_from_52w_high_pct if dist_from_52w_high_pct is not None else 0.0
-    if cat_median_return < 0 and cat_alpha_pct >= -1.5:
-        return "Cyclical Dip (Category-wide correction; moving with peers)"
-    elif cat_alpha_pct < -3.0:
-        return "Structural Drag (Chronic underperformance vs peers)"
-    elif dd < -15.0:
-        return "Deep Drawdown (Far from 52W High)"
-    else:
-        return "Mild Underperformer"
+def classify_quadrant(cat_alpha_pct: float, vol_vs_peers_pct: float) -> str:
+    """Where a fund sits against its OWN peers on both axes: return (above or below the peer
+    median) and volatility (below or above the peers' median volatility).
+
+    The old version measured every fund against one market-wide median return and
+    volatility, which only sorted funds by asset class: 241 of 242 liquid funds were
+    "Institutional Alpha Stars" for being calm, and 902 equity funds "Value Traps" for being
+    equity. Against its peers, a quadrant says something about the fund itself."""
+    ahead = cat_alpha_pct >= 0
+    calmer = vol_vs_peers_pct <= 0
+    if ahead:
+        return QUADRANT_AHEAD_CALMER if calmer else QUADRANT_AHEAD_BUMPIER
+    return QUADRANT_BEHIND_CALMER if calmer else QUADRANT_BEHIND_BUMPIER
+
+
+LAGGARD_BOTTOM_DECILE = "Bottom 10% of its peers"
+LAGGARD_BOTTOM_QUARTILE = "Bottom quarter of its peers"
+LAGGARD_WITH_CATEGORY = "Falling with its category"
+LAGGARD_SLIGHTLY_BEHIND = "Slightly behind its peers"
+NOT_A_LAGGARD = "Not a laggard"
+
+
+def diagnose_laggard(cat_median_return: Optional[float], cat_alpha_pct: Optional[float],
+                     peer_percentile: Optional[float]) -> str:
+    """Why a fund is behind, judged by where it ranks among its peers.
+
+    The old rules used fixed percentage-point cut-offs (-1.5 pp, -3 pp, -15% from the high)
+    whatever the window or asset class: -3 pp is a catastrophe for a liquid fund over a
+    month and ordinary noise for a small-cap fund over three years. They also sent funds
+    AHEAD of their peers to "Mild Underperformer". Rank within the peer group is scale-free,
+    so one rule reads the same for every category and window."""
+    def missing(v: Any) -> bool:
+        return v is None or (isinstance(v, float) and v != v)
+
+    if missing(cat_alpha_pct) or cat_alpha_pct >= 0:
+        return NOT_A_LAGGARD
+    if not missing(peer_percentile) and peer_percentile <= 10.0:
+        return LAGGARD_BOTTOM_DECILE
+    if not missing(peer_percentile) and peer_percentile < 25.0:
+        return LAGGARD_BOTTOM_QUARTILE
+    if not missing(cat_median_return) and cat_median_return < 0:
+        # Behind, but not far behind, in a category that fell as a whole: the category is
+        # most of the story.
+        return LAGGARD_WITH_CATEGORY
+    return LAGGARD_SLIGHTLY_BEHIND
 
 
 def apply_min_trading_days_guard(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
@@ -117,6 +157,7 @@ def build_leaders_dataset(df_all: pd.DataFrame, search_query: str = "") -> Dict[
             "market_median_return": None,
             "top_alpha": None,
             "leading_category": None,
+            "lagging_category": None,
             "med_vol": None,
             "med_ret": None,
             "quadrant_excluded": 0,
@@ -130,30 +171,58 @@ def build_leaders_dataset(df_all: pd.DataFrame, search_query: str = "") -> Dict[
     decliners = int((df["period_return_pct"] < 0).sum())
     market_median_return = float(df["period_return_pct"].median())
 
-    top_alpha_row = df.sort_values("cat_alpha_pct", ascending=False).iloc[0]
-    cat_medians = df.groupby("category")["period_return_pct"].median().sort_values(ascending=False)
-    leading_category = (
-        {"name": cat_medians.index[0], "return_pct": float(cat_medians.iloc[0])} if not cat_medians.empty else None
-    )
+    has_alpha = df["cat_alpha_pct"].notna() if "cat_alpha_pct" in df else pd.Series(False, index=df.index)
+    top_alpha_row = df[has_alpha].sort_values("cat_alpha_pct", ascending=False).iloc[0] if has_alpha.any() else None
+    # Grouped as the peers are (asset class + SEBI category), and only categories with
+    # enough funds to mean something.
+    cat_key = ["asset_class", "peer_category"] if {"asset_class", "peer_category"} <= set(df.columns) else ["category"]
+    # Counted in distinct FUNDS: a fund's Direct and Regular plans are one fund twice, and
+    # four funds shown as eight schemes once crowned a category on four funds.
+    fund_col = "scheme_name" if "scheme_name" in df.columns else "period_return_pct"
+    cats = df.groupby(cat_key).agg(median=("period_return_pct", "median"), count=(fund_col, "nunique"))
+    cats = cats[cats["count"] >= MIN_FUNDS_FOR_LEADING_CATEGORY].sort_values("median", ascending=False)
+
+    def _cat_name(key: Any) -> str:
+        if isinstance(key, tuple):
+            asset_class, category = key
+            return f"{category} ({asset_class})"
+        return str(key)
+
+    leading_category = ({"name": _cat_name(cats.index[0]), "return_pct": float(cats["median"].iloc[0]),
+                         "funds": int(cats["count"].iloc[0])} if not cats.empty else None)
+    lagging_category = ({"name": _cat_name(cats.index[-1]), "return_pct": float(cats["median"].iloc[-1]),
+                         "funds": int(cats["count"].iloc[-1])} if len(cats) > 1 else None)
 
     # Quadrant classification: only funds with a real, measurable volatility figure
     # (never a fabricated one) -- matches the original's df_quad filter exactly.
-    df_quad = df[df["annualized_vol_pct"].notna() & (df["annualized_vol_pct"] > 0.1)]
+    # Only funds with a real peer-relative position on both axes: 5+ peers (so there is a
+    # peer median) and a measured volatility. Never a fabricated figure.
+    if {"cat_alpha_pct", "vol_vs_peers_pct"} <= set(df.columns):
+        df_quad = df[df["cat_alpha_pct"].notna() & df["vol_vs_peers_pct"].notna()]
+    else:
+        df_quad = df.iloc[0:0]
     quadrant_excluded = len(df) - len(df_quad)
     med_vol: Optional[float] = None
     med_ret: Optional[float] = None
+    # Built as a whole column: under pandas 3, assigning strings to a NEW column for only some
+    # rows (df.loc[idx, "quadrant"] = [...]) fills the other rows with the string "nan", which
+    # the page then counted as a fifth quadrant.
+    quadrants = pd.Series([None] * len(df), index=df.index, dtype=object)
     if not df_quad.empty:
         med_vol = float(df_quad["annualized_vol_pct"].median())
         med_ret = float(df_quad["period_return_pct"].median())
-        df.loc[df_quad.index, "quadrant"] = df_quad.apply(
-            lambda r: classify_quadrant(r["period_return_pct"], r["annualized_vol_pct"], med_ret, med_vol), axis=1
-        )
+        quadrants.loc[df_quad.index] = [
+            classify_quadrant(a, v) for a, v in zip(df_quad["cat_alpha_pct"], df_quad["vol_vs_peers_pct"])
+        ]
+    df["quadrant"] = quadrants
 
     # Laggard diagnostics, computed for every row (cheap, scalar-only) -- the
     # frontend decides which subset to actually display (negative alpha or deep drawdown).
-    df["diagnostic_classification"] = df.apply(
-        lambda r: diagnose_laggard(r["cat_median_return"], r["cat_alpha_pct"], r.get("dist_from_52w_high_pct")), axis=1
-    )
+    df["diagnostic_classification"] = [
+        diagnose_laggard(m, a, p) for m, a, p in zip(
+            df["cat_median_return"], df["cat_alpha_pct"],
+            df["peer_percentile"] if "peer_percentile" in df else [None] * len(df))
+    ]
 
     return {
         "rows": df,
@@ -162,8 +231,11 @@ def build_leaders_dataset(df_all: pd.DataFrame, search_query: str = "") -> Dict[
         "advancers": advancers,
         "decliners": decliners,
         "market_median_return": market_median_return,
-        "top_alpha": {"name": top_alpha_row["display_name"], "return_pct": float(top_alpha_row["cat_alpha_pct"])},
+        "top_alpha": ({"name": top_alpha_row["display_name"], "return_pct": float(top_alpha_row["cat_alpha_pct"]),
+                       "category": top_alpha_row.get("peer_category")}
+                      if top_alpha_row is not None else None),
         "leading_category": leading_category,
+        "lagging_category": lagging_category,
         "med_vol": med_vol,
         "med_ret": med_ret,
         "quadrant_excluded": quadrant_excluded,

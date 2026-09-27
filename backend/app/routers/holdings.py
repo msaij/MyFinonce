@@ -144,8 +144,9 @@ def list_transactions(pid: str, include_deleted: bool = False) -> list:
     txns = hdb.list_transactions(_call(svc.resolve_portfolio_ids, pid), include_deleted=include_deleted)
     meta = hdb.scheme_meta({t["scheme_code"] for t in txns})
     return [
-        {**to_json(t), **{k: meta.get(int(t["scheme_code"]), {}).get(k) for k in ("scheme_name", "plan_type", "option_type")}}
+        {**to_json(t), **{k: m.get(k) for k in ("scheme_name", "plan_type", "option_type")}, "display_name": hdb.display_name(m)}
         for t in txns
+        for m in [meta.get(int(t["scheme_code"]), {"scheme_code": int(t["scheme_code"])})]
     ]
 
 
@@ -157,6 +158,12 @@ def export_csv(pid: str) -> Response:
 @router.get("/portfolios/{pid}/performance")
 def performance(pid: str, benchmark: Optional[int] = Query(None, description="Benchmark scheme code override")) -> dict:
     return _call(analytics.performance, pid, benchmark)
+
+
+@router.get("/portfolios/{pid}/recent-changes")
+def recent_changes(pid: str) -> dict:
+    """Trailing 2/5/7/10 NAV-day movement of the holdings, for the Holdings tab's tiles."""
+    return _call(analytics.recent_changes, pid)
 
 
 @router.get("/portfolios/{pid}/allocation")
@@ -192,9 +199,19 @@ def portfolio_stress(
     return _call(risk_svc.stress, pid, shocks)
 
 
+#: The Risk tab's horizon picker: one month to five years, in calendar days.
+MC_MIN_DAYS, MC_MAX_DAYS = 30, 1826
+
+
 @router.get("/portfolios/{pid}/monte-carlo")
-def portfolio_monte_carlo(pid: str, years: float = Query(1.0, gt=0, le=40), sims: int = Query(1000, ge=100, le=5000)) -> dict:
-    return _call(risk_svc.monte_carlo, pid, years, sims)
+def portfolio_monte_carlo(pid: str, years: float = Query(1.0, gt=0, le=40),
+                          days: Optional[int] = Query(None, ge=MC_MIN_DAYS, le=MC_MAX_DAYS),
+                          sims: int = Query(1000, ge=100, le=5000)) -> dict:
+    # `days` is the horizon the owner types or slides to; it wins over `years` when given.
+    # Calendar days, converted once here -- the service then turns years into simulation
+    # steps at the portfolio's own observation rate, so 30 days of a liquid-fund portfolio
+    # is ~30 steps and 30 days of an equity one is ~21.
+    return _call(risk_svc.monte_carlo, pid, days / 365.25 if days else years, sims)
 
 
 @router.get("/portfolios/{pid}/insights")
@@ -279,6 +296,13 @@ def create_goal(body: GoalSave) -> dict:
 def update_goal(goal_id: int, body: GoalSave) -> dict:
     _found(hdb.get_goal(goal_id), f"Goal {goal_id}")
     return _save_goal(goal_id, body)
+
+
+@router.delete("/goals/{goal_id}")
+def delete_goal(goal_id: int) -> dict:
+    if not hdb.delete_goal(goal_id):
+        raise HTTPException(status_code=404, detail=f"Goal {goal_id} not found")
+    return {"deleted": goal_id}
 
 
 @router.get("/goals/{goal_id}/status")

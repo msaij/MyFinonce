@@ -47,6 +47,8 @@ export interface Transaction {
   scheme_name?: string | null;
   plan_type?: string | null;
   option_type?: string | null;
+  /** "Fund name (Direct - Growth) [AMFI code]", the app-wide label. */
+  display_name?: string;
 }
 
 export interface TransactionDraft {
@@ -82,6 +84,7 @@ export interface Position {
   [key: string]: unknown;
   scheme_code: number;
   scheme_name: string | null;
+  display_name: string;
   fund_house: string | null;
   category: string | null;
   broad_category: string | null;
@@ -99,12 +102,23 @@ export interface Position {
   unrealised_pct: number | null;
   realised_gain: number;
   dividend_income: number;
+  stamp_duty: number;
   total_invested: number;
   total_redeemed: number;
+  /** Rupee move on the units held at the previous close; units bought on the latest NAV date earn nothing yet. */
   day_change: number;
   xirr_pct: number | null;
   xirr_note: "too_short" | "no_flows" | "no_solution" | null;
+  /** ISO date a withheld XIRR will start to show. */
+  xirr_available_on: string | null;
   weight_pct: number | null;
+  /** SEBI category without AMFI's section prefix ("Liquid Fund"). */
+  sebi_category: string | null;
+  asset_class: string;
+  /** SEBI riskometer label, e.g. "Low to Moderate". */
+  riskometer: string | null;
+  /** Value x TER: what the expense ratio costs a year at today's value. */
+  annual_fee: number | null;
   first_date: string | null;
   txn_count: number;
   portfolio_ids: number[];
@@ -119,12 +133,34 @@ export interface HoldingsKpis {
   unrealised_pct: number | null;
   realised_gain: number;
   dividend_income: number;
+  stamp_duty: number;
   total_gain: number;
+  /** Total gain on the cash actually put in, net of withdrawals; null once more came out than went in. */
+  total_gain_pct: number | null;
   net_contributed: number;
   xirr_pct: number | null;
   xirr_note: string | null;
+  /** ISO date a withheld XIRR will start to show; null when it already shows. */
+  xirr_available_on: string | null;
+  first_investment_date: string | null;
+  /** Average days each rupee put in has been invested (to the valuation date, or to the
+   *  redemption that took it out, oldest first), weighted by amount. */
+  avg_days_invested: number | null;
+  /** Calendar days from the first investment to the valuation date. */
+  days_since_first_investment: number | null;
+  /** Time-weighted return since the first investment, not annualised. */
+  twr_since_start_pct: number | null;
+  benchmark_since_start_pct: number | null;
+  excess_since_start_pp: number | null;
+  benchmark_name: string | null;
   day_change: number;
   day_change_pct: number | null;
+  day_benchmark_pct: number | null;
+  /** Value-weighted TER over the funds that have one (see ter_coverage_pct). */
+  weighted_ter_pct: number | null;
+  annual_fee: number | null;
+  /** Share of today's value whose fund has a TER on record. */
+  ter_coverage_pct: number | null;
   open_positions: number;
   transactions: number;
 }
@@ -136,8 +172,18 @@ export interface HoldingsSummary {
   positions: Position[];
 }
 
+export interface TerContext {
+  ter_pct: number | null;
+  breakdown: { base_expense_ratio?: number; brokerage_cost_pct?: number; transaction_cost_pct?: number; statutory_levies_pct?: number } | null;
+  as_of: string | null;
+  category_spread: { peers: number; p10: number; median: number; p90: number } | null;
+  status: "ok" | "high" | "low" | "inconsistent" | "unverified" | "missing";
+  reason: string | null;
+}
+
 export interface PositionDetail {
   position: Position | null;
+  ter: TerContext | null;
   lots: { portfolio_id: number; txn_id: number; date: string; units: number; cost: number; cost_nav: number | null }[];
   transactions: (Transaction & { effective_units: number; units_scale: number; balance_units: number })[];
   nav_series: { date: string; nav: number }[];
@@ -163,10 +209,29 @@ export interface Performance {
     twr_index: (number | null)[];
     benchmark_index: (number | null)[] | null;
   };
-  benchmark?: { scheme_code: number | null; scheme_name: string | null };
+  benchmark?: {
+    scheme_code: number | null;
+    scheme_name: string | null;
+    /** "category_blend": each fund vs its SEBI category average; "scheme": a benchmark you chose. */
+    kind: "scheme" | "category_blend";
+    components: { category: string; weight_pct: number }[];
+  };
   periods?: PeriodReturn[];
-  attribution?: { total_gain: number; holdings: { scheme_code: number; scheme_name: string | null; gain: number; end_value: number; share_pct: number | null }[] };
-  monthly_flows?: { month: string; invested: number; withdrawn: number }[];
+  attribution?: {
+    total_gain: number;
+    gross_gain: number;
+    gross_loss: number;
+    holdings: {
+      scheme_code: number;
+      scheme_name: string | null;
+      gain: number;
+      end_value: number;
+      /** Share of the gross gain (winners sum to 100) or of the gross loss (losers sum to -100). */
+      gain_share_pct: number;
+      /** Share of today's portfolio value; 0 for a fund fully exited. */
+      weight_pct: number | null;
+    }[];
+  };
 }
 
 export interface AllocationBucket {
@@ -183,15 +248,46 @@ export interface DriftRow {
   status: "over" | "under" | "ok";
 }
 
+export interface PortfolioSplit extends AllocationBucket {
+  portfolio_id: number;
+  fund_count: number;
+  by_asset_class: Record<string, number>;
+}
+
+export interface AllocationHolding {
+  scheme_code: number;
+  scheme_name: string | null;
+  asset_class: string;
+  category: string | null;
+  fund_house: string | null;
+  riskometer: string | null;
+  value: number;
+  weight_pct: number | null;
+}
+
 export interface Allocation {
   total_value: number;
+  /** Weights are by market value today (units x latest NAV). */
+  basis: "current_value";
+  as_of: string | null;
   by_asset_class: AllocationBucket[];
   by_category: AllocationBucket[];
   by_amc: AllocationBucket[];
   by_plan: AllocationBucket[];
   by_option: AllocationBucket[];
-  holdings: { scheme_code: number; scheme_name: string | null; asset_class: string; category: string | null; value: number; weight_pct: number | null }[];
-  concentration: { hhi: number | null; effective_funds: number | null; top1_pct: number | null; top3_pct: number | null; fund_count: number };
+  /** Household view with 2+ portfolios only. */
+  by_portfolio: PortfolioSplit[] | null;
+  holdings: AllocationHolding[];
+  concentration: {
+    hhi: number | null;
+    effective_funds: number | null;
+    top1_pct: number | null;
+    top3_pct: number | null;
+    fund_count: number;
+    amc_count: number;
+    top_amc: string | null;
+    top_amc_pct: number | null;
+  };
   asset_classes: string[];
   targets: Record<string, number> | null;
   drift: DriftRow[] | null;
@@ -222,8 +318,17 @@ export interface HoldingsRisk {
   empty: boolean;
   insufficient?: boolean;
   message?: string;
-  window?: { start: string; end: string; n_trading_days: number };
+  /** "realised": your own track record; "current_mix": today's weights replayed over the funds' history. */
+  basis?: "realised" | "current_mix";
+  basis_note?: string | null;
+  /** obs_per_year is the series' own sampling rate -- ~365 when liquid funds (which price
+   *  every calendar day) set the grid, ~252 for a trading-day series. Every annualised
+   *  figure on the page is scaled by it, so anything that explains one must use it too. */
+  window?: { start: string; end: string; n_trading_days: number; obs_per_year?: number };
   risk_free_pct?: number;
+  /** SEBI's riskometer for each held fund, and where the money sits on the scale. Present
+   *  even when `insufficient`: it needs no price history. */
+  riskometer?: Riskometer;
   metrics?: RiskMetrics;
   benchmark?: { scheme_code: number | null; scheme_name: string | null };
   relative?: {
@@ -235,7 +340,9 @@ export interface HoldingsRisk {
     up_market_capture_pct: number;
     down_market_capture_pct: number;
   } | null;
-  drawdown?: { dates: string[]; drawdown_pct: number[]; rolling_vol_pct: (number | null)[] };
+  /** coverage_pct: on the hypothetical current-mix basis, the share of today's money whose
+   *  funds already existed on each date; null on the realised basis, which is 100% by definition. */
+  drawdown?: { dates: string[]; drawdown_pct: number[]; rolling_vol_pct: (number | null)[]; coverage_pct?: (number | null)[] | null };
   holdings?: {
     available: boolean;
     reason?: string;
@@ -253,8 +360,25 @@ export interface HoldingsRisk {
   };
 }
 
+export interface Riskometer {
+  available: boolean;
+  reason?: string;
+  levels?: string[];
+  funds?: { scheme_code: number; scheme_name: string; level: string | null; rank: number | null; weight_pct: number; as_of: string | null }[];
+  distribution?: { level: string; rank: number; weight_pct: number }[];
+  /** Money-weighted position on the 1-6 scale; a summary, not an official SEBI figure. */
+  weighted_rank?: number;
+  portfolio_level?: string;
+  highest?: { level: string; scheme_name: string; weight_pct: number };
+  /** Share of your money in funds AMFI has published a riskometer for. */
+  coverage_pct?: number;
+  as_of?: string | null;
+}
+
 export interface HoldingsFactors {
   empty: boolean;
+  basis?: "realised" | "current_mix";
+  basis_note?: string | null;
   unavailable?: boolean;
   reason?: string;
   window?: { start: string; end: string };
@@ -275,6 +399,8 @@ export interface StressScenario {
   name: string;
   window_start: string;
   window_end: string;
+  /** What happened in markets during this window. */
+  description?: string | null;
   available: boolean;
   reason: string | null;
   drawdown_pct: number | null;
@@ -298,8 +424,13 @@ export interface MonteCarlo {
   empty: boolean;
   insufficient?: boolean;
   years?: number;
+  /** The horizon actually simulated, in calendar days. */
+  horizon_days?: number;
   initial_value?: number;
+  /** Simulation step indices. Steps are drawn at the series' own frequency, so they convert
+   *  to years with obs_per_year -- dividing by 252 stretched a "1Y" run to 1.45 years. */
   days?: number[];
+  obs_per_year?: number;
   p5?: number[];
   p25?: number[];
   p50?: number[];
@@ -420,6 +551,7 @@ export const generateInstalments = (id: number, confirm: boolean) =>
 export const listGoals = () => apiGet<Goal[]>(`${base}/goals`);
 export const saveGoal = (id: number | null, body: { name: string; target_amount: number; target_date: string; inflation_pct: number; portfolio_ids: number[]; archived?: boolean }) =>
   id === null ? apiPost<Goal>(`${base}/goals`, body) : apiPut<Goal>(`${base}/goals/${id}`, body);
+export const deleteGoal = (id: number) => apiDelete<{ deleted: number }>(`${base}/goals/${id}`);
 export const getGoalStatus = (id: number, sip?: number | null) =>
   apiGet<GoalStatus>(`${base}/goals/${id}/status`, { sip: sip ?? undefined });
 
@@ -440,8 +572,9 @@ export const getHoldingsStress = (pid: PortfolioKey, s: Shocks) =>
     shock_value: s.value,
     shock_momentum: s.momentum,
   });
-export const getMonteCarlo = (pid: PortfolioKey, years: number) =>
-  apiGet<MonteCarlo>(`${base}/portfolios/${pid}/monte-carlo`, { years });
+/** `horizonDays`: calendar days from today, 30 (one month) to 1826 (five years). */
+export const getMonteCarlo = (pid: PortfolioKey, horizonDays: number) =>
+  apiGet<MonteCarlo>(`${base}/portfolios/${pid}/monte-carlo`, { days: horizonDays });
 
 
 export const getPerformance = (pid: PortfolioKey) => apiGet<Performance>(`${base}/portfolios/${pid}/performance`);
@@ -462,6 +595,34 @@ export const archivePortfolio = (id: number) => apiDelete<Portfolio>(`${base}/po
 export const getHoldingsSummary = (pid: PortfolioKey) => apiGet<HoldingsSummary>(`${base}/portfolios/${pid}/summary`);
 export const getPositionDetail = (pid: PortfolioKey, code: number) =>
   apiGet<PositionDetail>(`${base}/portfolios/${pid}/positions/${code}`);
+/** One trailing window on the Holdings tab. Counted in NAV days, and time-weighted, so
+ *  money paid in during the window is not mistaken for a gain. */
+export interface RecentChangeWindow {
+  days: number;
+  available: boolean;
+  start: string | null;
+  change_pct: number | null;
+  avg_daily_pct: number | null;
+  gain: number | null;
+  /** The same window of the peer benchmark the Performance tab plots. */
+  benchmark_change_pct: number | null;
+  /** Portfolio minus benchmark, in percentage points. */
+  excess_pp: number | null;
+  nav_days_held: number;
+  /** NAV days still to go before this window can be shown; 0 once it is available. */
+  days_needed: number;
+}
+
+export interface RecentChanges {
+  empty: boolean;
+  as_of?: string;
+  benchmark_name?: string | null;
+  windows: RecentChangeWindow[];
+}
+
+export const getRecentChanges = (pid: PortfolioKey) =>
+  apiGet<RecentChanges>(`/api/holdings/portfolios/${pid}/recent-changes`);
+
 export const listTransactions = (pid: PortfolioKey, includeDeleted = false) =>
   apiGet<Transaction[]>(`${base}/portfolios/${pid}/transactions`, { include_deleted: includeDeleted || undefined });
 

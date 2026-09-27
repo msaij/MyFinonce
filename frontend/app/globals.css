@@ -274,3 +274,5 @@ select option {
 .info-icon.tooltip-align-left .tooltip-box::after { left: 18px; margin-left: 0; }
 .info-icon.tooltip-align-right .tooltip-box { left: auto; right: -12px; transform: none; }
 .info-icon.tooltip-align-right .tooltip-box::after { left: auto; right: 18px; margin-left: 0; }
+/* Viewport-positioned (see FormulaTooltip `fixed`): the arrow would point at nothing. */
+.info-icon.tooltip-fixed .tooltip-box::after { display: none; }

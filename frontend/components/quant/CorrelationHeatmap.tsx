@@ -6,11 +6,8 @@ import { PlotlyChart } from "@/components/shared/PlotlyChart";
 export interface CorrelationHeatmapProps {
   /** (N x N) Correlation matrix where elements are in [-1.0, 1.0] */
   corrMatrix: number[][];
-  /** Original asset names corresponding to corrMatrix rows/columns */
+  /** Asset names corresponding to corrMatrix rows/columns */
   assetNames: string[];
-  /** Optional HRP quasi-diagonalization cluster order (reorders matrix if provided) */
-  clusterOrder?: string[];
-
   title?: string;
   showAnnotations?: boolean;
   colorscale?: string | [number, string][];
@@ -36,8 +33,7 @@ export function getCellContrastTextColor(z: number): string {
 export function buildCorrelationHeatmapFigure({
   corrMatrix,
   assetNames,
-  clusterOrder,
-  title = "Quasi-Diagonalized Correlation Heatmap",
+  title = "Correlation Heatmap",
   showAnnotations = true,
   colorscale = "RdBu",
   height,
@@ -46,24 +42,10 @@ export function buildCorrelationHeatmapFigure({
     return { data: [], layout: {} };
   }
 
-  // 1. Quasi-diagonalization matrix reordering
-  let orderedNames = assetNames;
-  let zValues = corrMatrix;
+  const orderedNames = assetNames;
+  const zValues = corrMatrix;
 
-  if (clusterOrder && clusterOrder.length === assetNames.length) {
-    const indexMap = clusterOrder.map((name) => assetNames.indexOf(name));
-    const allFound = indexMap.every((idx) => idx !== -1);
-
-    if (allFound) {
-      orderedNames = clusterOrder;
-      const n = clusterOrder.length;
-      zValues = Array.from({ length: n }, (_, i) =>
-        Array.from({ length: n }, (_, j) => Number(corrMatrix[indexMap[i]][indexMap[j]].toFixed(4)))
-      );
-    }
-  }
-
-  // 2. Trace definition matching oracle_build_correlation_heatmap_spec
+  // 1. Trace definition matching oracle_build_correlation_heatmap_spec
   const trace = {
     type: "heatmap",
     z: zValues,
@@ -76,7 +58,7 @@ export function buildCorrelationHeatmapFigure({
     hovertemplate: "<b>%{y}</b> × <b>%{x}</b><br>Correlation: <b>%{z:.4f}</b><extra></extra>",
   };
 
-  // 3. Dynamic contrast in-cell annotations
+  // 2. Dynamic contrast in-cell annotations
   const annotations: Record<string, unknown>[] = [];
   const n = orderedNames.length;
 

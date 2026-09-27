@@ -23,8 +23,7 @@ _registries: list[TTLCache] = []
 def _stable_key(args: tuple, kwargs: dict) -> tuple:
     """Cache key from positional/keyword args, skipping any keyword whose name
     starts with "_" -- mirrors the original app's Streamlit-cache convention
-    (e.g. `_rules_result` in the portfolio advisor) for deliberately excluding
-    an argument that's redundant with other, already-hashed arguments (often
+    for deliberately excluding an argument that's redundant with other, already-hashed arguments (often
     because it's an unhashable DataFrame) from the cache key."""
     filtered_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
     return (args, tuple(sorted(filtered_kwargs.items())))

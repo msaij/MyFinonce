@@ -324,7 +324,7 @@ function QuantAnalysisContent() {
         <>
           {/* Fund metadata header */}
           <div className="mt-3 flex flex-wrap items-center gap-2.5 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
-            <span className="font-bold text-sm" style={{ color: "var(--mf-fg)" }}>{result.profile.scheme_name}</span>
+            <span className="font-bold text-sm" style={{ color: "var(--mf-fg)" }}>{result.profile.display_name ?? result.profile.scheme_name}</span>
             <span>·</span>
             <span className="font-semibold" style={{ color: "var(--mf-fg)" }}>{result.profile.category ?? "Uncategorized"}</span>
             <span>·</span>
@@ -554,7 +554,7 @@ function QuantAnalysisContent() {
                   <p className="mt-2 text-xs md:text-sm leading-relaxed font-normal" style={{ color: "var(--mf-fg)" }}>{intel.fee_drag.text}</p>
                   <div className="mt-3 flex flex-wrap gap-2 text-xs">
                     <span className="rounded-md px-2.5 py-1 border font-medium" style={{ borderColor: "var(--mf-border)", background: "var(--mf-bg)", color: "var(--mf-muted)" }}>
-                      Expense Ratio: <b style={{ color: "var(--mf-fg)" }}>{intel.fee_drag.ter_pct !== null ? `${intel.fee_drag.ter_pct.toFixed(2)}%` : "N/A"}</b>
+                      Expense Ratio: <b style={{ color: "var(--mf-fg)" }}>{intel.fee_drag.ter_pct !== null ? `${intel.fee_drag.ter_pct.toFixed(4)}%` : "N/A"}</b>
                     </span>
                     {intel.fee_drag.gross_alpha_pct !== null && (
                       <span className="rounded-md px-2.5 py-1 border font-medium" style={{ borderColor: "var(--mf-border)", background: "var(--mf-bg)", color: "var(--mf-muted)" }}>
@@ -654,7 +654,7 @@ function QuantAnalysisContent() {
                     <FactorWaterfallChart
                       alphaAnnPct={factorsResult.regression.alpha_annualized_pct}
                       waterfallData={factorsResult.regression.waterfall_data}
-                      schemeName={result?.profile.scheme_name}
+                      schemeName={result?.profile.display_name ?? result?.profile.scheme_name}
                       figure={factorsResult.figures.factor_waterfall}
                     />
                   </div>
@@ -761,7 +761,7 @@ function QuantAnalysisContent() {
                 {factorsResult?.regression.factor_betas ? (
                 <ScenarioStressSimulator
                   schemeCode={schemeCode ?? undefined}
-                  schemeName={result?.profile.scheme_name ?? `Scheme ${schemeCode}`}
+                  schemeName={result?.profile.display_name ?? result?.profile.scheme_name ?? `Scheme ${schemeCode}`}
                   category={result?.profile.category ?? undefined}
                   factorBetas={factorsResult.regression.factor_betas}
                   baselineMaxDrawdown={result?.metrics.max_drawdown_pct}

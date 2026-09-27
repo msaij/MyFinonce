@@ -11,6 +11,7 @@ import { PlanningPanel } from "@/components/holdings/PlanningPanel";
 import { PositionDrawer } from "@/components/holdings/PositionDrawer";
 import { RiskPanel } from "@/components/holdings/RiskPanel";
 import { TransactionDrawer } from "@/components/holdings/TransactionDrawer";
+import { TransactionsTable } from "@/components/holdings/TransactionsTable";
 import { AppShell } from "@/components/layout/AppShell";
 import { Banner } from "@/components/shared/Banner";
 import { DataTable, type ColumnConfig } from "@/components/shared/DataTable";
@@ -23,6 +24,7 @@ import {
   deleteTransaction,
   exportCsvUrl,
   getHoldingsSummary,
+  getRecentChanges,
   listPortfolios,
   listTransactions,
   restoreBackup,
@@ -34,7 +36,23 @@ import {
 } from "@/lib/api/holdings";
 import { formatDate, formatInr, formatSignedPct, toneOf } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
-import { TXN_TYPE_LABELS, formatSignedInr, formatUnits, parsePortfolioKey, positionBadges, xirrReason } from "@/lib/holdings";
+import {
+  excessText,
+  excessTone,
+  formatSignedInr,
+  formatTer,
+  formatUnits,
+  groupTransactionsByFund,
+  heldDays,
+  heldForText,
+  holdingsTotals,
+  investedForText,
+  parsePortfolioKey,
+  positionBadges,
+  windowPendingText,
+  xirrPendingText,
+  xirrReason,
+} from "@/lib/holdings";
 
 const TABS = ["overview", "holdings", "allocation", "risk", "insights", "plan", "transactions"] as const;
 type Tab = (typeof TABS)[number];
@@ -89,6 +107,11 @@ function HoldingsContent() {
     queryFn: () => getHoldingsSummary(pid),
     enabled: portfoliosQ.isSuccess && (pid === "all" || portfolios.some((p) => p.id === pid)),
   });
+  const recentQ = useQuery({
+    queryKey: ["holdings", "recent-changes", pid],
+    queryFn: () => getRecentChanges(pid),
+    enabled: summaryQ.isSuccess,
+  });
   const txnsQ = useQuery({
     queryKey: ["holdings", "transactions", pid],
     queryFn: () => listTransactions(pid),
@@ -132,24 +155,31 @@ function HoldingsContent() {
     () => (summary?.positions ?? []).filter((p) => showClosed || !p.is_closed),
     [summary, showClosed]
   );
+  const txnGroups = useMemo(() => groupTransactionsByFund(txnsQ.data ?? []), [txnsQ.data]);
   const closedCount = (summary?.positions ?? []).filter((p) => p.is_closed).length;
   const noPortfolios = portfoliosQ.isSuccess && active.length === 0;
   const emptyLedger = summary && summary.kpis.transactions === 0;
 
+  const pfName = useMemo(() => new Map(portfolios.map((p) => [p.id, p.name])), [portfolios]);
   const holdingsColumns: ColumnConfig[] = useMemo(
     () => [
       {
         key: "scheme_name",
         label: "Fund",
+        tooltip: "Click a fund for its lots, transactions, NAV chart and expense-ratio detail. Under the name: its SEBI category, the asset class it counts toward on the Allocation tab, and its SEBI riskometer level.",
+        sortValue: (r) => r.display_name,
         render: (row) => {
           const p = row as unknown as Position;
+          const where = pid === "all" && p.portfolio_ids.length > 0 ? p.portfolio_ids.map((i) => pfName.get(i) ?? `#${i}`).join(", ") : null;
           return (
             <div className="min-w-[16rem]">
               <button type="button" className="text-left font-semibold hover:underline" style={{ color: "var(--mf-accent)" }} onClick={() => setDetailCode(p.scheme_code)}>
-                {p.scheme_name ?? p.scheme_code}
+                {p.display_name}
               </button>
-              <div className="text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
-                {[p.category, p.plan_type, p.option_type].filter(Boolean).join(" · ")}
+              <div className="text-[0.7rem]" style={{ color: "var(--mf-muted)" }} title={p.category ?? undefined}>
+                {[p.sebi_category ?? p.category, p.asset_class].filter(Boolean).join(" · ")}
+                {p.riskometer && <> · Risk: {p.riskometer}</>}
+                {where && <> · In {where}</>}
               </div>
               {positionBadges(p).length > 0 && (
                 <div className="mt-0.5 flex flex-wrap gap-1">
@@ -164,14 +194,27 @@ function HoldingsContent() {
           );
         },
       },
-      { key: "units", label: "Units", sortValue: (r) => r.units, render: (_r, v) => formatUnits(v as number) },
-      { key: "avg_cost_nav", label: "Avg cost NAV", format: "number", decimals: 4 },
-      { key: "latest_nav", label: "NAV", render: (r, v) => (v == null ? "-" : <span title={`as of ${formatDate(r.latest_date as string)}`}>{Number(v).toFixed(4)}</span>) },
-      { key: "cost_basis", label: "Invested", format: "inr" },
-      { key: "current_value", label: "Value", format: "inr" },
+      {
+        key: "units", label: "Units", sortValue: (r) => r.units, render: (_r, v) => formatUnits(v as number),
+        tooltip: "Units you hold now, to the 3 decimals AMCs allot. After a unit split they are shown on AMFI's post-split scale.",
+      },
+      {
+        key: "avg_cost_nav", label: "Avg cost NAV", format: "number", decimals: 4,
+        tooltip: "Invested ÷ units: the average NAV you paid for the units you still hold (first in, first out, so redeemed lots no longer count).",
+      },
+      {
+        key: "latest_nav", label: "NAV", render: (r, v) => (v == null ? "-" : <span title={`as of ${formatDate(r.latest_date as string)}`}>{Number(v).toFixed(4)}</span>),
+        tooltip: "AMFI's latest published NAV for the fund. Hover a value for the date it is from.",
+      },
+      {
+        key: "cost_basis", label: "Invested", format: "inr",
+        tooltip: "What the units you still hold cost, first in first out, net of stamp duty. Money from units already redeemed is in Realised, not here.",
+      },
+      { key: "current_value", label: "Value", format: "inr", tooltip: "Units × latest NAV." },
       {
         key: "unrealised_gain",
         label: "Unrealised",
+        tooltip: "Value − Invested, on the units you still hold. The % is on Invested. It is a paper gain until you redeem.",
         sortValue: (r) => r.unrealised_gain,
         render: (r, v) => (
           <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>
@@ -180,65 +223,92 @@ function HoldingsContent() {
           </span>
         ),
       },
-      { key: "day_change", label: "1D ₹", sortValue: (r) => r.day_change, render: (_r, v) => <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>{formatSignedInr(v as number)}</span> },
+      {
+        key: "day_change",
+        label: "1D gain",
+        tooltip: "Rupees gained on the latest NAV move: units held at the previous close × (latest NAV − previous NAV). Units bought on the latest NAV date were bought at it and have not moved yet, so they add nothing. The total matches the 1-day change tile.",
+        sortValue: (r) => r.day_change,
+        render: (_r, v) => <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>{formatSignedInr(v as number)}</span>,
+      },
       {
         key: "xirr_pct",
         label: "XIRR",
+        tooltip: "Your annualised return in this fund, counting when each rupee went in and came out. Withheld for the first 30 days, because annualising a few days' move exaggerates it; the date it will show is given instead.",
         sortValue: (r) => r.xirr_pct,
-        render: (r, v) => (v == null ? <span title={xirrReason(r.xirr_note as string | null)}>—</span> : formatSignedPct(v as number, 2)),
+        render: (r, v) =>
+          v == null ? (
+            <span className="text-xs" style={{ color: "var(--mf-muted)" }} title={xirrReason(r.xirr_note as string | null)}>
+              {r.xirr_note === "too_short" && r.xirr_available_on ? `from ${formatDate(r.xirr_available_on as string)}` : "—"}
+            </span>
+          ) : (
+            formatSignedPct(v as number, 2)
+          ),
       },
-      { key: "realised_gain", label: "Realised", render: (_r, v) => formatSignedInr(v as number) },
-      { key: "weight_pct", label: "Weight", render: (_r, v) => (v == null ? "-" : `${(v as number).toFixed(1)}%`) },
-      { key: "expense_ratio", label: "TER %", render: (r, v) => (v == null ? "-" : <span title={String(r.ter_status ?? "")}>{Number(v).toFixed(2)}</span>) },
-    ],
-    []
-  );
-
-  const txnColumns: ColumnConfig[] = useMemo(
-    () => [
-      { key: "trade_date", label: "Date", format: "date" },
-      { key: "txn_type", label: "Type", render: (_r, v) => TXN_TYPE_LABELS[v as keyof typeof TXN_TYPE_LABELS] ?? String(v) },
       {
-        key: "scheme_name",
-        label: "Fund",
-        render: (r) => (
-          <button type="button" className="text-left hover:underline" style={{ color: "var(--mf-accent)" }} onClick={() => setDetailCode(r.scheme_code as number)}>
-            {String(r.scheme_name ?? r.scheme_code)}
-          </button>
+        key: "realised_gain",
+        label: "Realised",
+        tooltip: "Gain or loss already booked on units you redeemed or switched out, first in first out. Dividends paid out are listed underneath when there are any.",
+        render: (r, v) => (
+          <span>
+            {formatSignedInr(v as number)}
+            {(r.dividend_income as number) > 0 && <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>+ {formatInr(r.dividend_income as number)} dividends</span>}
+          </span>
         ),
       },
-      ...(pid === "all"
-        ? [{ key: "portfolio_id", label: "Portfolio", render: (_r: Record<string, unknown>, v: unknown) => portfolios.find((p) => p.id === v)?.name ?? String(v) } as ColumnConfig]
-        : []),
-      { key: "amount", label: "Amount", sortValue: (r) => Number(r.amount), render: (_r, v) => formatInr(Number(v)) },
-      { key: "units", label: "Units", sortValue: (r) => Number(r.units), render: (_r, v) => formatUnits(v as string) },
-      { key: "nav", label: "NAV", sortValue: (r) => Number(r.nav), render: (r, v) => `${Number(v).toFixed(4)}${r.nav_source === "user" ? " ✎" : ""}` },
-      { key: "stamp_duty", label: "Stamp", render: (_r, v) => (Number(v) > 0 ? formatInr(Number(v)) : "-") },
-      { key: "notes", label: "Notes", render: (_r, v) => <span className="text-xs">{(v as string) ?? ""}</span> },
       {
-        key: "id",
-        label: "",
-        sortable: false,
+        key: "weight_pct", label: "Weight", render: (_r, v) => (v == null ? "-" : `${(v as number).toFixed(1)}%`),
+        tooltip: "This fund's share of the portfolio's value today.",
+      },
+      {
+        key: "expense_ratio", label: "TER %",
+        tooltip: "Total expense ratio exactly as AMFI publishes it: the yearly fee the fund deducts from its NAV. Hover a value for its source status. Total row: the value-weighted average across your funds.",
+        render: (r, v) => (v == null ? "-" : <span title={String(r.ter_status ?? "")}>{formatTer(v as number)}</span>),
+      },
+      {
+        key: "annual_fee", label: "Yearly fee",
+        tooltip: "Value × TER: roughly what the expense ratio costs you over a year at today's value. It is taken out of the NAV daily, so it is already inside every return shown here. It is not a separate bill.",
+        render: (_r, v) => (v == null ? "-" : formatInr(v as number)),
+      },
+      {
+        key: "first_date", label: "Held for",
+        tooltip: "Time since your first purchase in this fund, up to its latest NAV date. Useful for exit loads, and for the holding periods that set how gains are taxed.",
+        sortValue: (r) => heldDays(r.first_date as string | null, r.latest_date as string | null),
         render: (r) => {
-          const t = r as unknown as Transaction;
-          return (
-            <div className="flex gap-2 text-xs font-semibold">
-              {!t.switch_group && (
-                <button type="button" style={{ color: "var(--mf-accent)" }} onClick={() => { setEditing(t); setPrefill(null); setDrawerOpen(true); }}>
-                  Edit
-                </button>
-              )}
-              <button type="button" style={{ color: "var(--mf-danger)" }} disabled={del.isPending} onClick={() => { setActionError(null); del.mutate(t.id); }}>
-                Delete
-              </button>
-            </div>
-          );
+          const days = heldDays(r.first_date as string | null, r.latest_date as string | null);
+          return days === null ? "-" : <span title={`First purchase ${formatDate(r.first_date as string)}`}>{heldForText(days)}</span>;
         },
       },
     ],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pid, portfolios, del.isPending]
+    [pid, pfName]
   );
+  const totals = useMemo(() => holdingsTotals(positions), [positions]);
+  const holdingsFooter: Record<string, React.ReactNode> | undefined = k
+    ? {
+        scheme_name: `Total (${positions.length} fund${positions.length === 1 ? "" : "s"})`,
+        cost_basis: formatInr(totals.invested),
+        current_value: formatInr(totals.value),
+        unrealised_gain: (
+          <span className={toneOf(totals.unrealised) === "pos" ? "mf-pos" : toneOf(totals.unrealised) === "neg" ? "mf-neg" : ""}>
+            {formatSignedInr(totals.unrealised)}
+            <span className="block text-[0.7rem]">{formatSignedPct(totals.unrealisedPct, 2)}</span>
+          </span>
+        ),
+        day_change: <span className={toneOf(totals.day) === "pos" ? "mf-pos" : toneOf(totals.day) === "neg" ? "mf-neg" : ""}>{formatSignedInr(totals.day)}</span>,
+        xirr_pct:
+          k.xirr_pct !== null ? (
+            <span title="The whole portfolio's XIRR, closed funds included">{formatSignedPct(k.xirr_pct, 2)}</span>
+          ) : (
+            <span className="text-xs font-medium" style={{ color: "var(--mf-muted)" }}>{xirrPendingText(k.xirr_note, k.xirr_available_on)}</span>
+          ),
+        realised_gain: formatSignedInr(totals.realised),
+        weight_pct: `${totals.weight.toFixed(1)}%`,
+        expense_ratio:
+          k.weighted_ter_pct !== null ? (
+            <span title={`Value-weighted over ${k.ter_coverage_pct?.toFixed(1)}% of the portfolio's value (the funds with a TER on record)`}>{formatTer(k.weighted_ter_pct)}</span>
+          ) : "-",
+        annual_fee: totals.annualFee !== null ? formatInr(totals.annualFee) : "-",
+      }
+    : undefined;
 
   return (
     <AppShell pageContext={{ label: "Holdings", value: current?.name ?? "All portfolios", sub: k ? formatInr(k.current_value) : undefined }}>
@@ -271,31 +341,125 @@ function HoldingsContent() {
               <StatCard
                 title="Invested"
                 value={formatInr(k.invested)}
-                sub={`${k.open_positions} open holding${k.open_positions === 1 ? "" : "s"}`}
-                tooltip={<FormulaTooltip label="Invested" description="Cost basis of the units you still hold (FIFO). Money from units already sold is in Realised gain." />}
+                sub={`Across ${k.open_positions} fund${k.open_positions === 1 ? "" : "s"}`}
+                tooltip={
+                  <FormulaTooltip
+                    label="Invested"
+                    formula="Σ units × purchase NAV (units still held, FIFO)"
+                    description="The value allotted to you, as on your AMC statement or Coin. Stamp duty is not included; it is shown under Total gain. Units already sold move to Realised gain."
+                  />
+                }
               />
-              <StatCard title="Unrealised gain" value={formatSignedInr(k.unrealised_gain)} tone={toneOf(k.unrealised_gain)} sub={formatSignedPct(k.unrealised_pct, 2)} subTone={toneOf(k.unrealised_pct)} />
+              {/* Unrealised gain used to have its own tile. For a buy-and-hold ledger it
+                  differs from Total gain only by stamp duty, so two tiles said one thing;
+                  it now leads this tile's sub-line and the full split is in the tooltip. */}
               <StatCard
                 title="Total gain"
                 value={formatSignedInr(k.total_gain)}
                 tone={toneOf(k.total_gain)}
-                sub={`Realised ${formatSignedInr(k.realised_gain)} · Dividends ${formatInr(k.dividend_income)}`}
-                tooltip={<FormulaTooltip label="Total gain" formula="unrealised + realised (FIFO) + dividends" />}
+                sub={`${k.total_gain_pct !== null ? `${formatSignedPct(k.total_gain_pct, 2)}${k.avg_days_invested != null ? ` in ${investedForText(k.avg_days_invested)}` : ""} · ` : ""}unrealised ${formatSignedInr(k.unrealised_gain)}`}
+                subTone={toneOf(k.total_gain_pct ?? k.total_gain)}
+                tooltip={
+                  <FormulaTooltip
+                    label="Total gain"
+                    formula="current value + money taken out − money put in"
+                    description={`What you have gained on the cash you actually paid (${formatInr(k.net_contributed)} net). Made up of unrealised ${formatSignedInr(k.unrealised_gain)} + realised ${formatSignedInr(k.realised_gain)} + dividends ${formatInr(k.dividend_income)} − stamp duty ${formatInr(k.stamp_duty)}; the parts can differ by a few paise because AMCs round units to 3 decimals.${
+                      k.avg_days_invested != null
+                        ? ` Your money has been invested for ${Math.round(k.avg_days_invested).toLocaleString("en-IN")} days on average: each rupee counts from the day it went in (to the day it came back out, oldest first, if sold), weighted by amount; switches between your funds keep the original date.${
+                            k.days_since_first_investment != null && k.first_investment_date
+                              ? ` Your first investment was ${k.days_since_first_investment.toLocaleString("en-IN")} days ago, on ${formatDate(k.first_investment_date)}.`
+                              : ""
+                          }`
+                        : ""
+                    }`}
+                  />
+                }
+              />
+              <StatCard
+                title="Return since start"
+                value={k.twr_since_start_pct !== null ? formatSignedPct(k.twr_since_start_pct, 2) : "—"}
+                tone={toneOf(k.twr_since_start_pct)}
+                sub={
+                  excessText(k.excess_since_start_pp) ||
+                  (k.first_investment_date ? `Time-weighted, since ${formatDate(k.first_investment_date)}` : "")
+                }
+                subTone={excessTone(k.excess_since_start_pp)}
+                tooltip={
+                  <FormulaTooltip
+                    label="Return since start"
+                    formula={"Π (1 + rₜ) − 1,  rₜ = (Vₜ − Fₜ) / Vₜ₋₁ − 1"}
+                    description={`How your funds have done since ${k.first_investment_date ? formatDate(k.first_investment_date) : "your first investment"}, with the timing of your deposits taken out, so it is directly comparable with a benchmark and is not annualised.${k.benchmark_since_start_pct !== null ? ` Over the same days your funds' peer groups returned ${formatSignedPct(k.benchmark_since_start_pct, 2)}` + (k.benchmark_name ? ` (${k.benchmark_name}).` : ".") : ""} XIRR, beside it, is how your money did given when you invested it.`}
+                  />
+                }
               />
               <StatCard
                 title="XIRR"
                 value={k.xirr_pct !== null ? formatSignedPct(k.xirr_pct, 2) : "—"}
                 tone={toneOf(k.xirr_pct)}
-                sub={k.xirr_pct === null ? xirrReason(k.xirr_note) : "Money-weighted, annualised"}
+                sub={k.xirr_pct === null ? xirrPendingText(k.xirr_note, k.xirr_available_on) : "Money-weighted, annualised"}
                 tooltip={
                   <FormulaTooltip
                     label="XIRR"
                     formula="Σ CFᵢ / (1 + r)^(tᵢ / 365.25) = 0"
-                    description="The annual rate that makes every rupee you put in and took out, plus today's value, net to zero. Switches between your own funds are internal and excluded."
+                    description="The annual rate that makes every rupee you put in and took out, plus today's value, net to zero. Switches between your own funds are internal and excluded. Withheld for the first 30 days, because annualising a few days' return turns small moves into absurd yearly rates."
                   />
                 }
               />
-              <StatCard title="1-day change" value={formatSignedInr(k.day_change)} tone={toneOf(k.day_change)} sub={formatSignedPct(k.day_change_pct, 2)} subTone={toneOf(k.day_change_pct)} />
+              <StatCard
+                title="1-day change"
+                value={formatSignedInr(k.day_change)}
+                tone={toneOf(k.day_change)}
+                sub={`${formatSignedPct(k.day_change_pct, 2)}${k.day_benchmark_pct !== null ? ` · peers ${formatSignedPct(k.day_benchmark_pct, 2)}` : ""}`}
+                subTone={toneOf(k.day_change_pct)}
+                tooltip={
+                  <FormulaTooltip
+                    label="1-day change"
+                    formula="Vₜ − Vₜ₋₁ − Fₜ"
+                    description="The last NAV day on the same time-weighted basis as the windows below, so anything you bought or sold that day is taken out first and is never counted as a gain. The 1D ₹ column in the table is each fund's own NAV move on the units held now, so the two need not add up."
+                  />
+                }
+              />
+            </div>
+          )}
+
+          {k && !emptyLedger && (recentQ.data?.windows?.length ?? 0) > 0 && (
+            <div className="mt-3">
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                {recentQ.data!.windows.map((w) => (
+                  <StatCard
+                    key={w.days}
+                    title={`Last ${w.days} days`}
+                    value={w.available ? formatSignedPct(w.change_pct, 2) : "—"}
+                    tone={w.available ? toneOf(w.change_pct) : ""}
+                    // The peers' figure sits beside the rupees so the two percentages can be
+                    // read against each other at a glance; the sub keeps the rupee gain's
+                    // tone, because colouring a positive "+₹1,215" red for trailing the
+                    // benchmark would contradict its own sign.
+                    sub={
+                      w.available
+                        ? `${formatSignedInr(w.gain)}${w.benchmark_change_pct !== null ? ` · peers ${formatSignedPct(w.benchmark_change_pct, 2)}` : ""}`
+                        : windowPendingText(w.days_needed)
+                    }
+                    subTone={w.available ? toneOf(w.gain) : "neutral"}
+                    tooltip={
+                      w.available ? (
+                        <FormulaTooltip
+                          label={`Last ${w.days} NAV days`}
+                          description={`${w.start ? `From ${formatDate(w.start)}, time-weighted. ` : ""}Averages ${formatSignedPct(w.avg_daily_pct, 3)} a day, compounded.${w.excess_pp !== null ? ` ${excessText(w.excess_pp).replace(/^./, (c) => c.toUpperCase())} (${recentQ.data?.benchmark_name ?? "benchmark"}).` : ""}`}
+                        />
+                      ) : undefined
+                    }
+                  />
+                ))}
+              </div>
+              <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Movement of the holdings over the last few NAV days, time-weighted — money paid in during a window is not counted as a
+                gain.{" "}
+                {recentQ.data?.benchmark_name && !recentQ.data.benchmark_name.startsWith("Category blend")
+                  ? `“Peers” is your chosen benchmark, ${recentQ.data.benchmark_name}, over the same window.`
+                  : "“Peers” is the same window for the average fund in each of your funds’ SEBI categories, weighted like your portfolio."}
+                {recentQ.data?.as_of ? ` NAVs as of ${formatDate(recentQ.data.as_of)}.` : ""}
+              </p>
             </div>
           )}
 
@@ -366,14 +530,29 @@ function HoldingsContent() {
                   Show {closedCount} fully redeemed holding{closedCount === 1 ? "" : "s"}
                 </label>
               )}
-              <DataTable columns={holdingsColumns} rows={positions as unknown as Record<string, unknown>[]} keyField="scheme_code" />
+              <DataTable columns={holdingsColumns} rows={positions as unknown as Record<string, unknown>[]} keyField="scheme_code" footer={holdingsFooter} />
+              <p className="mt-2 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Valued at each fund&apos;s latest AMFI NAV{summary.as_of ? ` (up to ${formatDate(summary.as_of)})` : ""}. The total row adds up the funds shown
+                {closedCount > 0 && !showClosed ? "; fully redeemed funds are hidden, but their realised gains still count on the Performance tab" : ""}.
+              </p>
             </div>
           )}
 
           {tab === "transactions" && !emptyLedger && (
             <div className="mt-4">
               {txnsQ.isLoading && <div className="text-sm" style={{ color: "var(--mf-muted)" }}>Loading ledger…</div>}
-              {txnsQ.data && <DataTable columns={txnColumns} rows={[...txnsQ.data].reverse() as unknown as Record<string, unknown>[]} keyField="id" />}
+              {/* Without this the tab renders blank on a failed fetch, which reads as "no transactions". */}
+              {txnsQ.isError && <Banner level="danger">{(txnsQ.error as Error).message}</Banner>}
+              {txnsQ.data && (
+                <TransactionsTable
+                  groups={txnGroups}
+                  portfolioName={pid === "all" ? (id) => portfolios.find((p) => p.id === id)?.name ?? `#${id}` : undefined}
+                  onOpenFund={setDetailCode}
+                  onEdit={(t) => { setEditing(t); setPrefill(null); setDrawerOpen(true); }}
+                  onDelete={(t) => { setActionError(null); del.mutate(t.id); }}
+                  deleting={del.isPending}
+                />
+              )}
             </div>
           )}
 

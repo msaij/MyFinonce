@@ -468,7 +468,9 @@ def generate_stress_figure(scenarios: List[Dict[str, Any]], scheme_name: str) ->
     fig.add_trace(go.Bar(
         x=names,
         y=fund_dds,
-        name=scheme_name[:25],
+        # Full label: slicing a raw name to 25 characters rendered a fund and its
+        # Direct/Regular twin as the same legend entry.
+        name=scheme_name,
         marker_color="#DC2626",
         text=[f"{v:.2f}%" for v in fund_dds],
         textposition="outside",

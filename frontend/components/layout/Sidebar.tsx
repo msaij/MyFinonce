@@ -24,17 +24,27 @@ import { StatusPill } from "./StatusPill";
  * read-only sidebar. This shows status only for now.
  */
 
-const NAV_ITEMS = [
-  { href: "/", label: "Overview" },
-  { href: "/holdings", label: "Holdings" },
-  { href: "/screener", label: "Scheme Screener" },
-  { href: "/compare", label: "Compare & Simulate" },
-  { href: "/quant", label: "Quantitative MF Analysis" },
-  { href: "/portfolio", label: "Portfolio" },
+// A group with no title renders its links without a heading: standalone pages that belong to no domain.
+const NAV_GROUPS: { title: string | null; items: { href: string; label: string }[] }[] = [
+  { title: null, items: [{ href: "/calculator", label: "Calculator" }] },
+  { title: "Stock Market", items: [{ href: "/nse-ipo", label: "NSE IPO" }] },
+  {
+    title: "Mutual Funds",
+    // Market overview, then your own portfolio, then single-fund research; data upkeep last.
+    items: [
+      { href: "/", label: "Overview" },
+      { href: "/holdings", label: "Holdings" },
+      { href: "/screener", label: "Scheme Screener" },
+      { href: "/compare", label: "Compare & Simulate" },
+      { href: "/quant", label: "Quantitative MF Analysis" },
+      { href: "/admin", label: "Data Management" },
+    ],
+  },
 ];
-const OPS_ITEMS = [{ href: "/admin", label: "Data Management" }];
 
-export function Sidebar({ pageContext }: { pageContext?: { label: string; value: string; sub?: string } }) {
+const isActive = (pathname: string, href: string) => pathname === href || (href !== "/" && pathname.startsWith(href));
+
+export function Sidebar({ pageContext, showScope = true }: { pageContext?: { label: string; value: string; sub?: string }; showScope?: boolean }) {
   const pathname = usePathname();
   const { preset, start, end, planType, optionType } = useDateRangeStore();
   const [telemetryOpen, setTelemetryOpen] = useState(false);
@@ -73,55 +83,51 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
       }}
     >
       <div className="flex items-center gap-2">
-        <div className="text-xl font-bold tracking-tight">🇮🇳 MF Analytics</div>
+        <div className="text-xl font-bold tracking-tight">myFinonce</div>
       </div>
 
       <nav className="flex flex-col gap-1">
-        {NAV_ITEMS.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            className="rounded-lg px-3 py-1.5 text-sm"
-            style={{
-              background: pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href)) ? "var(--mf-accent-bg)" : "transparent",
-              color: pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href)) ? "var(--mf-accent)" : "var(--mf-fg)",
-              fontWeight: pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href)) ? 600 : 400,
-            }}
-          >
-            {item.label}
-            {item.href === "/holdings" && unackedAlerts > 0 && (
-              <span
-                className="ml-2 rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold"
-                style={{ background: "var(--mf-danger)", color: "#fff" }}
-                aria-label={`${unackedAlerts} unread holdings alert${unackedAlerts === 1 ? "" : "s"}`}
-              >
-                {unackedAlerts}
-              </span>
+        {NAV_GROUPS.map((group, gi) => (
+          <div key={group.title ?? `ungrouped-${gi}`} className={`flex flex-col gap-1 ${gi === 0 ? "" : "mt-3"}`}>
+            {group.title && (
+              <div className="mb-1 text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
+                {group.title}
+              </div>
             )}
-          </Link>
-        ))}
-        <div className="mt-3 mb-1 text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
-          Ops
-        </div>
-        {OPS_ITEMS.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            className="rounded-lg px-3 py-1.5 text-sm"
-            style={{
-              background: pathname === item.href ? "var(--mf-accent-bg)" : "transparent",
-              color: pathname === item.href ? "var(--mf-accent)" : "var(--mf-fg)",
-              fontWeight: pathname === item.href ? 600 : 400,
-            }}
-          >
-            {item.label}
-          </Link>
+            {group.items.map((item) => {
+              const active = isActive(pathname, item.href);
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className="rounded-lg px-3 py-1.5 text-sm"
+                  style={{
+                    background: active ? "var(--mf-accent-bg)" : "transparent",
+                    color: active ? "var(--mf-accent)" : "var(--mf-fg)",
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {item.label}
+                  {item.href === "/holdings" && unackedAlerts > 0 && (
+                    <span
+                      className="ml-2 rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold"
+                      style={{ background: "var(--mf-danger)", color: "#fff" }}
+                      aria-label={`${unackedAlerts} unread holdings alert${unackedAlerts === 1 ? "" : "s"}`}
+                    >
+                      {unackedAlerts}
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
+          </div>
         ))}
       </nav>
 
       <div className="mt-2 flex flex-col gap-2">
         <StatusPill label={pillLabel} level={pillLevel} />
 
+        {showScope && (
         <div className="filter-box">
           <div className="text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
             Active Scope
@@ -140,6 +146,7 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
             <span className="font-medium" style={{ color: "var(--mf-accent)" }}>{optionType}</span>
           </div>
         </div>
+        )}
 
         {pageContext && (
           <div className="filter-box">
@@ -177,8 +184,11 @@ export function Sidebar({ pageContext }: { pageContext?: { label: string; value:
             {status.ter_official_schemes !== undefined && status.ter_official_schemes > 0 && (
               <div>• Official TER Schemes: {status.ter_official_schemes.toLocaleString()}</div>
             )}
+            {/* One row per change in a scheme's TER, not per daily disclosure: AMFI
+                republishes identical figures every day and those collapse into a single
+                period, so this is far smaller than the number of files fetched. */}
             {status.ter_records_count !== undefined && status.ter_records_count > 0 && (
-              <div>• Dated TER Disclosures: {status.ter_records_count.toLocaleString()}</div>
+              <div>• TER Periods Stored: {status.ter_records_count.toLocaleString()}</div>
             )}
             <div>
               • Coverage:{" "}

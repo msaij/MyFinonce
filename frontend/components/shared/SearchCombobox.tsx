@@ -121,7 +121,7 @@ export function SearchCombobox({
   const handleSelect = (scheme: SchemeResult) => {
     onSelect(scheme);
     if (!isControlled) {
-      setInternalQuery(scheme.scheme_name);
+      setInternalQuery(scheme.display_label ?? scheme.scheme_name);
     }
     setOpen(false);
   };
@@ -199,7 +199,9 @@ export function SearchCombobox({
             >
               <div className="flex items-start justify-between gap-3">
                 <span className="text-xs font-semibold leading-snug break-words" style={{ color: "var(--mf-fg)" }}>
-                  {scheme.scheme_name}
+                  {/* The search endpoint already returns the app-wide label; showing the
+                      bare name made two plan/option variants of one fund look identical. */}
+                  {scheme.display_label ?? scheme.scheme_name}
                 </span>
                 <span className="flex shrink-0 items-center gap-1">
                   <Link

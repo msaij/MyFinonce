@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from app.db.connection import fetchdf, get_connection
+from app.db.queries import format_scheme_display_name
 
 PORTFOLIO_COLUMNS = (
     "id", "name", "owner_label", "benchmark_scheme_code", "color", "notes",
@@ -195,7 +196,11 @@ def navs_on_dates(pairs: Iterable[Tuple[int, datetime.date]]) -> Dict[Tuple[int,
 SCHEME_META_COLUMNS = (
     "scheme_code", "scheme_name", "fund_house", "category", "broad_category", "plan_type",
     "option_type", "isin", "expense_ratio", "ter_status", "latest_date", "latest_nav",
-    "is_active", "change_1d_pct", "return_1y_pct",
+    # nav_1d_ago, not just change_1d_pct: a position's rupee day change is
+    # units x (latest_nav - nav_1d_ago), which needs both NAVs, not a rounded percentage.
+    "nav_1d_ago", "is_active", "change_1d_pct", "return_1y_pct",
+    "ter_base_expense_ratio", "ter_brokerage_cost_pct", "ter_transaction_cost_pct",
+    "ter_statutory_levies_pct", "ter_as_of_date",
 )
 
 
@@ -208,12 +213,15 @@ def scheme_meta(codes: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         return {}
     with get_connection() as con:
         try:
+            # The riskometer lives on schemes only; summary_table is a rebuildable price cache.
             df = fetchdf(con.execute(
-                f"SELECT {', '.join(SCHEME_META_COLUMNS)} FROM summary_table WHERE scheme_code = ANY(%s)",
+                f"SELECT {', '.join('st.' + c for c in SCHEME_META_COLUMNS)}, s.riskometer"
+                " FROM summary_table st LEFT JOIN schemes s ON s.scheme_code = st.scheme_code"
+                " WHERE st.scheme_code = ANY(%s)",
                 (codes,),
             ))
         except Exception:
-            df = pd.DataFrame(columns=SCHEME_META_COLUMNS)
+            df = pd.DataFrame(columns=[*SCHEME_META_COLUMNS, "riskometer"])
         found = set(int(c) for c in df["scheme_code"]) if not df.empty else set()
         missing = [c for c in codes if c not in found]
         if missing:
@@ -222,9 +230,12 @@ def scheme_meta(codes: Sequence[int]) -> Dict[int, Dict[str, Any]]:
                 SELECT s.scheme_code, s.scheme_name, s.fund_house, s.category,
                        NULL::text AS broad_category, s.plan_type, s.option_type, s.isin,
                        s.expense_ratio, s.ter_status, l.nav_date AS latest_date,
-                       l.nav AS latest_nav, NULL::boolean AS is_active,
+                       l.nav AS latest_nav, NULL::double precision AS nav_1d_ago,
+                       NULL::boolean AS is_active,
                        NULL::double precision AS change_1d_pct,
-                       NULL::double precision AS return_1y_pct
+                       NULL::double precision AS return_1y_pct,
+                       s.ter_base_expense_ratio, s.ter_brokerage_cost_pct, s.ter_transaction_cost_pct,
+                       s.ter_statutory_levies_pct, s.ter_as_of_date, s.riskometer
                 FROM schemes s
                 LEFT JOIN LATERAL (
                     SELECT nav_date, nav FROM nav_history
@@ -237,8 +248,19 @@ def scheme_meta(codes: Sequence[int]) -> Dict[int, Dict[str, Any]]:
             df = pd.concat([df, extra], ignore_index=True) if not df.empty else extra
     out: Dict[int, Dict[str, Any]] = {}
     for rec in df.to_dict(orient="records"):
+        rec["display_name"] = display_name(rec)
         out[int(rec["scheme_code"])] = rec
     return out
+
+
+def display_name(rec: Dict[str, Any]) -> str:
+    """The app-wide fund label, "Mirae Asset Liquid Fund (Direct - Growth) [118859]", as the charts
+    and fund search show it. The stored scheme_name is the base fund, shared by every variant."""
+    def text(k: str) -> str:
+        v = rec.get(k)
+        return v if isinstance(v, str) else ""  # pandas hands back NaN for missing values
+    return format_scheme_display_name(text("scheme_name") or f"Scheme {rec['scheme_code']}",
+                                      text("plan_type"), text("option_type"), rec["scheme_code"])
 
 
 def scheme_exists(scheme_code: int) -> bool:
@@ -360,6 +382,12 @@ def save_goal(goal_id: Optional[int], fields: Dict[str, Any], portfolio_ids: Opt
     return get_goal(goal_id)  # type: ignore[return-value]
 
 
+def delete_goal(goal_id: int) -> bool:
+    """Goals are planning config, not ledger data; goal_portfolios cascade."""
+    with get_connection() as con:
+        return con.execute("DELETE FROM goals WHERE id = %s", (goal_id,)).rowcount > 0
+
+
 # --- Alerts --------------------------------------------------------------------------
 
 RULE_COLUMNS = ("id", "portfolio_id", "kind", "threshold", "active", "created_at")
@@ -409,6 +437,32 @@ def ack_alerts(ids: Optional[Sequence[int]]) -> int:
         if ids is None:
             return con.execute("UPDATE holding_alerts SET ack_at = now() WHERE ack_at IS NULL").rowcount
         return con.execute("UPDATE holding_alerts SET ack_at = now() WHERE id = ANY(%s) AND ack_at IS NULL", (list(ids),)).rowcount
+
+
+# --- Expense-ratio spread (for the TER sanity check) ----------------------------------------
+
+def category_ter_spread(groups: Sequence[Tuple[str, str]]) -> Dict[Tuple[str, str], Dict[str, float]]:
+    """p10 / median / p90 of official TERs per (category, plan_type) among active
+    schemes -- the yardstick a single fund's TER is judged against."""
+    groups = sorted({(c, p) for c, p in groups if c and p})
+    if not groups:
+        return {}
+    with get_connection() as con:
+        rows = con.execute(
+            """
+            SELECT s.category, s.plan_type, count(*),
+                   percentile_cont(0.1) WITHIN GROUP (ORDER BY s.expense_ratio),
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY s.expense_ratio),
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY s.expense_ratio)
+            FROM summary_table s
+            JOIN unnest(%s::text[], %s::text[]) AS g(category, plan_type)
+              ON g.category = s.category AND g.plan_type = s.plan_type
+            WHERE s.is_active AND s.ter_status = 'official' AND s.expense_ratio IS NOT NULL
+            GROUP BY s.category, s.plan_type
+            """,
+            ([c for c, _ in groups], [p for _, p in groups]),
+        ).fetchall()
+    return {(r[0], r[1]): {"peers": int(r[2]), "p10": float(r[3]), "median": float(r[4]), "p90": float(r[5])} for r in rows}
 
 
 # --- Peer ranking (for insights) ----------------------------------------------------------

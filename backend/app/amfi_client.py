@@ -152,32 +152,51 @@ class AmfiClient:
             logger.error(f"Error downloading 90-day report for mf_id={mf_id}: {e}")
             return None
 
+    #: AMFI's scheme-type codes for the NAV-history report: open-ended, close-ended, interval.
+    #: Since ~2026-09-23 the all-AMC report is served only per type -- a request without `tp`
+    #: gets the portal's HTML form page with HTTP 200 (the failure ChunkDownloadError was
+    #: added for), and tp=4 does not exist.
+    NAV_HISTORY_SCHEME_TYPES = (1, 2, 3)
+
     def download_bulk_historical_report(self, from_date: datetime.date, to_date: datetime.date) -> Optional[str]:
         """
         Downloads bulk historical NAV report for ALL funds across India for up to 90 days.
         Dates are formatted as DD-Mon-YYYY.
+
+        One request per scheme type, joined into one text: each part carries its own
+        "Scheme Code" header, which the parser simply re-reads. All or nothing -- a part
+        that fails or comes back as anything but a report fails the whole download, because
+        callers checkpoint what they receive and a silently missing scheme type would be
+        recorded as done.
         """
         frmdt_str = from_date.strftime("%d-%b-%Y")
         todt_str = to_date.strftime("%d-%b-%Y")
-        url = f"{self.NAV_HISTORY_URL}?frmdt={frmdt_str}&todt={todt_str}"
-        logger.info(f"Requesting bulk AMFI historical report: {url}")
-        req = urllib.request.Request(url, headers=self.headers)
-        try:
-            # 60s, not the old 120s: this is the same NAV-history endpoint
-            # download_amc_90d_report already calls with a 60s timeout below, just
-            # unfiltered by AMC -- there's no reason a wider report should need double the
-            # patience, and a slow/hung request here is also what the historical backfill's
-            # should_stop check waits behind (see amfi_sync._historical_backfill_worker) --
-            # failing faster halves that worst-case "Stop doesn't seem to do anything" wait.
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=60) as resp:
-                if resp.status == 200:
-                    return resp.read().decode("utf-8", errors="ignore")
-                else:
-                    logger.warning(f"HTTP {resp.status} for bulk report {frmdt_str} to {todt_str}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error downloading bulk report {frmdt_str} to {todt_str}: {e}")
-            return None
+        parts = []
+        for tp in self.NAV_HISTORY_SCHEME_TYPES:
+            url = f"{self.NAV_HISTORY_URL}?tp={tp}&frmdt={frmdt_str}&todt={todt_str}"
+            logger.info(f"Requesting bulk AMFI historical report: {url}")
+            req = urllib.request.Request(url, headers=self.headers)
+            try:
+                # 60s, not the old 120s: this is the same NAV-history endpoint
+                # download_amc_90d_report already calls with a 60s timeout below, just
+                # unfiltered by AMC -- there's no reason a wider report should need double the
+                # patience, and a slow/hung request here is also what the historical backfill's
+                # should_stop check waits behind (see amfi_sync._historical_backfill_worker) --
+                # failing faster halves that worst-case "Stop doesn't seem to do anything" wait.
+                with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=60) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"HTTP {resp.status} for bulk report tp={tp} {frmdt_str} to {todt_str}")
+                        return None
+                    body = resp.read().decode("utf-8", errors="ignore")
+            except Exception as e:
+                logger.error(f"Error downloading bulk report tp={tp} {frmdt_str} to {todt_str}: {e}")
+                return None
+            if "scheme code" not in body[:4000].lower():
+                logger.warning(f"Bulk report tp={tp} {frmdt_str} to {todt_str} is not a NAV report "
+                               f"({len(body):,} bytes) -- the portal is likely serving its form page.")
+                return None
+            parts.append(body)
+        return "\n".join(parts)
 
     def download_daily_report(self) -> Optional[str]:
         """Downloads the single bulk daily closing NAV file for all funds across India."""
@@ -229,6 +248,7 @@ class AmfiClient:
             "plan": 2,
             "option": 3,
             "isin": [4, 5],
+            "isin_reinvest": 5,
             "nav": 6,
             "date": 7
         }
@@ -243,6 +263,10 @@ class AmfiClient:
         total_lines = raw_text.count("\n") + 1
         logger.info(f"parse_amfi_nav_lines: {len(raw_text):,} chars, ~{total_lines:,} lines to process.")
         line_count = 0
+        # Whether a header line has been seen yet. Rows before any header are read through
+        # the fallback indices above, which say where a column *usually* is -- not that this
+        # file carries it -- so they can never count as AMFI having reported the column.
+        header_seen = False
 
         for line in raw_text.splitlines():
             line_count += 1
@@ -308,11 +332,27 @@ class AmfiClient:
                         new_map["option"] = i
                     elif "isin" in col:
                         new_map.setdefault("isin", []).append(i)
+                        # Which of the two ISIN columns this is matters, not just that it
+                        # holds an ISIN: only a scheme with a dividend option is issued a
+                        # reinvestment ISIN, so that column identifies IDCW schemes whose
+                        # Option field AMFI filled in wrongly or left blank.
+                        if "reinvest" in col:
+                            new_map["isin_reinvest"] = i
                     elif "net asset value" in col:
                         new_map["nav"] = i
                     elif "date" in col:
                         new_map["date"] = i
                 col_map.update(new_map)
+                # A header that does not declare Plan, Option or the reinvestment ISIN must
+                # not inherit the fallback index for it: that index then points at whatever
+                # column this layout puts there (a scheme name, a NAV), which would be
+                # recorded as something AMFI "stated". It matters most for the reinvestment
+                # column, whose placeholder now CLEARS the stored ISIN -- a column that is not
+                # in the file has to read as "not reported", never as "reported blank".
+                for optional_col in ("plan", "option", "isin_reinvest"):
+                    if optional_col not in new_map:
+                        col_map.pop(optional_col, None)
+                header_seen = True
                 continue
 
             # Data row
@@ -347,6 +387,17 @@ class AmfiClient:
                             isin = candidate
                             break
 
+                reinvest_idx = col_map.get("isin_reinvest")
+                reinvest_isin = parts[reinvest_idx] if reinvest_idx is not None and reinvest_idx < len(parts) else ""
+                has_reinvest_isin = bool(reinvest_isin) and reinvest_isin not in ("-", "None", "null")
+                # Two different kinds of "no reinvestment ISIN", and the merge treats them
+                # oppositely: a header that carries the column and a row that leaves it blank
+                # is AMFI saying the scheme has none (clear any stored one); a file without the
+                # column says nothing at all (keep what is stored). A row too short to reach
+                # the column is the second kind -- a truncated line is not a statement.
+                reinvest_reported = (header_seen and reinvest_idx is not None
+                                     and reinvest_idx < len(parts))
+
                 nav_val = float(nav_str)
                 nav_date = self.parse_date(date_str)
                 if not nav_date:
@@ -354,20 +405,56 @@ class AmfiClient:
             except (ValueError, IndexError, TypeError):
                 continue
 
-            # Normalize Plan
+            # Normalize Plan. AMFI leaves the Plan column blank for ~40% of rows, and for
+            # those the name usually carries no hint either. This used to answer "Regular"
+            # for all of them, which is a guess stated as fact: it mislabels every Direct
+            # plan in that set, and because the TER matcher picks the Direct or Regular
+            # column *from this field*, those funds were then given the Regular expense
+            # ratio (Motilal Oswal Liquid Direct, code 145834, carried Regular's 0.41%).
+            # None means "AMFI did not say" -- amfi_sync.resolve_plan_options() settles it
+            # afterwards from the fund's own published Direct/Regular NAVs.
+            #
+            # Each value is emitted with its source ('amfi' = AMFI's Plan/Option column,
+            # 'isin' = the reinvestment ISIN, 'name' = the scheme name), so the database can
+            # tell a stated value from an inferred one. The branches below are the original
+            # precedence verbatim; only the source is new. Where the column and the name both
+            # carry the winning word, the column is credited -- it is the stronger evidence.
             name_lower = scheme_name.lower()
-            if "direct" in plan_raw.lower() or "direct" in name_lower:
+            plan_lower = plan_raw.lower()
+            if "direct" in plan_lower or "direct" in name_lower:
                 plan_type = "Direct"
-            else:
+                plan_source = "amfi" if "direct" in plan_lower else "name"
+            elif "regular" in plan_lower or "regular" in name_lower:
                 plan_type = "Regular"
-
-            # Normalize Option
-            if "growth" in option_raw.lower() or "growth" in name_lower:
-                option_type = "Growth"
-            elif "idcw" in option_raw.lower() or "dividend" in name_lower or "idcw" in name_lower:
-                option_type = "IDCW"
+                plan_source = "amfi" if "regular" in plan_lower else "name"
             else:
-                option_type = "Other"
+                plan_type = None
+                plan_source = None
+
+            # Same rule for the option: state it only where AMFI's data says it.
+            #
+            # The reinvestment ISIN is checked FIRST and outranks the Option column, because
+            # it is structural rather than typed: a registrar only issues one to a scheme
+            # that has a dividend option, whereas the Option field is free text AMFI's
+            # members fill in by hand (this file carries 300+ distinct spellings of it).
+            # Where the two disagree the ISIN is right -- Motilal Oswal Digital India Fund
+            # 152965 is published as "Direct Plan / Growth" yet carries reinvestment ISIN
+            # INF247L01DP7, which is why it and its Growth twin 152964 were indistinguishable
+            # in the app. 11 schemes are mislabelled Growth this way and a further 410 carry
+            # a reinvestment ISIN with no Option stated at all.
+            option_lower = option_raw.lower()
+            if has_reinvest_isin:
+                option_type = "IDCW"
+                option_source = "isin"
+            elif "growth" in option_lower or "growth" in name_lower:
+                option_type = "Growth"
+                option_source = "amfi" if "growth" in option_lower else "name"
+            elif "idcw" in option_lower or "dividend" in name_lower or "idcw" in name_lower:
+                option_type = "IDCW"
+                option_source = "amfi" if "idcw" in option_lower else "name"
+            else:
+                option_type = None
+                option_source = None
 
             scheme_meta = {
                 "scheme_code": scheme_code,
@@ -376,8 +463,18 @@ class AmfiClient:
                 "category": current_category,
                 "scheme_type": "Open Ended" if "open" in current_category.lower() else "Close Ended",
                 "plan_type": plan_type,
+                "plan_source": plan_source,
                 "option_type": option_type,
+                "option_source": option_source,
                 "isin": isin,
+                # Kept rather than consumed and thrown away: it is the evidence for the
+                # option above. Without it a scheme reads as IDCW with nothing in the
+                # database saying why, when AMFI's own Option column says "Growth".
+                "isin_reinvestment": reinvest_isin if has_reinvest_isin else None,
+                # Whether None above means "AMFI says none" (True) or "not in this file"
+                # (False). A separate flag rather than a sentinel string in the value, so no
+                # sentinel can ever reach a stored row -- see amfi_sync._merge_amfi_payload.
+                "isin_reinvestment_reported": reinvest_reported,
             }
 
             nav_record = {

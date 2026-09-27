@@ -53,7 +53,7 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
         },
         ...(s.benchmark_index
           ? [{
-              type: "scatter", mode: "lines", name: data.benchmark?.scheme_name ?? "Benchmark", x: s.dates, y: s.benchmark_index,
+              type: "scatter", mode: "lines", name: data.benchmark?.kind === "category_blend" ? "Peer-group blend" : data.benchmark?.scheme_name ?? "Benchmark", x: s.dates, y: s.benchmark_index,
               line: { color: SERIES_2, width: 2 }, hovertemplate: "Benchmark %{y:.2f}<extra></extra>",
             }]
           : []),
@@ -68,7 +68,7 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
     const attrFig = {
       data: [{
         type: "bar", orientation: "h",
-        y: attr.map((h) => (h.scheme_name ?? String(h.scheme_code)).slice(0, 48)),
+        y: attr.map((h) => h.scheme_name ?? String(h.scheme_code)),
         x: attr.map((h) => h.gain),
         marker: { color: attr.map((h) => (h.gain >= 0 ? GAIN : LOSS)) },
         text: attr.map((h) => formatSignedInr(h.gain)), textposition: "outside", cliponaxis: false,
@@ -79,18 +79,45 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
         yaxis: { automargin: true }, xaxis: { ...AXIS, tickprefix: "₹", tickformat: ",.0f", zeroline: true },
       },
     };
-    const mf = data.monthly_flows ?? [];
-    const flowFig = {
+    // Share of money vs share of gain, one pair of bars per fund. Both are percentages of
+    // a whole, so they share one axis and read directly against each other: a fund whose
+    // gain bar outruns its money bar is earning more than its weight in the portfolio.
+    // Largest share of the gain on top (Plotly draws horizontal bars bottom-up, hence the
+    // reverse). The money bars are the neutral reference series; only the gain bars carry
+    // direct labels, so the chart states its finding without a number on every mark.
+    const byShare = [...(data.attribution?.holdings ?? [])]
+      .sort((a, b) => b.gain_share_pct - a.gain_share_pct)
+      .reverse();
+    const names = byShare.map((h) => h.scheme_name ?? String(h.scheme_code));
+    const vsWeight = byShare.map((h) => {
+      if (!h.weight_pct) return h.gain_share_pct !== 0 ? "Fully exited — gain already banked" : "Fully exited";
+      if (h.gain_share_pct <= 0) return h.gain_share_pct < 0 ? "Losing money" : "No gain yet";
+      const ratio = h.gain_share_pct / h.weight_pct;
+      return Math.abs(ratio - 1) < 0.05 ? "Earning in line with its weight" : `Earning ${ratio.toFixed(1)}× its weight`;
+    });
+    const hover = "<b>%{y}</b><br>Money %{customdata[0]:.1f}% · Gain %{customdata[1]:.1f}%<br>%{customdata[2]}<extra></extra>";
+    const custom = byShare.map((h, i) => [h.weight_pct ?? 0, h.gain_share_pct, vsWeight[i]]);
+    const shareFig = {
       data: [
-        { type: "bar", name: "Invested", x: mf.map((m) => m.month), y: mf.map((m) => m.invested), marker: { color: SERIES_1 }, hovertemplate: "Invested ₹%{y:,.0f}<extra></extra>" },
-        { type: "bar", name: "Withdrawn", x: mf.map((m) => m.month), y: mf.map((m) => -m.withdrawn), marker: { color: SERIES_2 }, hovertemplate: "Withdrawn ₹%{customdata:,.0f}<extra></extra>", customdata: mf.map((m) => m.withdrawn) },
+        {
+          type: "bar", orientation: "h", name: "Share of your money",
+          y: names, x: byShare.map((h) => h.weight_pct ?? 0),
+          marker: { color: REFERENCE, cornerradius: 4 }, customdata: custom, hovertemplate: hover,
+        },
+        {
+          type: "bar", orientation: "h", name: "Share of your gain",
+          y: names, x: byShare.map((h) => h.gain_share_pct),
+          marker: { color: SERIES_1, cornerradius: 4 }, customdata: custom, hovertemplate: hover,
+          text: byShare.map((h) => `${h.gain_share_pct.toFixed(1)}%`), textposition: "outside", cliponaxis: false,
+        },
       ],
       layout: {
-        height: 260, barmode: "relative", bargap: 0.25, legend: { orientation: "h", y: 1.15 }, margin: { t: 30, l: 70 },
-        yaxis: { ...AXIS, tickprefix: "₹", tickformat: ",.0f", zeroline: true }, xaxis: { ...AXIS, type: "category" },
+        height: Math.max(220, 60 + byShare.length * 52), barmode: "group", bargap: 0.3, bargroupgap: 0.08,
+        legend: { orientation: "h", y: 1.1, traceorder: "reversed" }, margin: { l: 10, r: 60, t: 30 },
+        yaxis: { automargin: true }, xaxis: { ...AXIS, ticksuffix: "%", zeroline: true },
       },
     };
-    return { valueFig, twrFig, attrFig, flowFig };
+    return { valueFig, twrFig, attrFig, shareFig };
   }, [data]);
 
   const periodColumns: ColumnConfig[] = useMemo(
@@ -107,6 +134,7 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
   if (isLoading) return <div className="mt-4 text-sm" style={{ color: "var(--mf-muted)" }}>Building your daily value history…</div>;
   if (isError) return <div className="mt-4"><Banner level="danger">{(error as Error).message}</Banner></div>;
   if (!data || data.empty || !figs) return null;
+  const blend = data.benchmark?.kind === "category_blend";
 
   return (
     <div className="mt-4 flex flex-col gap-6">
@@ -118,14 +146,23 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
         </section>
         <section>
           <h3 className="flex items-center gap-1 text-base font-bold">
-            Growth of 100 vs {data.benchmark?.scheme_name ?? "benchmark"}
+            Growth of 100 vs {blend ? "your funds' peer groups" : data.benchmark?.scheme_name ?? "benchmark"}
             <FormulaTooltip
               label="Time-weighted return (TWR)"
               formula={"rₜ = (Vₜ − Fₜ) / Vₜ₋₁ − 1"}
               description="Removes the effect of when you added or withdrew money, so it measures how your funds performed. Directly comparable with an index."
             />
           </h3>
-          <p className="text-xs" style={{ color: "var(--mf-muted)" }}>Both lines start at 100 on your first investment date.</p>
+          <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
+            Both lines are indexed to 100 on your first investment date. The benchmark starts at exactly 100; your line starts a
+            hair under it, because day one already carries the stamp duty and unit rounding on that first purchase.
+            {blend && (
+              <>
+                {" "}Benchmark: each fund against the average of its SEBI category, weighted like your portfolio (
+                {data.benchmark!.components.map((c) => `${c.category.replace(/^.* - /, "")} ${c.weight_pct.toFixed(0)}%`).join(" · ")}).
+              </>
+            )}
+          </p>
           <PlotlyChart figure={figs.twrFig} />
         </section>
       </div>
@@ -153,11 +190,21 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
           <PlotlyChart figure={figs.attrFig} />
         </section>
         <section>
-          <h3 className="text-base font-bold">Money in and out, by month</h3>
+          <h3 className="flex items-center gap-1 text-base font-bold">
+            Share of money vs share of gain
+            <FormulaTooltip
+              label="Share of gain"
+              formula="fund gain ÷ total of all gains"
+              description="Each fund's slice of what your portfolio has made, beside its slice of what your portfolio is worth today. Funds that lost money are shown as a share of the total losses instead, below zero, so the shares never run past 100% just because one fund's loss shrank the net."
+            />
+          </h3>
           <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
-            Switches between your own funds are excluded. Total invested {formatInr((data.monthly_flows ?? []).reduce((a, m) => a + m.invested, 0))}.
+            A blue bar longer than its grey one means the fund is pulling more than its weight.
+            {(data.attribution?.gross_loss ?? 0) < 0
+              ? ` Gains ${formatSignedInr(data.attribution!.gross_gain)}, losses ${formatSignedInr(data.attribution!.gross_loss)}.`
+              : ` Total gain ${formatInr(data.attribution?.gross_gain ?? 0)}.`}
           </p>
-          <PlotlyChart figure={figs.flowFig} />
+          <PlotlyChart figure={figs.shareFig} />
         </section>
       </div>
     </div>

@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { FactorProxyEditor } from "@/components/admin/FactorProxyEditor";
 import { AppShell } from "@/components/layout/AppShell";
 import { StatCard } from "@/components/shared/StatCard";
 import { Banner } from "@/components/shared/Banner";
@@ -13,6 +15,8 @@ import { ApiError, getAdminToken, setAdminToken } from "@/lib/api/client";
 import { getMetaStatus, getDataQuality } from "@/lib/api/meta";
 import {
   getAdminStatus,
+  getVerification,
+  runFullRefresh,
   triggerDailySync,
   triggerTerSync,
   recomputeSummary,
@@ -21,6 +25,10 @@ import {
   startHistoricalBackfill,
   stopHistoricalBackfill,
   getBackfillChunkCount,
+  getTerBackfillMonthCount,
+  getLatestAudit,
+  runAudit,
+  type AuditCheck,
   type SyncHistory,
 } from "@/lib/api/admin";
 
@@ -36,6 +44,16 @@ const TAB_LABELS: Record<Tab, string> = {
   monitor: "Activity Log",
   reference: "Reference",
 };
+
+/** "Unauthorized" on its own leaves the reader stuck: the token box is right there at the
+ *  top of this page, and the value lives in docker-compose.yml. Say so. */
+function adminErrorText(error: unknown): string {
+  const err = error as ApiError;
+  if (err?.status === 401) {
+    return "Unauthorized: paste the admin token in the box at the top of this page and click Store token, then try again. It is ADMIN_TOKEN in docker-compose.yml, and it is remembered for this browser tab only.";
+  }
+  return err?.message ?? String(error);
+}
 
 function epochToStr(seconds: number | null): string {
   if (!seconds) return "-";
@@ -80,6 +98,168 @@ function SyncHealthCards({ title, caption, history, freshnessNote }: { title: st
   );
 }
 
+function auditPill(check: AuditCheck): { label: string; level: "success" | "warning" | "danger" | "neutral" } {
+  if (check.status === "error") return { label: "Check failed", level: "danger" };
+  if (check.status === "not_run") return { label: "Not run yet", level: "neutral" };
+  if (check.status === "pass") return { label: "Pass", level: "success" };
+  if (check.severity === "error") return { label: "Error", level: "danger" };
+  if (check.severity === "warning") return { label: "Warning", level: "warning" };
+  return { label: "Info", level: "neutral" };
+}
+
+function auditValue(v: unknown): string {
+  if (v === null || v === undefined || v === "") return "—";
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  if (typeof v === "number") return v.toLocaleString("en-IN", { maximumFractionDigits: 4 });
+  return String(v);
+}
+
+/** `detail` carries the check's context (the TER ceiling used, how many segregated
+ *  portfolios were set aside, why a check could not run). Shown as plain text, since the
+ *  keys differ by check. */
+function auditDetailText(detail: Record<string, unknown> | null): string {
+  if (!detail) return "";
+  if (typeof detail.reason === "string") return detail.reason;
+  return Object.entries(detail)
+    .filter(([, v]) => v !== null && typeof v !== "object")
+    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${auditValue(v)}`)
+    .join(" · ");
+}
+
+function AuditCheckRow({ check }: { check: AuditCheck }) {
+  const [open, setOpen] = useState(false);
+  const pill = auditPill(check);
+  // A failing error check, or a check that could not run at all, gets a red band: the
+  // point of the panel is that neither can be scrolled past unnoticed.
+  const loud = (check.severity === "error" && check.status === "flagged") || check.status === "error";
+  const detailText = auditDetailText(check.detail);
+  const shown = check.samples.length;
+  return (
+    <div
+      className="border-b py-2.5"
+      style={{
+        borderColor: "var(--mf-border)",
+        ...(loud ? { background: "var(--mf-danger-bg)", borderLeft: "3px solid var(--mf-danger)", paddingLeft: 10, paddingRight: 10 } : {}),
+      }}
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="flex-none" style={{ width: 118 }}>
+          <StatusPill label={pill.label} level={pill.level} />
+        </span>
+        <span className="flex-1 text-sm font-semibold" style={{ minWidth: 200 }}>
+          {check.title}
+        </span>
+        <span className="flex-none font-mono text-sm font-semibold" style={{ color: loud ? "var(--mf-danger)" : "var(--mf-fg)" }}>
+          {check.count === null ? "—" : check.count.toLocaleString("en-IN")}
+        </span>
+      </div>
+      <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+        {check.description}
+        {detailText && <span className="block mt-0.5">{detailText}</span>}
+      </p>
+      {shown > 0 && (
+        <button type="button" onClick={() => setOpen(!open)} className="mt-1 text-xs font-semibold" style={{ color: "var(--mf-accent)" }}>
+          {open ? "Hide rows" : check.count !== null && check.count > shown ? `Show first ${shown} of ${check.count.toLocaleString("en-IN")} rows` : `Show ${shown} row${shown === 1 ? "" : "s"}`}
+        </button>
+      )}
+      {open && (
+        <ul className="mt-2 flex flex-col gap-1.5">
+          {check.samples.map((s, i) => (
+            <li key={i} className="rounded-lg border px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}>
+              {s.scheme_code !== null && !s.label.startsWith("(no scheme row)") ? (
+                <Link href={`/scheme/${s.scheme_code}`} className="font-semibold" style={{ color: "var(--mf-accent)" }}>
+                  {s.label}
+                </Link>
+              ) : (
+                <span className="font-semibold">{s.label}</span>
+              )}
+              <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5" style={{ color: "var(--mf-muted)" }}>
+                {Object.entries(s.values).map(([k, v]) => (
+                  <span key={k}>
+                    {k.replace(/_/g, " ")}: <span className="font-mono" style={{ color: "var(--mf-fg)" }}>{auditValue(v)}</span>
+                  </span>
+                ))}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function DataAuditPanel() {
+  const queryClient = useQueryClient();
+  const { data: audit, isError, error } = useQuery({ queryKey: ["data-audit"], queryFn: getLatestAudit });
+  const runMut = useMutation({
+    mutationFn: runAudit,
+    onSuccess: (run) => queryClient.setQueryData(["data-audit"], run),
+  });
+  const summary = audit?.summary;
+  const errorChecks = audit?.checks.filter((c) => c.severity === "error").length ?? 0;
+  const failing = (summary?.errors ?? 0) + (summary?.check_failures ?? 0);
+
+  return (
+    <>
+      <div className="mt-8 flex flex-wrap items-end justify-between gap-3 border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+        <div>
+          <h3 className="text-base font-bold">Data audit</h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Row-level checks that name the specific rows which contradict themselves or break a hard rule. Errors must be zero; warnings need a look.
+            {audit && !audit.empty && audit.run_at &&
+              ` Last run ${new Date(audit.run_at).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}` +
+                ` (${audit.trigger}), ${audit.checks.length} checks in ${((audit.elapsed_ms ?? 0) / 1000).toFixed(1)}s.`}
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={runMut.isPending}
+          onClick={() => runMut.mutate()}
+          className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+          style={{ background: "var(--mf-accent)", color: "white" }}
+        >
+          {runMut.isPending ? "Auditing…" : "Run audit now"}
+        </button>
+      </div>
+      {runMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(runMut.error)}</p>}
+      {isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(error)}</p>}
+      {audit?.empty && (
+        <div className="mt-3">
+          <Banner level="info">No audit has been stored yet. Run one now to see which rows, if any, are contradictory.</Banner>
+        </div>
+      )}
+      {audit && !audit.empty && summary && (
+        <>
+          <div className="mt-3">
+            {failing > 0 ? (
+              <Banner level="danger">
+                <b>
+                  {summary.errors > 0 && `${summary.errors} of ${errorChecks} error check${errorChecks === 1 ? "" : "s"} failed`}
+                  {summary.errors > 0 && summary.check_failures > 0 && " and "}
+                  {summary.check_failures > 0 && `${summary.check_failures} check${summary.check_failures === 1 ? "" : "s"} could not run`}
+                </b>
+                {summary.errors > 0 && ` -- ${summary.error_rows.toLocaleString("en-IN")} row(s) in the database are wrong. Open the red rows below to see which.`}
+              </Banner>
+            ) : (
+              <div className="mf-banner" style={{ background: "var(--mf-success-bg)", borderColor: "var(--mf-success)" }}>
+                <b style={{ color: "var(--mf-success)" }}>All {errorChecks} error checks pass.</b>{" "}
+                {summary.warnings > 0
+                  ? `${summary.warnings} warning check${summary.warnings === 1 ? "" : "s"} flagged rows worth a look.`
+                  : "No warnings either."}
+              </div>
+            )}
+          </div>
+          <div className="mt-3 rounded-xl border px-3" style={{ borderColor: "var(--mf-border)" }}>
+            {audit.checks.map((c) => (
+              <AuditCheckRow key={c.name} check={c} />
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 export default function DataManagementPage() {
   const queryClient = useQueryClient();
   const { data: status, isFetching } = useQuery({
@@ -105,12 +285,25 @@ export default function DataManagementPage() {
   // the older requested months come back empty, not an error; this input no longer
   // pretends the portal's own limit is this control's limit too.
   const [terStartYear, setTerStartYear] = useState(2015);
+  const { data: terMonthCountData } = useQuery({
+    queryKey: ["ter-month-count", terStartYear],
+    queryFn: () => getTerBackfillMonthCount(terStartYear),
+    enabled: terStartYear >= EARLIEST_BACKFILL_YEAR && terStartYear <= new Date().getFullYear(),
+  });
   const { data: chunkCountData } = useQuery({
     queryKey: ["backfill-chunk-count", backfillStartYear],
     queryFn: () => getBackfillChunkCount(backfillStartYear),
     enabled: backfillStartYear >= EARLIEST_BACKFILL_YEAR && backfillStartYear <= new Date().getFullYear(),
   });
 
+  const fullRefreshMut = useMutation({
+    mutationFn: runFullRefresh,
+    onSuccess: () => {
+      invalidate();
+      queryClient.invalidateQueries({ queryKey: ["verification"] });
+      queryClient.invalidateQueries({ queryKey: ["data-quality"] });
+    },
+  });
   const dailySyncMut = useMutation({ mutationFn: triggerDailySync, onSuccess: invalidate });
   const terSyncMut = useMutation({ mutationFn: triggerTerSync, onSuccess: invalidate });
   const recomputeMut = useMutation({ mutationFn: recomputeSummary, onSuccess: invalidate });
@@ -120,20 +313,27 @@ export default function DataManagementPage() {
   const stopHistBackfillMut = useMutation({ mutationFn: stopHistoricalBackfill, onSuccess: invalidate });
 
   const stats = status?.stats;
+  const refresh = status?.full_refresh;
+  // The nightly/manual refresh ends by auditing the data it just wrote, in a background
+  // thread; re-read the stored audit when a refresh finishes rather than polling for it.
+  const refreshFinishedAt = refresh?.finished_at;
+  useEffect(() => {
+    if (refreshFinishedAt) queryClient.invalidateQueries({ queryKey: ["data-audit"] });
+  }, [refreshFinishedAt, queryClient]);
   const cov = status?.cost_coverage;
   const total = Math.max(1, cov?.total_schemes ?? 1);
-  // Same shape as the historical NAV engine's own chunk-count preview, just in months
-  // instead of chunks -- there's no server-side "count the months" endpoint to call for
-  // this (unlike NAV's chunk-count, which depends on chunk boundaries only the backend
-  // computes), so this stays a client-side estimate exactly like the old fixed
-  // FY2018-19 preset already was, just parameterized by year now instead of hardcoded.
-  const monthsSinceTerYear = Math.max(1, (new Date().getFullYear() - terStartYear) * 12 + new Date().getMonth() + 1 + 9);
+  // Asked of the backend, like NAV's chunk count, rather than estimated here. The estimate
+  // this replaces was wrong twice over: a stray constant made "since 2026" read as 18
+  // months for a nine-month span, and it ignored AMFI's 2018 floor, so "since 2015"
+  // claimed 150 months when only 105 exist.
+  const terMonths = terMonthCountData?.total_months ?? 0;
   // Durable, unlike backfill_status.records_added, which resets with every run.
   // Optional-chained because a database created before the checkpoint table existed
   // returns no progress block until the next /status call after init_db() runs.
   const completedChunks = status?.backfill_progress?.completed_chunks ?? 0;
   const { data: meta } = useQuery({ queryKey: ["meta-status"], queryFn: getMetaStatus });
   const { data: quality } = useQuery({ queryKey: ["data-quality"], queryFn: getDataQuality });
+  const { data: verification } = useQuery({ queryKey: ["verification"], queryFn: getVerification });
   const [adminTokenInput, setAdminTokenInput] = useState("");
   const authRequired = meta?.flags?.admin_auth_required === true;
   const tokenConfigured = meta?.flags?.admin_token_configured === true;
@@ -232,6 +432,50 @@ export default function DataManagementPage() {
             </div>
           )}
 
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Data check
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            What the database actually holds, reconciled after every refresh{verification ? ` · checked ${formatDate(verification.checked_at)}` : ""}.
+          </p>
+          {verification && (
+            <>
+              <div className="mt-3 grid grid-cols-2 gap-4 md:grid-cols-4">
+                <StatCard
+                  title="NAV coverage"
+                  value={`${verification.nav.rows.toLocaleString("en-IN")} rows`}
+                  sub={verification.nav.first_date ? `${formatDate(verification.nav.first_date)} to ${formatDate(verification.nav.last_date)}` : ""}
+                />
+                <StatCard
+                  title="Days behind AMFI"
+                  value={verification.nav.lag_days !== null ? String(verification.nav.lag_days) : "—"}
+                  tone={(verification.nav.lag_days ?? 0) > 1 ? "warn" : "pos"}
+                  sub={verification.nav.expected_date ? `expected through ${formatDate(verification.nav.expected_date)}` : ""}
+                />
+                <StatCard
+                  title="Plan unconfirmed"
+                  value={verification.schemes.unknown_plan.toLocaleString("en-IN")}
+                  tone={verification.schemes.unknown_plan > 0 ? "warn" : "pos"}
+                  sub={`of ${verification.schemes.active.toLocaleString("en-IN")} active schemes`}
+                />
+                <StatCard
+                  title="Option unconfirmed"
+                  value={verification.schemes.unknown_option.toLocaleString("en-IN")}
+                  sub="AMFI states neither a plan nor an option for these"
+                />
+              </div>
+              {verification.findings.length > 0 && (
+                <div className="mt-3 flex flex-col gap-2">
+                  {verification.findings.map((f, i) => (
+                    <Banner key={i} level={f.level === "warning" ? "warning" : "info"}>{f.text}</Banner>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          <DataAuditPanel />
+
           <SyncHealthCards
             title="NAV Sync Health"
             caption="Automated schedule: every night at 00:05 IST and 23:30 IST, plus an hourly heartbeat that catches up automatically if any run is missed or fails."
@@ -247,7 +491,51 @@ export default function DataManagementPage() {
 
       {activeTab === "sync" && status && (
         <div className="mt-4">
-          <h3 className="text-base font-bold">Manual Actions</h3>
+          <div className="filter-box">
+            <div className="text-sm font-semibold">Full refresh (recommended)</div>
+            <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+              Today&apos;s NAVs, then the plan/option resolution those NAVs make possible, then this month&apos;s official TER, then one
+              rebuild of the performance table. That order matters: TER matching reads a scheme&apos;s plan to decide which of AMFI&apos;s
+              two disclosed expense ratios belongs to it.
+            </p>
+            <button
+              type="button"
+              disabled={fullRefreshMut.isPending || refresh?.is_running}
+              onClick={() => fullRefreshMut.mutate()}
+              className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+              style={{ background: "var(--mf-accent)", color: "white" }}
+            >
+              {refresh?.is_running ? "Refreshing…" : "Run full refresh"}
+            </button>
+            {fullRefreshMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(fullRefreshMut.error)}</p>}
+            {refresh?.is_running && (
+              <div className="mt-2">
+                <Banner level="info">{refresh.step || "Starting"}… This runs in the background; you can leave this page.</Banner>
+              </div>
+            )}
+            {!refresh?.is_running && refresh?.last_result && (
+              <ul className="mt-2 flex flex-col gap-1 text-xs">
+                <li style={{ color: refresh.last_result.nav.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>NAV: {refresh.last_result.nav.message}</li>
+                <li style={{ color: "var(--mf-muted)" }}>
+                  Plans:{" "}
+                  {refresh.last_result.resolve?.ok
+                    ? `${refresh.last_result.resolve.resolved?.toLocaleString("en-IN")} schemes identified, ${refresh.last_result.resolve.plan_changed} plan(s) corrected, ${refresh.last_result.resolve.option_changed} option(s) filled`
+                    : refresh.last_result.resolve?.reason}
+                </li>
+                {refresh.last_result.ter && (
+                  <li style={{ color: refresh.last_result.ter.ok ? "var(--mf-success)" : "var(--mf-warning)" }}>TER: {refresh.last_result.ter.message}</li>
+                )}
+                <li style={{ color: "var(--mf-muted)" }}>Finished in {refresh.last_result.elapsed_seconds}s.</li>
+              </ul>
+            )}
+          </div>
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Individual actions
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            The same steps one at a time, for when only one source needs re-running.
+          </p>
           <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-3">
             <div className="filter-box">
               <div className="text-sm font-semibold">Trigger Live AMFI Sync</div>
@@ -264,7 +552,7 @@ export default function DataManagementPage() {
                 {dailySyncMut.isPending ? "Syncing..." : "Start Daily NAV Sync Now"}
               </button>
               {dailySyncMut.isSuccess && <p className="mt-2 text-xs" style={{ color: "var(--mf-success)" }}>{dailySyncMut.data.message}</p>}
-              {dailySyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{(dailySyncMut.error as ApiError).message}</p>}
+              {dailySyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(dailySyncMut.error)}</p>}
             </div>
             <div className="filter-box">
               <div className="text-sm font-semibold">Trigger Official TER Sync</div>
@@ -281,12 +569,15 @@ export default function DataManagementPage() {
                 {terSyncMut.isPending ? "Syncing..." : "Sync Official TER Now"}
               </button>
               {terSyncMut.isSuccess && <p className="mt-2 text-xs" style={{ color: "var(--mf-success)" }}>{terSyncMut.data.message}</p>}
-              {terSyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{(terSyncMut.error as ApiError).message}</p>}
+              {terSyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(terSyncMut.error)}</p>}
             </div>
             <div className="filter-box">
               <div className="text-sm font-semibold">Re-materialize Performance Table</div>
               <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
                 Recomputes all 1D/7D/30D/90D/1Y returns, 52-week High/Low, and asset-class summaries across all {(stats?.schemes_count ?? 0).toLocaleString("en-IN")} schemes.
+                This already runs by itself at the end of every sync and every backfill (and every 10th chunk of a long one), so it is here for a manual
+                repair, not routine use.
+                {quality?.summary_table_built_at ? ` Last rebuilt ${formatDate(quality.summary_table_built_at)}.` : ""}
               </p>
               <button
                 type="button"
@@ -361,16 +652,23 @@ export default function DataManagementPage() {
                 />
                 <button
                   type="button"
-                  onClick={() => startTerBackfillMut.mutate(monthsSinceTerYear)}
-                  className="rounded-lg px-4 py-2 text-sm font-semibold"
+                  disabled={!terMonths}
+                  onClick={() => startTerBackfillMut.mutate(terMonths)}
+                  className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                   style={{ background: "var(--mf-accent)", color: "white" }}
                 >
-                  Start TER Backfill Since {terStartYear} (~{monthsSinceTerYear} months)
+                  Start TER Backfill Since {terStartYear} ({terMonths || "…"} months)
                 </button>
               </div>
+              {terMonthCountData?.oldest_month && (
+                <p className="w-full text-xs" style={{ color: "var(--mf-muted)" }}>
+                  Covers {terMonthCountData.oldest_month} to {terMonthCountData.newest_month}.
+                  {terStartYear < 2018 && " AMFI's portal holds nothing before 2018, so an earlier year fetches the same months."}
+                </p>
+              )}
             </div>
           )}
-          {startTerBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{(startTerBackfillMut.error as ApiError).message}</p>}
+          {startTerBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(startTerBackfillMut.error)}</p>}
 
           <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
             Multi-Year Historical Backfill Engine
@@ -472,7 +770,7 @@ export default function DataManagementPage() {
               )}
             </div>
           )}
-          {startHistBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{(startHistBackfillMut.error as ApiError).message}</p>}
+          {startHistBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(startHistBackfillMut.error)}</p>}
 
         </div>
       )}
@@ -596,6 +894,11 @@ export default function DataManagementPage() {
               </ul>
             </div>
           </div>
+
+          <h4 className="mt-6 text-sm font-semibold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Factor proxy funds
+          </h4>
+          <FactorProxyEditor lastNavs={quality ? { factor_market_last_nav: quality.factor_market_last_nav, factor_momentum_last_nav: quality.factor_momentum_last_nav } : undefined} />
 
           <h4 className="mt-6 text-sm font-semibold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
             What each TER status means

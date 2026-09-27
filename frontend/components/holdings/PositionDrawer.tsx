@@ -8,9 +8,9 @@ import { Banner } from "@/components/shared/Banner";
 import { DataTable, type ColumnConfig } from "@/components/shared/DataTable";
 import { PlotlyChart } from "@/components/shared/PlotlyChart";
 import { StatCard } from "@/components/shared/StatCard";
-import { getPositionDetail, type PortfolioKey } from "@/lib/api/holdings";
+import { getPositionDetail, type PortfolioKey, type TerContext } from "@/lib/api/holdings";
 import { formatDate, formatInr, formatSignedPct, toneOf } from "@/lib/format";
-import { TXN_TYPE_LABELS, formatSignedInr, formatUnits, positionBadges, xirrReason } from "@/lib/holdings";
+import { TXN_TYPE_LABELS, formatSignedInr, formatTer, formatUnits, positionBadges, xirrReason } from "@/lib/holdings";
 
 const INFLOW = new Set(["BUY", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]);
 
@@ -29,6 +29,36 @@ const TXN_COLUMNS: ColumnConfig[] = [
   { key: "nav", label: "NAV", render: (r, v) => `${Number(v).toFixed(4)}${r.nav_source === "user" ? " (yours)" : ""}` },
   { key: "balance_units", label: "Balance", render: (_r, v) => formatUnits(v as number) },
 ];
+
+const TER_PARTS: [keyof NonNullable<TerContext["breakdown"]>, string][] = [
+  ["base_expense_ratio", "base"],
+  ["brokerage_cost_pct", "brokerage"],
+  ["transaction_cost_pct", "transaction costs"],
+  ["statutory_levies_pct", "statutory levies"],
+];
+
+/** "TER 1.0000% = base 0.1000 + brokerage 0.1100 + …, category median 1.4650% (89 peers)",
+ *  plus a warning when the figure doesn't look right for its category. */
+function TerLine({ ter }: { ter: TerContext }) {
+  const parts = ter.breakdown ? TER_PARTS.filter(([k]) => ter.breakdown![k] !== undefined) : [];
+  const s = ter.category_spread;
+  return (
+    <div className="flex flex-col gap-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+      {ter.ter_pct !== null && (parts.length > 0 || s) && (
+        <div>
+          {parts.length > 0 && (
+            <>
+              TER {formatTer(ter.ter_pct)}% = {parts.map(([k, label]) => `${label} ${formatTer(ter.breakdown![k])}`).join(" + ")}.{" "}
+            </>
+          )}
+          {s && `Same category and plan: median ${formatTer(s.median)}%, 80% of ${s.peers} peers between ${formatTer(s.p10)}% and ${formatTer(s.p90)}%.`}
+          {ter.as_of && ` AMFI disclosure of ${formatDate(ter.as_of)}.`}
+        </div>
+      )}
+      {ter.status !== "ok" && ter.reason && <Banner level="warning">Check this expense ratio: {ter.reason}</Banner>}
+    </div>
+  );
+}
 
 export function PositionDrawer({ pid, schemeCode, onClose }: { pid: PortfolioKey; schemeCode: number | null; onClose: () => void }) {
   const { data, isLoading, isError, error } = useQuery({
@@ -79,9 +109,9 @@ export function PositionDrawer({ pid, schemeCode, onClose }: { pid: PortfolioKey
       <div className="relative flex h-full w-full max-w-3xl flex-col gap-4 overflow-y-auto p-6 shadow-xl" style={{ background: "var(--mf-bg)", color: "var(--mf-fg)" }}>
         <div className="flex items-start justify-between gap-3">
           <div>
-            <h2 className="text-lg font-bold">{p?.scheme_name ?? `Scheme ${schemeCode}`}</h2>
+            <h2 className="text-lg font-bold">{p?.display_name ?? `Scheme ${schemeCode}`}</h2>
             <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
-              {[p?.fund_house, p?.category, p?.plan_type, p?.option_type].filter(Boolean).join(" · ")}
+              {[p?.fund_house, p?.category].filter(Boolean).join(" · ")}
             </div>
             {p && positionBadges(p).length > 0 && (
               <div className="mt-1 flex flex-wrap gap-1">
@@ -114,10 +144,17 @@ export function PositionDrawer({ pid, schemeCode, onClose }: { pid: PortfolioKey
             />
             <StatCard title="Realised gain" value={formatSignedInr(p.realised_gain)} tone={toneOf(p.realised_gain)} sub="FIFO, on units sold" />
             <StatCard title="Dividends" value={formatInr(p.dividend_income)} />
-            <StatCard title="Invested (gross)" value={formatInr(p.total_invested)} sub={`Redeemed ${formatInr(p.total_redeemed)}`} />
-            <StatCard title="TER" value={p.expense_ratio !== null ? `${Number(p.expense_ratio).toFixed(2)}%` : "—"} sub={p.ter_status ?? ""} />
+            <StatCard title="Cash paid in" value={formatInr(p.total_invested)} sub={`Stamp duty ${formatInr(p.stamp_duty)} · Redeemed ${formatInr(p.total_redeemed)}`} />
+            <StatCard
+              title="TER"
+              value={p.expense_ratio !== null ? `${formatTer(p.expense_ratio)}%` : "—"}
+              tone={data?.ter && data.ter.status !== "ok" ? "warn" : ""}
+              sub={data?.ter?.category_spread ? `Category median ${formatTer(data.ter.category_spread.median)}%` : p.ter_status ?? ""}
+            />
           </div>
         )}
+
+        {data?.ter && <TerLine ter={data.ter} />}
 
         {figure && data && data.nav_series.length > 0 && (
           <div className="rounded-lg border p-2" style={{ borderColor: "var(--mf-border)" }}>

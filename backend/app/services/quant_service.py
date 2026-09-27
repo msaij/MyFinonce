@@ -228,7 +228,7 @@ def get_quant_analysis(
 
     elif bench_mode == "Custom Peer Mutual Fund" and custom_peer_code:
         peer_profile, df_b_raw = db.get_scheme_profile(custom_peer_code)
-        bench_label = peer_profile["scheme_name"] if peer_profile else "Custom Peer"
+        bench_label = (peer_profile.get("display_name") or peer_profile["scheme_name"]) if peer_profile else "Custom Peer"
         if not df_b_raw.empty:
             df_bench, _ = quant_analytics.prepare_fund_timeseries(df_b_raw, start_date, end_date, risk_free_rate_ann=rf_annual)
         if df_bench.empty:
@@ -253,7 +253,10 @@ def get_quant_analysis(
         df_roll = quant_analytics.compute_rolling_metrics(df_fund, window=roll_window, risk_free_rate_ann=rf_annual)
 
     figures = {
-        "cumulative_return": _cumulative_return_figure(df_fund, profile["scheme_name"], df_bench, bench_label),
+        # The app-wide label, so a chart legend names the exact plan/option being plotted
+        # rather than the base name every variant of the fund shares.
+        "cumulative_return": _cumulative_return_figure(
+            df_fund, profile.get("display_name") or profile["scheme_name"], df_bench, bench_label),
         "distribution": _distribution_figure(df_fund, q_metrics.get("var_95_daily_pct", 0.0)) if q_metrics else None,
         "drawdown": _drawdown_figure(df_fund),
         "capm_regression": _capm_regression_figure(b_metrics.get("regression_points") if b_metrics else None, b_metrics.get("beta", 1.0) if b_metrics else 1.0, b_metrics.get("r_squared", 0.0) if b_metrics else 0.0, bench_label),

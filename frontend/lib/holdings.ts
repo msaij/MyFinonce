@@ -132,10 +132,146 @@ export function xirrReason(note: string | null | undefined): string {
   return note ? XIRR_NOTES[note] ?? "Not available" : "";
 }
 
+/** Below this a gap to the benchmark is rounding, not a lead: 0.004 pp on a liquid fund
+ *  is a single paisa of NAV, and calling it "ahead" would be reading noise as skill. */
+const LEVEL_PP = 0.005;
+
+/** "+0.06 pp ahead of peers" / "−0.12 pp behind peers" / "level with peers".
+ *  Percentage points, not percent: the gap between two returns is a difference, and a
+ *  relative figure ("50% better") would make tiny returns look dramatic. */
+export function excessText(pp: number | null | undefined): string {
+  if (pp === null || pp === undefined || Number.isNaN(pp)) return "";
+  if (Math.abs(pp) < LEVEL_PP) return "level with peers";
+  const mag = Math.abs(pp).toFixed(2);
+  return pp > 0 ? `+${mag} pp ahead of peers` : `−${mag} pp behind peers`;
+}
+
+/** The tone a tile's comparison line should carry: being ahead of the benchmark is good
+ *  news even in a falling market, so this follows the gap, never the return itself. */
+export function excessTone(pp: number | null | undefined): "pos" | "neg" | "neutral" {
+  if (pp === null || pp === undefined || Number.isNaN(pp) || Math.abs(pp) < LEVEL_PP) return "neutral";
+  return pp > 0 ? "pos" : "neg";
+}
+
+/** "Shows from 15 Oct 2026" for an XIRR withheld as too short, else the plain reason. */
+export function xirrPendingText(note: string | null | undefined, availableOn: string | null | undefined): string {
+  if (note === "too_short" && availableOn) {
+    const d = new Date(`${availableOn}T00:00:00`);
+    if (!Number.isNaN(d.getTime())) {
+      return `Shows from ${d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}`;
+    }
+  }
+  return xirrReason(note);
+}
+
+/** Monte Carlo horizon bounds, in calendar days: one month to five years (the backend
+ *  enforces the same range). */
+export const MC_MIN_DAYS = 30;
+export const MC_MAX_DAYS = 1826;
+const DAYS_PER_MONTH = 365.25 / 12;
+
+export function clampHorizonDays(d: number): number {
+  if (!Number.isFinite(d)) return 365;
+  return Math.min(MC_MAX_DAYS, Math.max(MC_MIN_DAYS, Math.round(d)));
+}
+
+/** The months slider and the days box drive one value; these convert between them. */
+export function monthsToDays(months: number): number {
+  return clampHorizonDays(months * DAYS_PER_MONTH);
+}
+
+export function daysToMonths(days: number): number {
+  return Math.min(60, Math.max(1, Math.round(days / DAYS_PER_MONTH)));
+}
+
+/** "45 days" · "6 months (183 days)" · "2.5 years (913 days)" -- always with the exact
+ *  day count once it is expressed in a coarser unit, so the chosen horizon is never vague. */
+export function horizonLabel(days: number): string {
+  if (days < 60) return `${days} days`;
+  const months = days / DAYS_PER_MONTH;
+  if (months < 23.5) return `${Math.round(months)} months (${days} days)`;
+  const years = Math.round((days / 365.25) * 10) / 10;
+  return `${Number.isInteger(years) ? years.toFixed(0) : years.toFixed(1)} years (${days} days)`;
+}
+
+/** The fan chart's x-axis unit, chosen so the axis reads naturally at any horizon:
+ *  "day 0.8 of a year" is as unhelpful as "year 0.08" for a one-month run. */
+export function horizonAxis(days: number): { unit: "Day" | "Month" | "Year"; perUnit: number; title: string } {
+  if (days <= 92) return { unit: "Day", perUnit: 1, title: "Days from today" };
+  if (days <= 730) return { unit: "Month", perUnit: DAYS_PER_MONTH, title: "Months from today" };
+  return { unit: "Year", perUnit: 365.25, title: "Years from today" };
+}
+
+/** A window not yet available, stated as what it is waiting for. NAV days rather than a
+ *  date, because market holidays make a date a promise the data might not keep. */
+export function windowPendingText(daysNeeded: number): string {
+  return daysNeeded > 0 ? `Needs ${daysNeeded} more NAV day${daysNeeded === 1 ? "" : "s"}` : "Not available";
+}
+
 export function formatUnits(n: number | string | null | undefined): string {
   const v = typeof n === "string" ? Number(n) : n;
   if (v === null || v === undefined || Number.isNaN(v)) return "-";
   return v.toLocaleString("en-IN", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+}
+
+/** Calendar days from the first purchase to the NAV date the position is valued at. */
+export function heldDays(firstDate: string | null | undefined, asOf: string | null | undefined): number | null {
+  if (!firstDate || !asOf) return null;
+  const a = Date.parse(`${firstDate.slice(0, 10)}T00:00:00Z`);
+  const b = Date.parse(`${asOf.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(a) || Number.isNaN(b)) return null;
+  return Math.max(0, Math.round((b - a) / 86_400_000));
+}
+
+/** "18 days" / "5 months" / "2.3 years": the unit a person would say it in. */
+export function heldForText(days: number | null): string {
+  if (days === null) return "";
+  if (days < 60) return `${days} day${days === 1 ? "" : "s"}`;
+  if (days < 730) return `${Math.floor(days / (365.25 / 12))} months`;
+  return `${(days / 365.25).toFixed(1)} years`;
+}
+
+/** How long the money behind a gain has been invested: "~331 days" under a year, then
+ *  "~1 yr 3 mo". The "~" because it is an average across purchases, not one date. */
+export function investedForText(days: number | null | undefined): string {
+  if (days == null || !Number.isFinite(days)) return "";
+  const n = Math.round(days);
+  if (n < 365) return `~${n} day${n === 1 ? "" : "s"}`;
+  const months = Math.round(n / (365.25 / 12));
+  const y = Math.floor(months / 12);
+  const m = months % 12;
+  return `~${y} yr${m ? ` ${m} mo` : ""}`;
+}
+
+export interface HoldingsTotals {
+  invested: number;
+  value: number;
+  unrealised: number;
+  /** On the cost of the units still held; null with nothing invested. */
+  unrealisedPct: number | null;
+  day: number;
+  realised: number;
+  weight: number;
+  /** null when no row has a TER on record. */
+  annualFee: number | null;
+}
+
+/** The Holdings table's totals row, summed over exactly the rows on screen. */
+export function holdingsTotals(rows: Pick<Position, "cost_basis" | "current_value" | "unrealised_gain" | "day_change" | "realised_gain" | "weight_pct" | "annual_fee">[]): HoldingsTotals {
+  const sum = (f: (r: (typeof rows)[number]) => number | null | undefined) => rows.reduce((a, r) => a + (f(r) ?? 0), 0);
+  const invested = sum((r) => r.cost_basis);
+  const unrealised = sum((r) => r.unrealised_gain);
+  const fees = rows.filter((r) => r.annual_fee !== null && r.annual_fee !== undefined);
+  return {
+    invested,
+    value: sum((r) => r.current_value),
+    unrealised,
+    unrealisedPct: invested > 0 ? (unrealised / invested) * 100 : null,
+    day: sum((r) => r.day_change),
+    realised: sum((r) => r.realised_gain),
+    weight: sum((r) => r.weight_pct),
+    annualFee: fees.length ? fees.reduce((a, r) => a + (r.annual_fee as number), 0) : null,
+  };
 }
 
 /** Signed rupee string that never relies on colour alone (WCAG): "+₹1,234.00" / "−₹56.10". */
@@ -145,6 +281,16 @@ export function formatSignedInr(v: number | null | undefined): string {
   return v > 0 ? `+${abs}` : v < 0 ? `−${abs}` : abs;
 }
 
+/** Expense ratios print to exactly 4 decimals and never carry a sign: AMFI publishes TER to
+ *  4 places, and a fee is a cost, so "+0.45%" would read as a gain. Same rule as DataTable's
+ *  "pct" format -- every TER on the page (the fund's own, its breakdown, its peer spread)
+ *  goes through here so the same number never appears at two precisions on one screen. */
+export function formatTer(v: number | string | null | undefined): string {
+  const n = typeof v === "string" ? Number(v) : v;
+  if (n === null || n === undefined || Number.isNaN(n)) return "-";
+  return n.toFixed(4);
+}
+
 export function positionBadges(p: Pick<Position, "flags" | "is_closed">): string[] {
   const out: string[] = [];
   if (p.is_closed) out.push("Closed");
@@ -152,6 +298,37 @@ export function positionBadges(p: Pick<Position, "flags" | "is_closed">): string
   if (p.flags.stale_nav) out.push("Stale NAV");
   if (p.flags.split_adjusted) out.push("Split-adjusted");
   return out;
+}
+
+export interface FundTxnGroup {
+  scheme_code: number;
+  name: string;
+  transactions: Transaction[];
+  paid_in: number;
+  taken_out: number;
+  last_date: string;
+}
+
+/** Ledger -> one group per fund, labelled with the app-wide "Name (Plan - Option) [AMFI code]".
+ *  Newest transaction first inside each group, and the fund with the most recent activity
+ *  first. Switch legs land in their own fund's group. */
+export function groupTransactionsByFund(txns: Transaction[]): FundTxnGroup[] {
+  const groups = new Map<number, FundTxnGroup>();
+  for (const t of txns) {
+    let g = groups.get(t.scheme_code);
+    if (!g) {
+      g = { scheme_code: t.scheme_code, name: t.display_name ?? `Scheme ${t.scheme_code}`, transactions: [], paid_in: 0, taken_out: 0, last_date: t.trade_date };
+      groups.set(t.scheme_code, g);
+    }
+    g.transactions.push(t);
+    if (PURCHASE_TYPES.includes(t.txn_type)) g.paid_in += Number(t.amount);
+    else if (OUTFLOW_TYPES.includes(t.txn_type) || t.txn_type === "DIVIDEND_PAYOUT") g.taken_out += Number(t.amount);
+    if (t.trade_date > g.last_date) g.last_date = t.trade_date;
+  }
+  const byNewest = (a: Transaction, b: Transaction) => b.trade_date.localeCompare(a.trade_date) || b.id - a.id;
+  return [...groups.values()]
+    .map((g) => ({ ...g, transactions: [...g.transactions].sort(byNewest) }))
+    .sort((a, b) => b.last_date.localeCompare(a.last_date) || a.name.localeCompare(b.name));
 }
 
 export function todayIso(): string {

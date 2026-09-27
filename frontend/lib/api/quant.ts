@@ -10,6 +10,8 @@ export type BenchMode = "Category Benchmark (Synthesized Peer Average)" | "Nifty
 export interface QuantSchemeProfile {
   scheme_code: number;
   scheme_name: string;
+  /** "Name (Plan - Option) [AMFI code]" -- the app-wide label. */
+  display_name?: string;
   fund_house?: string;
   category?: string | null;
   broad_category?: string | null;

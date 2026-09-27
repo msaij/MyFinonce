@@ -11,14 +11,18 @@ is an equality-sensitive comparison that binary floats get subtly wrong.
 
 Conventions, stated once because every screen depends on them:
 
-* `amount` is money that crossed the investor's bank account. For a purchase it
-  is the GROSS amount paid (stamp duty included), so it is also the lot's cost
-  basis. For a redemption it is the proceeds received.
+* `amount` is money that crossed the investor's bank account: for a purchase the
+  GROSS amount paid (stamp duty included), for a redemption the proceeds. Cash
+  flows (and so XIRR) always use it.
+* A lot's cost basis is the value ALLOTTED -- units x purchase NAV -- the way
+  AMC statements and Coin/Kuvera show "invested". Stamp duty is not part of it;
+  it is tracked separately (`Position.stamp_duty`) so a gain measures the fund,
+  while the page's total gain still subtracts it.
 * Realised gain uses FIFO lots within one portfolio -- the same convention AMC
   and RTA statements use. It is a performance number, not a tax computation
   (tax features are out of scope by product decision).
-* DIVIDEND_REINVEST adds a lot at its NAV, costed at the dividend amount. It is
-  NOT an external cash flow: the money never left the fund.
+* DIVIDEND_REINVEST adds a lot at its NAV. It is NOT an external cash flow: the
+  money never left the fund.
 * DIVIDEND_PAYOUT adds no units; it is income and an external inflow.
 * SWITCH_OUT/SWITCH_IN are a redemption + purchase pair. At the holding level
   they are real flows (money left fund A, entered fund B); at the portfolio
@@ -76,6 +80,7 @@ class Position:
     realised_gain: Decimal = ZERO        # FIFO capital gain on units sold
     dividend_income: Decimal = ZERO      # payouts + reinvested dividends
     dividend_reinvested: Decimal = ZERO
+    stamp_duty: Decimal = ZERO           # paid on inflows; outside cost basis (see module docstring)
     first_date: Optional[datetime.date] = None
     last_date: Optional[datetime.date] = None
     # Holding-level external flows (investor perspective: out of pocket is negative).
@@ -122,6 +127,10 @@ class LedgerResult:
     errors: List[LedgerError]
     # Portfolio-level external flows: switches excluded (internal to the portfolio).
     portfolio_cash_flows: List[Tuple[datetime.date, Decimal]]
+    # Capital, not cash: +allotted value of each purchase (BUY/SIP), -cost basis released
+    # by each redemption. Switches and dividends are left out, so money keeps the date it
+    # first came in. Feeds `average_days_invested`.
+    capital_flows: List[Tuple[datetime.date, Decimal]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -142,6 +151,16 @@ def unit_sign(txn_type: str) -> int:
     return 1 if txn_type in INFLOW_TYPES else -1 if txn_type in OUTFLOW_TYPES else 0
 
 
+def allotted_value(t: Dict[str, Any]) -> Decimal:
+    """Rupee value allotted by an inflow: units x purchase NAV, to the paisa.
+    Uses the row's own units and NAV, so it is on the statement's scale and a
+    later unit split doesn't change it. Rows without a NAV (bare ledger
+    literals) fall back to amount less stamp duty."""
+    if t.get("nav") is None:
+        return D(t["amount"]) - D(t.get("stamp_duty"))
+    return (D(t["units"]) * D(t["nav"])).quantize(Decimal("0.01"))
+
+
 def effective_units(t: Dict[str, Any]) -> Decimal:
     """Units on AMFI's split-adjusted scale (see module docstring)."""
     return D(t["units"]) * D(t.get("units_scale", 1))
@@ -156,7 +175,8 @@ def merge_positions(parts: Iterable[Position]) -> Position:
     for p in parts:
         merged.lots.extend(p.lots)
         merged.cash_flows.extend(p.cash_flows)
-        for f in ("total_invested", "total_redeemed", "realised_gain", "dividend_income", "dividend_reinvested", "txn_count"):
+        for f in ("total_invested", "total_redeemed", "realised_gain", "dividend_income", "dividend_reinvested",
+                  "stamp_duty", "txn_count"):
             setattr(merged, f, getattr(merged, f) + getattr(p, f))
         merged.first_date = min(filter(None, (merged.first_date, p.first_date)), default=None)
         merged.last_date = max(filter(None, (merged.last_date, p.last_date)), default=None)
@@ -176,6 +196,7 @@ def replay(transactions: Iterable[Dict[str, Any]]) -> LedgerResult:
     positions: Dict[int, Position] = {}
     errors: List[LedgerError] = []
     pf_flows: List[Tuple[datetime.date, Decimal]] = []
+    capital: List[Tuple[datetime.date, Decimal]] = []
 
     for t in sorted(transactions, key=replay_order):
         code = int(t["scheme_code"])
@@ -196,7 +217,8 @@ def replay(transactions: Iterable[Dict[str, Any]]) -> LedgerResult:
             if units <= 0:
                 errors.append(LedgerError(t.get("id"), code, date, "A purchase must add a positive number of units"))
                 continue
-            pos.lots.append(Lot(txn_id=t.get("id"), date=date, units=units, cost=amount))
+            pos.lots.append(Lot(txn_id=t.get("id"), date=date, units=units, cost=allotted_value(t)))
+            pos.stamp_duty += D(t.get("stamp_duty"))
             if ttype == "DIVIDEND_REINVEST":
                 pos.dividend_income += amount
                 pos.dividend_reinvested += amount
@@ -205,6 +227,7 @@ def replay(transactions: Iterable[Dict[str, Any]]) -> LedgerResult:
                 pos.cash_flows.append((date, -amount))
                 if ttype != "SWITCH_IN":
                     pf_flows.append((date, -amount))
+                    capital.append((date, allotted_value(t)))
 
         elif ttype in OUTFLOW_TYPES:
             held = pos.units
@@ -238,13 +261,61 @@ def replay(transactions: Iterable[Dict[str, Any]]) -> LedgerResult:
             pos.cash_flows.append((date, amount))
             if ttype != "SWITCH_OUT":
                 pf_flows.append((date, amount))
+                capital.append((date, -cost_consumed))
 
         else:  # DIVIDEND_PAYOUT
             pos.dividend_income += amount
             pos.cash_flows.append((date, amount))
             pf_flows.append((date, amount))
 
-    return LedgerResult(positions=positions, errors=errors, portfolio_cash_flows=pf_flows)
+    return LedgerResult(positions=positions, errors=errors, portfolio_cash_flows=pf_flows, capital_flows=capital)
+
+
+def capital_days(capital_flows: Iterable[Tuple[datetime.date, Decimal]], as_of: datetime.date) -> Tuple[Decimal, Decimal]:
+    """(rupee-days, rupees put in) for one portfolio's capital flows.
+
+    Each rupee counts for as long as it was invested: from its purchase to `as_of`, or
+    to the redemption that took it back out. Redemptions retire the OLDEST money first
+    (FIFO), matching how the units themselves are matched. Returned as a pair, not an
+    average, so several portfolios can be summed before dividing.
+
+    An approximation in one respect: a redemption releases the cost basis of the units
+    sold, and units that arrived by a switch or a reinvested dividend carry a basis that
+    was never new money, so such a sale can retire a little more capital than it should.
+    Capped at what is left, it never goes negative."""
+    pieces: Deque[List[Any]] = deque()  # [date, rupees still invested]
+    rupee_days = ZERO
+    put_in = ZERO
+    for date, value in sorted(capital_flows, key=lambda f: (f[0], f[1] < 0)):
+        if value > 0:
+            pieces.append([date, value])
+            put_in += value
+            continue
+        out = -value
+        while out > 0 and pieces:
+            piece = pieces[0]
+            take = min(piece[1], out)
+            rupee_days += take * (date - piece[0]).days
+            piece[1] -= take
+            out -= take
+            if piece[1] <= 0:
+                pieces.popleft()
+    for date, left in pieces:
+        rupee_days += left * max(0, (as_of - date).days)
+    return rupee_days, put_in
+
+
+def average_days_invested(results: Iterable[LedgerResult], as_of: Optional[datetime.date]) -> Optional[float]:
+    """How long, on average, each rupee put in has been invested -- weighted by amount,
+    across portfolios (FIFO runs within each). None with no purchases or no valuation date."""
+    if as_of is None:
+        return None
+    total_days, total_in = ZERO, ZERO
+    for r in results:
+        d, n = capital_days(r.capital_flows, as_of)
+        total_days += d
+        total_in += n
+    return float(total_days / total_in) if total_in > 0 else None
 
 
 def units_held_on(transactions: Iterable[Dict[str, Any]], scheme_code: int, on: datetime.date) -> Decimal:

@@ -27,30 +27,6 @@ describe("CorrelationHeatmap - buildCorrelationHeatmapFigure", () => {
     expect(trace.y).toEqual(names);
   });
 
-  it("reorders rows and columns based on HRP clusterOrder quasi-diagonalization", () => {
-    const corr = [
-      [1.0, 0.2, 0.85],
-      [0.2, 1.0, 0.1],
-      [0.85, 0.1, 1.0],
-    ];
-    const names = ["A", "B", "C"];
-    const clusterOrder = ["A", "C", "B"]; // Correlated A and C placed adjacent
-
-    const fig = buildCorrelationHeatmapFigure({
-      corrMatrix: corr,
-      assetNames: names,
-      clusterOrder,
-    });
-    const trace = fig.data[0] as any;
-
-    expect(trace.x).toEqual(clusterOrder);
-    expect(trace.y).toEqual(clusterOrder);
-    expect(trace.z[0][1]).toBe(0.85); // A x C correlation
-    expect(trace.z[0][0]).toBe(1.0);
-    expect(trace.z[1][1]).toBe(1.0);
-    expect(trace.z[2][2]).toBe(1.0);
-  });
-
   it("strictly enforces WCAG AA dynamic cell text contrast (>= 4.5:1)", () => {
     // Dark cells (deep red: z <= -0.70, deep blue: z >= 0.75) must select #FFFFFF
     expect(getCellContrastTextColor(-1.0)).toBe("#FFFFFF");

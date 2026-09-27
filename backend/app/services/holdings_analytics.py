@@ -6,13 +6,19 @@ NAVs into (a) the portfolio's rupee value, (b) its external cash flows and
 (c) a **time-weighted return index** -- a unitised "portfolio NAV" that starts at
 100 and moves only with investment performance, not with deposits/withdrawals:
 
-    r_t = (V_t - F_t) / V_{t-1} - 1        index_t = index_{t-1} * (1 + r_t)
+    r_t = (1 + pre_t / V_{t-1} - 1) * (1 + V_t / (pre_t + F_t) - 1) - 1
+    index_t = index_{t-1} * (1 + r_t)
 
 where F_t is the day's net external flow (purchases +, redemptions and dividend
-payouts -). Flows are treated as happening at that day's NAV, which is exactly
-how a mutual-fund order is allotted, so this daily form is exact rather than an
-approximation. Switches between the portfolio's own funds net to zero and are
-internal. That index is also what Phase 3 hands to quant_analytics /
+payouts -) and pre_t is the book valued at that day's NAVs immediately before the
+flow. A day carrying a flow is thus two sub-periods, valued at the flow and
+chain-linked -- the standard time-weighted treatment, which keeps a large deposit
+into a small portfolio from turning a few rupees of stamp duty into a double-digit
+daily "loss". On a flow-free day pre_t == V_t and the whole thing collapses to
+r_t = V_t / V_{t-1} - 1. Flows are allotted at that day's NAV, exactly as an AMC
+allots an order, so the sub-period boundary is a real one rather than an
+intra-day approximation. Switches between the portfolio's own funds net to zero
+and are internal. That index is also what Phase 3 hands to quant_analytics /
 factor_model / stress_testing, which all expect a `nav_date`/`nav` frame.
 
 Money-weighted (XIRR) and time-weighted numbers are both shown, side by side, for
@@ -22,7 +28,6 @@ the reason portfolio_sim's docstring gives: they answer different questions.
 from __future__ import annotations
 
 import datetime
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -37,50 +42,9 @@ from app.services import holdings_service as svc
 
 # --- Asset classes -------------------------------------------------------------
 #
-# A *total* classification (every scheme lands in exactly one class), unlike the
-# Portfolio Suggestion page's sleeves, which are a deliberately conservative
-# screening filter (e.g. only "safe" debt categories qualify) and leave most
-# schemes unclassified. summary_table.broad_category alone is not enough either:
-# its "Other / Index / ETF" bucket mixes Nifty index funds, gilt ETFs, gold ETFs
-# and Nasdaq FoFs. Hybrid funds stay "Hybrid" -- splitting them into their equity
-# and debt legs needs monthly portfolio disclosures this app does not ingest.
-
-ASSET_CLASSES = ["Equity", "International Equity", "Hybrid", "Debt", "Cash & Liquid", "Gold & Commodities", "Other"]
-
-_INTL = re.compile(r"nasdaq|s&p ?500|sp ?500|nyse|fang|global|international|overseas|world|hang seng|"
-                   r"us (equity|bluechip|opportunities|total|specific)|u\.s\.|japan|china|taiwan|europe|greater china|"
-                   r"emerging market", re.I)
-_GOLD = re.compile(r"\bgold\b|\bsilver\b|commodit", re.I)
-_CASH = re.compile(r"liquid fund|overnight fund|money market", re.I)
-_DEBT_NAME = re.compile(r"gilt|g-?sec|\bsdl\b|bond|debt|crisil ibx|nifty .*(psu|aaa|sdl|g-sec)|target maturity|"
-                        r"treasury|t-?bill|corporate|psu|bharat bond|liquid|money market|overnight|income", re.I)
-
-
-def classify(category: Optional[str], broad_category: Optional[str], scheme_name: Optional[str]) -> str:
-    cat = category or ""
-    broad = broad_category or ""
-    name = scheme_name or ""
-    if _GOLD.search(name) or "Gold ETF" in cat:
-        return "Gold & Commodities"
-    if "FoF Overseas" in cat or _INTL.search(name):
-        return "International Equity"
-    if _CASH.search(cat):
-        return "Cash & Liquid"
-    if broad == "Debt":
-        return "Debt"
-    if broad == "Hybrid":
-        return "Hybrid"
-    if broad == "Equity":
-        return "Equity"
-    if "Index Funds" in cat or "ETF" in cat:
-        return "Debt" if _DEBT_NAME.search(name) else "Equity"
-    if broad == "Solution Oriented":
-        # Retirement/children's funds: their SEBI category leaves the equity/debt mix to
-        # the scheme, so the scheme name is the only honest signal we have here.
-        return "Debt" if _DEBT_NAME.search(name) else "Hybrid"
-    if "FoF Domestic" in cat:
-        return "Debt" if _DEBT_NAME.search(name) else "Hybrid"
-    return "Other"
+# Shared with the market Overview, so a fund is classed the same on both pages; see
+# app/classification.py for the rules.
+from app.classification import ASSET_CLASSES, classify  # noqa: E402,F401  (re-exported)
 
 
 # --- Daily time series -------------------------------------------------------------
@@ -92,18 +56,62 @@ HOLDING_FLOW_SIGN = {"BUY": 1, "SIP": 1, "SWITCH_IN": 1, "REDEEM": -1, "SWITCH_O
 MIN_BASE_VALUE = 1.0
 
 
-def _benchmark_code(portfolio_ids: List[int]) -> Optional[int]:
+def explicit_benchmark(portfolio_ids: List[int]) -> Optional[int]:
+    """A single portfolio's chosen benchmark scheme, if the owner set one. Without
+    one, the benchmark is the category blend below -- never a blanket equity index,
+    which would grade a liquid-fund portfolio against the stock market."""
     if len(portfolio_ids) == 1:
         p = hdb.get_portfolio(portfolio_ids[0])
         if p and p.get("benchmark_scheme_code"):
             return int(p["benchmark_scheme_code"])
-    try:
-        from app.factor_model import get_factor_proxies
+    return None
 
-        code = get_factor_proxies().get("factor_proxy_market")
-        return int(code) if code else None
-    except Exception:
+
+# --- Category-blend benchmark ----------------------------------------------------------
+#
+# "Did my funds beat their peers?" Each holding is compared with the average daily
+# return of its own SEBI category (quant_analytics.get_synthetic_category_benchmark,
+# the Quant page's peer benchmark), weighted by how much of the portfolio sat in that
+# holding on the previous day. A liquid fund is measured against liquid funds, an
+# arbitrage fund against arbitrage funds, an equity fund against its equity category.
+
+BLEND_NAME = "Category blend (each fund vs its SEBI category average)"
+
+
+def category_daily_returns(categories: List[str], start: datetime.date, end: datetime.date) -> pd.DataFrame:
+    """Daily peer-average returns, one column per category."""
+    cols = {}
+    for cat in sorted({c for c in categories if c}):
+        df = quant_analytics.get_synthetic_category_benchmark(cat, start, end)
+        if not df.empty:
+            cols[cat] = df.set_index("nav_date")["daily_return"]
+    return pd.DataFrame(cols)
+
+
+def blend_index(weights: pd.DataFrame, code_category: Dict[int, str], index: pd.DatetimeIndex) -> Optional[pd.Series]:
+    """Index (base 100) of sum_i w_i,t * r_category(i),t. `weights` rows are the
+    weights to apply on each date (they need not sum to 1 before normalisation).
+    Days a category has no peer return count as 0 for that slice."""
+    if weights.empty or index.empty:
         return None
+    cat_r = category_daily_returns(list(code_category.values()), index[0].date(), index[-1].date()).reindex(index).fillna(0.0)
+    if cat_r.empty:
+        return None
+    w = weights.reindex(index).fillna(0.0)
+    w = w.div(w.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
+    r = sum(w[code] * cat_r[cat] for code, cat in code_category.items() if cat in cat_r.columns and code in w.columns)
+    if isinstance(r, int):      # no holding had a category series
+        return None
+    r.iloc[0] = 0.0             # the index starts at 100 on the first date
+    return 100.0 * (1.0 + r).cumprod()
+
+
+def blend_components(weights_now: Dict[int, float], code_category: Dict[int, str]) -> List[Dict[str, Any]]:
+    by_cat: Dict[str, float] = {}
+    for code, w in weights_now.items():
+        by_cat[code_category.get(code) or "Unknown"] = by_cat.get(code_category.get(code) or "Unknown", 0.0) + w
+    total = sum(by_cat.values()) or 1.0
+    return sorted(({"category": c, "weight_pct": v / total * 100.0} for c, v in by_cat.items()), key=lambda x: -x["weight_pct"])
 
 
 def _asof_index(index: pd.DatetimeIndex, day: datetime.date) -> pd.Timestamp:
@@ -125,7 +133,7 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
 
     codes = sorted({int(t["scheme_code"]) for t in txns})
     first = min(t["trade_date"] for t in txns)
-    bench_code = benchmark or _benchmark_code(portfolio_ids)
+    bench_code = benchmark or explicit_benchmark(portfolio_ids)
     load_codes = codes + ([bench_code] if bench_code and bench_code not in codes else [])
     nav_long = db.get_nav_history_dataframe(load_codes, start_date=first - datetime.timedelta(days=15))
     if nav_long.empty:
@@ -144,32 +152,94 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
     unit_delta = pd.DataFrame(0.0, index=idx, columns=codes)
     pf_flow = pd.Series(0.0, index=idx)
     hold_flow = pd.DataFrame(0.0, index=idx, columns=codes)
+    # The units an *external* flow brought in or took out, kept apart from switches and
+    # dividend reinvestments (which move units without any money crossing the portfolio
+    # boundary). Used below to value the book at the moment of the flow.
+    flow_units = pd.DataFrame(0.0, index=idx, columns=codes)
+    # A dividend paid out leaves through the NAV, not through units: no unit delta
+    # carries it, so it is tracked on its own.
+    payout = pd.Series(0.0, index=idx)
     for t in txns:
         d, code, ttype, amt = _asof_index(idx, t["trade_date"]), int(t["scheme_code"]), t["txn_type"], float(t["amount"])
-        unit_delta.at[d, code] += ledger.unit_sign(ttype) * float(ledger.effective_units(t))
+        signed_units = ledger.unit_sign(ttype) * float(ledger.effective_units(t))
+        unit_delta.at[d, code] += signed_units
         pf_flow.at[d] += PORTFOLIO_FLOW_SIGN.get(ttype, 0) * amt
         hold_flow.at[d, code] += HOLDING_FLOW_SIGN.get(ttype, 0) * amt
+        if PORTFOLIO_FLOW_SIGN.get(ttype, 0):
+            flow_units.at[d, code] += signed_units
+        if ttype == "DIVIDEND_PAYOUT":
+            payout.at[d] += amt
 
-    values_by_code = (unit_delta.cumsum().clip(lower=0.0) * held_nav.fillna(0.0)).fillna(0.0)
+    units_held = unit_delta.cumsum().clip(lower=0.0)
+    values_by_code = (units_held * held_nav.fillna(0.0)).fillna(0.0)
     value = values_by_code.sum(axis=1)
 
+    # --- Daily return, sub-periods split at the cash flow ---------------------------
+    #
+    # A day carrying an external flow is two sub-periods, valued at the flow and
+    # chain-linked:
+    #
+    #   pre_t  = V_t - (what the flow itself put on the book at today's NAV)
+    #   r1_t   = pre_t / V_{t-1} - 1            what the holdings did before the flow
+    #   r2_t   = V_t / (pre_t + F_t) - 1        what the post-flow book then did
+    #   r_t    = (1 + r1_t)(1 + r2_t) - 1
+    #
+    # This is the standard time-weighted treatment of a large flow -- the one GIPS
+    # requires -- and what it buys over the one-line r_t = (V_t - F_t)/V_{t-1} - 1 is
+    # *where the friction lands*. A purchase does not add its full rupee amount to the
+    # book: stamp duty comes out of it and the AMC rounds units to 3 decimals, so V_t
+    # falls short of pre_t + F_t by a few rupees. The one-line form charges that whole
+    # shortfall to V_{t-1}. On 2026-09-15 portfolio 2 opened at Rs 1,499.39 and took in
+    # Rs 1,000,000: ~Rs 20 of purchase friction measured against a Rs 1,499 base read as
+    # -1.35% for the day, and then dominated every window containing it -- a red "-1.18%"
+    # headline sitting above a green "+Rs 2,925.50". Chain-linking charges it to the base
+    # that actually bore it (pre_t + F_t), where it is a couple of thousandths of a percent.
+    #
+    # A threshold ("fall back to something else when the opening value is small next to
+    # the flow") was the alternative and is rejected deliberately: it needs a constant to
+    # tune, it flips behaviour discontinuously on either side of that constant, and it is
+    # wrong in degree everywhere below the cut rather than only at the extreme. The split
+    # has no constant, and on a flow-free day it collapses to the one-line form exactly
+    # (pre_t == V_t and F_t == 0, so r2_t == 0), so settled figures do not move.
+    #
+    # pre_t is built by subtracting the flow's own book effect from V_t rather than by
+    # revaluing yesterday's units, because the two differ for the flows that move no
+    # units: a dividend payout leaves through the NAV (add it back), while a switch or a
+    # dividend reinvestment moves units but no money (nothing to take out).
+    flow_book = (flow_units * held_nav.fillna(0.0)).fillna(0.0).sum(axis=1)
+    pre_flow = value - flow_book + payout
+    post_flow = pre_flow + pf_flow
     prev = value.shift(1).fillna(0.0)
-    r = pd.Series(0.0, index=idx)
+
+    r1 = pd.Series(0.0, index=idx)
     has_base = prev >= MIN_BASE_VALUE
-    r[has_base] = (value[has_base] - pf_flow[has_base]) / prev[has_base] - 1.0
-    fresh = (~has_base) & (pf_flow > 0)
-    r[fresh] = value[fresh] / pf_flow[fresh] - 1.0
+    r1[has_base] = pre_flow[has_base] / prev[has_base] - 1.0
+    # MIN_BASE_VALUE still guards the *empty* book at both ends: a portfolio not opened
+    # yet, and the paise of rounding crumbs left after a full redemption, which must
+    # never become the base of a four-digit "return".
+    r2 = pd.Series(0.0, index=idx)
+    funded = post_flow >= MIN_BASE_VALUE
+    r2[funded] = value[funded] / post_flow[funded] - 1.0
+    r = (1.0 + r1) * (1.0 + r2) - 1.0
     twr = 100.0 * (1.0 + r).cumprod()
 
-    bench = None
-    bench_name = None
+    bench, bench_name, components = None, None, []
     if bench_code and bench_code in nav.columns:
         b = nav[bench_code].reindex(idx).ffill()
         first_valid = b.first_valid_index()
         if first_valid is not None:
             bench = 100.0 * b / b.loc[first_valid]
-            names = nav_long.loc[nav_long["scheme_code"] == bench_code, "scheme_name"]
-            bench_name = names.iloc[0] if not names.empty else str(bench_code)
+            bench_name = hdb.display_name(hdb.scheme_meta([bench_code]).get(bench_code, {"scheme_code": bench_code}))
+    elif not bench_code:
+        # Yesterday's holding weights applied to today's peer returns (day one uses its own mix).
+        code_cat = {c: m.get("category") for c, m in hdb.scheme_meta(codes).items()}
+        weights = values_by_code.shift(1)
+        weights.iloc[0] = values_by_code.iloc[0]
+        bench = blend_index(weights, code_cat, idx)
+        if bench is not None:
+            bench_name = BLEND_NAME
+            last = values_by_code.iloc[-1]
+            components = blend_components({c: float(last[c]) for c in codes if last[c] > 0}, code_cat)
 
     return {
         "empty": False,
@@ -184,6 +254,7 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
         "nav": held_nav,
         "bench_code": bench_code if bench is not None else None,
         "bench_name": bench_name,
+        "bench_components": components,
         "bench": bench,
     }
 
@@ -235,6 +306,119 @@ def _annualise(ret: Optional[float], start: pd.Timestamp, end: pd.Timestamp) -> 
     return (quant_analytics.calendar_day_cagr(ret, start, end) if (end - start).days >= 365 else ret) * 100.0
 
 
+#: Trailing windows for the Holdings tab's tiles, counted in NAV days rather than calendar
+#: days -- "the last 2 days" over a weekend would otherwise be two days in which nothing
+#: could possibly have changed.
+RECENT_WINDOWS: Tuple[int, ...] = (2, 5, 7, 10)
+
+
+def recent_changes(pid: str, windows: Tuple[int, ...] = RECENT_WINDOWS) -> Dict[str, Any]:
+    """How the holdings themselves moved over the last N NAV days, per window.
+
+    Time-weighted, not the raw change in portfolio value: money paid in during the window
+    would otherwise read as a gain. The rupee figure is the market gain on that basis --
+    each day's value change minus that day's own contribution or withdrawal."""
+    ts = timeseries(pid)
+    if ts["empty"]:
+        return {"empty": True, "windows": []}
+
+    idx: pd.DatetimeIndex = ts["index"]
+    level, value, flows, bench = ts["twr"], ts["value"], ts["flows"], ts["bench"]
+    end = idx[-1]
+    # Daily market gain in rupees: what the holdings did, with the day's own flow removed.
+    market_gain = value.diff().fillna(0.0) - flows.reindex(idx).fillna(0.0)
+
+    out = []
+    for days in windows:
+        # N NAV days means N daily changes, so the window opens one row earlier.
+        available = len(idx) >= days + 1
+        start = idx[-(days + 1)] if available else idx[0]
+        ret = _period_return(level, start, end) if available else None
+        # The same window of the peer benchmark the Performance tab plots, so a tile can say
+        # whether a move was the funds or just the market they sit in: +0.04% reads very
+        # differently when the funds' own categories did +0.10% over the same days.
+        bench_ret = _period_return(bench, start, end) if (available and bench is not None) else None
+        gain = float(market_gain.loc[start:end].iloc[1:].sum()) if available else None
+        out.append({
+            "days": days,
+            "available": available,
+            "start": start.strftime("%Y-%m-%d") if available else None,
+            "change_pct": ret * 100.0 if ret is not None else None,
+            # The per-day rate that compounds to the window's return, not a plain mean:
+            # the plain mean of daily returns would not reproduce the figure above it.
+            "avg_daily_pct": ((1.0 + ret) ** (1.0 / days) - 1.0) * 100.0 if ret is not None else None,
+            "gain": gain,
+            "benchmark_change_pct": bench_ret * 100.0 if bench_ret is not None else None,
+            "excess_pp": (ret - bench_ret) * 100.0 if (ret is not None and bench_ret is not None) else None,
+            "nav_days_held": max(len(idx) - 1, 0),
+            # NAV days, not calendar days: holidays make a date promise unkeepable.
+            "days_needed": 0 if available else days + 1 - len(idx),
+        })
+    return {"empty": False, "as_of": end.strftime("%Y-%m-%d"), "benchmark_name": ts["bench_name"], "windows": out}
+
+
+def since_start(pid: str) -> Dict[str, Any]:
+    """Time-weighted return since the first investment, beside the peer benchmark.
+
+    This is the headline answer XIRR cannot give for a young portfolio: XIRR is withheld
+    for the first MIN_XIRR_DAYS because annualising a few days' return exaggerates it, but
+    "how have my funds done so far, and did they beat the funds they compete with" has an
+    honest answer from day two. Same basis as the Performance tab's "Since start" row."""
+    ts = timeseries(pid)
+    if ts["empty"]:
+        return {"twr_pct": None, "benchmark_pct": None, "excess_pp": None, "start": None, "benchmark_name": None}
+    idx: pd.DatetimeIndex = ts["index"]
+    first, end = idx[0], idx[-1]
+    ret = _period_return(ts["twr"], first, end) if len(idx) > 1 else None
+    bench_ret = _period_return(ts["bench"], first, end) if (len(idx) > 1 and ts["bench"] is not None) else None
+    return {
+        "twr_pct": ret * 100.0 if ret is not None else None,
+        "benchmark_pct": bench_ret * 100.0 if bench_ret is not None else None,
+        "excess_pp": (ret - bench_ret) * 100.0 if (ret is not None and bench_ret is not None) else None,
+        "start": first.strftime("%Y-%m-%d"),
+        "benchmark_name": ts["bench_name"],
+    }
+
+
+def day_change(pid: str) -> Dict[str, Any]:
+    """The portfolio's 1-day change for the headline KPI tile: {gain, change_pct, as_of}.
+
+    Just the shortest trailing window, from the same engine as the "Last N days" tiles
+    that sit directly beneath it, so the two rows cannot contradict each other.
+
+    It used to be computed separately, as units x nav x (1 - 1/(1 + change_1d_pct/100)),
+    which was wrong twice over: it rebuilt yesterday's value from a percentage
+    summary_table rounds to 4 decimals (Rs 0.63 out on a real portfolio), and it applied
+    today's NAV move to units bought *today*, which had not been held for it. Those are
+    both properties of the formula, not bugs in it -- the only durable fix is to have one
+    engine rather than two."""
+    rc = recent_changes(pid, windows=(1,))
+    window = rc["windows"][0] if rc["windows"] else None
+    if window is None or not window["available"]:
+        # One NAV day of history (or none): there is no previous close to move from.
+        return {"gain": 0.0, "change_pct": None, "benchmark_change_pct": None, "as_of": rc.get("as_of")}
+    return {"gain": window["gain"], "change_pct": window["change_pct"],
+            "benchmark_change_pct": window["benchmark_change_pct"], "as_of": rc["as_of"]}
+
+
+def gain_shares(gains: List[float]) -> Tuple[List[float], float, float]:
+    """Each fund's share of the gains (or of the losses), plus the gross gain and gross loss.
+
+    Shares are taken against the GROSS gains and GROSS losses separately, not against the
+    net total. A share of the net is only well-defined while every fund is up: once one
+    fund loses money the net shrinks, the winners' shares climb past 100%, and near a net of
+    zero they run off to thousands of percent with the sign flipping as it crosses. Split
+    this way, winners always sum to 100% of what was made and losers to -100% of what was
+    lost -- and while nothing is down, it is identical to the plain share of the total."""
+    gross_gain = sum(g for g in gains if g > 0)
+    gross_loss = sum(g for g in gains if g < 0)
+    shares = [g / gross_gain * 100.0 if g > 0
+              else g / -gross_loss * 100.0 if g < 0
+              else 0.0
+              for g in gains]
+    return shares, gross_gain, gross_loss
+
+
 def performance(pid: str, benchmark: Optional[int] = None) -> Dict[str, Any]:
     ts = timeseries(pid, benchmark)
     if ts["empty"]:
@@ -268,18 +452,17 @@ def performance(pid: str, benchmark: Optional[int] = None) -> Dict[str, Any]:
     contrib = []
     for code in vb.columns:
         gain = float(vb[code].iloc[-1] - hf[code].sum())
-        contrib.append({"scheme_code": int(code), "scheme_name": meta.get(int(code), {}).get("scheme_name"),
+        contrib.append({"scheme_code": int(code), "scheme_name": hdb.display_name(meta.get(int(code), {"scheme_code": int(code)})),
                         "gain": gain, "end_value": float(vb[code].iloc[-1])})
     total_gain = sum(c["gain"] for c in contrib)
-    for c in contrib:
-        c["share_pct"] = (c["gain"] / total_gain * 100.0) if abs(total_gain) > 1e-9 else None
+    total_value = sum(c["end_value"] for c in contrib)
+    shares, gross_gain, gross_loss = gain_shares([c["gain"] for c in contrib])
+    for c, share in zip(contrib, shares):
+        c["gain_share_pct"] = share
+        # Weight by value today, so a fund you have fully exited reads 0% of your money
+        # beside whatever share of the gain it banked on the way out.
+        c["weight_pct"] = c["end_value"] / total_value * 100.0 if total_value > 0 else None
     contrib.sort(key=lambda c: -abs(c["gain"]))
-
-    monthly = ts["flows"].groupby(ts["flows"].index.to_period("M"))
-    monthly_flows = [
-        {"month": str(p), "invested": float(g[g > 0].sum()), "withdrawn": float(-g[g < 0].sum())}
-        for p, g in monthly if (g != 0).any()
-    ]
 
     return {
         "empty": False,
@@ -291,10 +474,12 @@ def performance(pid: str, benchmark: Optional[int] = None) -> Dict[str, Any]:
             "twr_index": _series(ts["twr"]),
             "benchmark_index": _series(ts["bench"]),
         },
-        "benchmark": {"scheme_code": ts["bench_code"], "scheme_name": ts["bench_name"]},
+        "benchmark": {"scheme_code": ts["bench_code"], "scheme_name": ts["bench_name"],
+                      "kind": "scheme" if ts["bench_code"] else "category_blend",
+                      "components": ts["bench_components"]},
         "periods": periods,
-        "attribution": {"total_gain": total_gain, "holdings": contrib},
-        "monthly_flows": monthly_flows,
+        "attribution": {"total_gain": total_gain, "gross_gain": gross_gain, "gross_loss": gross_loss,
+                        "holdings": contrib},
     }
 
 
@@ -318,10 +503,36 @@ def _open_positions(pid: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     shared cached object and must not be mutated."""
     summ = svc.summary(pid)
     positions = [
-        {**p, "asset_class": classify(p.get("category"), p.get("broad_category"), p.get("scheme_name"))}
+        {**p, "asset_class": p.get("asset_class") or classify(p.get("category"), p.get("broad_category"), p.get("scheme_name"))}
         for p in summ["positions"] if not p["is_closed"] and p["current_value"] > 0
     ]
     return positions, summ
+
+
+def _by_portfolio(summ: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Household view only: each portfolio's value, share and asset-class mix, so the
+    combined picture can be traced back to whose money it is."""
+    ids = summ["portfolio_ids"]
+    if len(ids) < 2:
+        return None
+    rows = []
+    for pf in ids:
+        positions, _ = _open_positions(str(pf))
+        value = sum(p["current_value"] for p in positions)
+        if value <= 0:
+            continue
+        meta = hdb.get_portfolio(pf) or {}
+        rows.append({
+            "portfolio_id": pf,
+            "bucket": meta.get("name") or f"Portfolio {pf}",
+            "value": value,
+            "fund_count": len(positions),
+            "by_asset_class": {r["bucket"]: r["weight_pct"] for r in _group(positions, lambda p: p["asset_class"])},
+        })
+    total = sum(r["value"] for r in rows)
+    for r in rows:
+        r["weight_pct"] = r["value"] / total * 100.0 if total > 0 else 0.0
+    return sorted(rows, key=lambda r: -r["value"])
 
 
 def allocation(pid: str) -> Dict[str, Any]:
@@ -330,18 +541,25 @@ def allocation(pid: str) -> Dict[str, Any]:
     weights = np.array([p["current_value"] / total for p in positions]) if total > 0 else np.array([])
     hhi = float((weights ** 2).sum()) if weights.size else None
     top = sorted(weights, reverse=True)
+    by_amc = _group(positions, lambda p: p.get("fund_house"))
     out: Dict[str, Any] = {
         "total_value": total,
+        # Every weight on this tab is by market value today (units x latest NAV), not by
+        # the money paid in: allocation is about where the money IS.
+        "basis": "current_value",
+        "as_of": summ.get("as_of"),
         "by_asset_class": _group(positions, lambda p: p["asset_class"]),
-        "by_category": _group(positions, lambda p: p.get("category")),
-        "by_amc": _group(positions, lambda p: p.get("fund_house")),
+        "by_category": _group(positions, lambda p: svc.sebi_category(p.get("category"))),
+        "by_amc": by_amc,
         "by_plan": _group(positions, lambda p: p.get("plan_type") or "Unspecified"),
         "by_option": _group(positions, lambda p: p.get("option_type") or "Unspecified"),
-        "holdings": [
-            {"scheme_code": p["scheme_code"], "scheme_name": p["scheme_name"], "asset_class": p["asset_class"],
-             "category": p.get("category"), "value": p["current_value"], "weight_pct": p.get("weight_pct")}
+        "by_portfolio": _by_portfolio(summ),
+        "holdings": sorted([
+            {"scheme_code": p["scheme_code"], "scheme_name": p["display_name"], "asset_class": p["asset_class"],
+             "category": svc.sebi_category(p.get("category")), "fund_house": p.get("fund_house"),
+             "riskometer": p.get("riskometer"), "value": p["current_value"], "weight_pct": p.get("weight_pct")}
             for p in positions
-        ],
+        ], key=lambda h: (ASSET_CLASSES.index(h["asset_class"]), -h["value"])),
         # Herfindahl-Hirschman index and its reciprocal, the effective number of funds
         # (the same ENC definition risk_budgeting.compute_risk_budgeting reports).
         "concentration": {
@@ -350,6 +568,12 @@ def allocation(pid: str) -> Dict[str, Any]:
             "top1_pct": float(top[0] * 100) if top else None,
             "top3_pct": float(sum(top[:3]) * 100) if top else None,
             "fund_count": len(positions),
+            # Fund-house concentration is a separate risk from fund concentration: an
+            # AMC-level event (Franklin Templeton's 2020 debt wind-up) hits every one of
+            # its schemes at once, however many of them you spread across.
+            "amc_count": len(by_amc),
+            "top_amc": by_amc[0]["bucket"] if by_amc else None,
+            "top_amc_pct": by_amc[0]["weight_pct"] if by_amc else None,
         },
         "asset_classes": ASSET_CLASSES,
         "targets": None,
@@ -436,7 +660,7 @@ def rebalance_with_new_money(pid: str, new_money: float) -> Dict[str, Any]:
             "after_pct": after / total_after * 100.0,
             "target_pct": float(targets.get(c, 0.0)),
             "suggested_scheme_code": in_class[0]["scheme_code"] if (in_class and amount > 0) else None,
-            "suggested_scheme_name": in_class[0]["scheme_name"] if (in_class and amount > 0) else None,
+            "suggested_scheme_name": in_class[0]["display_name"] if (in_class and amount > 0) else None,
         })
     return {"new_money": new_money, "rows": rows,
             "note": "Uses new money only; nothing is sold. Where a class has no holding yet, pick a fund for it."}

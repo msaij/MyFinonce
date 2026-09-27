@@ -1022,3 +1022,64 @@ describe("DataTable - Interactive Component & DOM Tests", () => {
     await expect(clickHeader(codeHeader)).resolves.not.toThrow();
   });
 });
+
+describe('DataTable - "pct" format (TER)', () => {
+  let container: HTMLDivElement | null = null;
+  let root: Root | null = null;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    if (root && container) {
+      root.unmount();
+      await new Promise((r) => setTimeout(r, 10));
+      container.remove();
+      container = null;
+      root = null;
+    }
+  });
+
+  async function renderTable(ui: React.ReactElement) {
+    root!.render(ui);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+
+  function cellText(): string[] {
+    return Array.from(container!.querySelectorAll("tbody tr")).map(
+      (tr) => tr.querySelectorAll("td")[1]?.textContent?.trim() ?? ""
+    );
+  }
+
+  const columns: ColumnConfig[] = [
+    { key: "name", label: "Scheme Name" },
+    { key: "ter", label: "TER %", format: "pct", decimals: 4 },
+  ];
+
+  it("reproduces AMFI's published string exactly, trailing zeros and all", async () => {
+    // AMFI's TER portal serves these as zero-padded 4-decimal strings: "1.7800", "0.4500",
+    // "0.6200". Anything that drops the padding shows fewer decimals than the source.
+    await renderTable(<DataTable columns={columns} rows={[{ name: "A", ter: 1.78 }, { name: "B", ter: 0.45 }, { name: "C", ter: 0.62 }]} />);
+    expect(cellText()).toEqual(["1.7800%", "0.4500%", "0.6200%"]);
+  });
+
+  it("never signs a cost", async () => {
+    await renderTable(<DataTable columns={columns} rows={[{ name: "A", ter: 0.45 }]} />);
+    expect(cellText()[0]).not.toContain("+");
+  });
+
+  it("still renders missing TER as a dash rather than 0.0000%", async () => {
+    await renderTable(<DataTable columns={columns} rows={[{ name: "A", ter: null }, { name: "B", ter: "" }]} />);
+    expect(cellText()).toEqual(["-", "-"]);
+  });
+
+  it("sorts numerically, not as the formatted string", async () => {
+    // "0.4500%" < "1.7800%" holds lexically, but "10.0000%" < "9.0000%" does not.
+    expect(compareTableValues(10, 9, "pct")).toBeGreaterThan(0);
+    expect(isMissingOrInvalid("abc", "pct")).toBe(true);
+    expect(isMissingOrInvalid(0.45, "pct")).toBe(false);
+  });
+});

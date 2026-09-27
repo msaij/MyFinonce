@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import portfolio_sim
 from app.db import connection
+from app.db import holdings as hdb
 from app.db import migrate
 from app.db import queries as db
 from app.main import app
@@ -37,6 +38,42 @@ def test_fifo_partial_redemption_realises_gain_on_oldest_lot():
     assert pos.realised_gain == Decimal("1100")
     assert pos.cost_basis == Decimal("1200")          # 80 remaining @ 15
     assert pos.avg_cost_nav == Decimal("15")
+
+
+def test_average_days_invested_weights_each_rupee_by_how_long_it_was_in():
+    # The worked example: Rs 1L on 1 Jan 2025, 1L on 1 Jul 2025, 2L on 1 Jun 2026, valued 27 Sep 2026.
+    res = ledger.replay([
+        txn(1, 7, "BUY", d(2025, 1, 1), 100000, 1000),
+        txn(2, 7, "BUY", d(2025, 7, 1), 100000, 1000),
+        txn(3, 8, "SIP", d(2026, 6, 1), 200000, 2000),
+    ])
+    avg = ledger.average_days_invested([res], d(2026, 9, 27))
+    assert avg == pytest.approx((100000 * 634 + 100000 * 453 + 200000 * 118) / 400000)   # ~330.75
+    assert (d(2026, 9, 27) - d(2025, 1, 1)).days == 634
+
+
+def test_a_redemption_retires_the_oldest_money_at_the_sale_date():
+    res = ledger.replay([
+        txn(1, 7, "BUY", d(2024, 1, 1), 1000, 100),      # cost 10/unit
+        txn(2, 7, "BUY", d(2024, 7, 1), 1000, 100),
+        txn(3, 7, "REDEEM", d(2024, 3, 1), 900, 60),     # retires 600 of the Jan money on 1 Mar
+    ])
+    days, put_in = ledger.capital_days(res.capital_flows, d(2025, 1, 1))
+    jan_to_mar, jan_to_end, jul_to_end = 60, 366, 184
+    assert put_in == Decimal("2000")
+    assert days == 600 * jan_to_mar + 400 * jan_to_end + 1000 * jul_to_end
+
+
+def test_switches_and_dividends_keep_money_on_its_original_date():
+    res = ledger.replay([
+        txn(1, 7, "BUY", d(2024, 1, 1), 1000, 100),
+        txn(2, 7, "SWITCH_OUT", d(2024, 6, 1), 1200, 100),
+        txn(3, 8, "SWITCH_IN", d(2024, 6, 1), 1200, 120),
+        txn(4, 8, "DIVIDEND_PAYOUT", d(2024, 9, 1), 50, 0),
+    ])
+    assert res.capital_flows == [(d(2024, 1, 1), Decimal("1000"))]
+    assert ledger.average_days_invested([res], d(2025, 1, 1)) == 366
+    assert ledger.average_days_invested([res], None) is None
 
 
 def test_over_redemption_is_an_error_not_a_crash():
@@ -97,6 +134,15 @@ def test_switch_is_a_holding_flow_but_not_a_portfolio_flow():
     assert res.positions[8].units == Decimal("60")
     assert [cf for _, cf in res.positions[8].cash_flows] == [Decimal("-1200")]
     assert [cf for _, cf in res.portfolio_cash_flows] == [Decimal("-1000")]
+
+
+def test_lot_cost_is_allotted_value_and_stamp_duty_is_tracked_apart():
+    buy = {**txn(1, 7, "BUY", d(2026, 9, 18), "500000.00", "166.582"), "nav": Decimal("3001.3733"), "stamp_duty": Decimal("25.00")}
+    pos = ledger.replay([buy]).positions[7]
+    assert pos.cost_basis == Decimal("499974.77")          # 166.582 x 3001.3733, as an AMC statement / Coin shows it
+    assert pos.stamp_duty == Decimal("25.00")
+    assert pos.total_invested == Decimal("500000.00")       # cash paid, for XIRR
+    assert pos.cash_flows == [(d(2026, 9, 18), Decimal("-500000.00"))]
 
 
 def test_units_scale_puts_pre_split_units_on_amfi_scale():
@@ -221,6 +267,31 @@ def test_switch_writes_a_linked_pair_and_deletes_as_one(seeded):
     assert [t["txn_type"] for t in txns] == ["BUY"]
 
 
+def test_any_real_scheme_can_be_recorded_but_an_unknown_code_cannot(seeded):
+    """The ledger records what the owner actually holds, so no plan/option filter narrows
+    what can be added -- a Regular-plan fund goes in while the global picker says Direct.
+    The only gate is that the code is a real scheme with NAV history."""
+    pid = new_portfolio(seeded)
+    assert add_txn(seeded, portfolio_id=pid, scheme_code=1002, txn_type="BUY",
+                   trade_date="2023-03-01", amount=10000, plan_type="Direct").status_code == 200
+    r = add_txn(seeded, portfolio_id=pid, scheme_code=999999, txn_type="BUY", trade_date="2023-03-01", amount=1000)
+    assert r.status_code == 422 and "AMFI scheme master" in r.json()["detail"]["message"]
+    r = add_txn(seeded, portfolio_id=pid, scheme_code=1001, txn_type="SWITCH", trade_date="2023-03-01",
+                amount=1000, switch_to_scheme_code=999999)
+    assert r.status_code == 422 and "AMFI scheme master" in r.json()["detail"]["message"]
+
+
+def test_funds_carry_the_app_wide_label_with_their_amfi_code(seeded):
+    assert hdb.display_name({"scheme_code": 118859, "scheme_name": "Mirae Asset Liquid Fund",
+                             "plan_type": "Direct", "option_type": "Growth"}) == "Mirae Asset Liquid Fund (Direct - Growth) [118859]"
+    assert hdb.display_name({"scheme_code": 7, "scheme_name": float("nan"), "plan_type": None}) == "Scheme 7 [7]"
+    pid = new_portfolio(seeded)
+    add_txn(seeded, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", amount=10000)
+    label = "Alpha Flexi Cap Fund - Direct Plan - Growth [1001]"  # plan/option already in the name aren't repeated
+    assert seeded.get(f"/api/holdings/portfolios/{pid}/transactions").json()[0]["display_name"] == label
+    assert seeded.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"][0]["display_name"] == label
+
+
 def test_summary_values_units_at_latest_nav_and_household_is_the_sum(seeded):
     a = new_portfolio(seeded, "Self")
     b = new_portfolio(seeded, "Spouse")
@@ -240,6 +311,50 @@ def test_summary_values_units_at_latest_nav_and_household_is_the_sum(seeded):
     regular = next(p for p in hh["positions"] if p["scheme_code"] == 1002)
     assert regular["flags"]["regular_plan"] is True
     assert hh["kpis"]["xirr_pct"] is not None
+
+
+def test_unrealised_gain_matches_statement_convention_and_total_gain_nets_stamp_duty(seeded):
+    """Three Rs 5L purchases at statement NAVs (the shape of a real Coin comparison):
+    unrealised = value - sum(units x purchase NAV); stamp duty shown separately and
+    taken out of total gain only."""
+    pid = new_portfolio(seeded)
+    buys = []
+    for day in (d(2023, 3, 1), d(2023, 3, 2), d(2023, 3, 3)):
+        nav = round(nav_on(1001, day) * 1.0004, 4)
+        row = add_txn(seeded, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date=day.isoformat(),
+                      amount=500000, nav=nav).json()["transactions"][0]
+        buys.append(row)
+    k = seeded.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    allotted = sum(float((Decimal(b["units"]) * Decimal(b["nav"])).quantize(Decimal("0.01"))) for b in buys)
+    units = sum(float(b["units"]) for b in buys)
+    value = units * nav_on(1001, d(2024, 12, 31))
+    stamp = sum(float(b["stamp_duty"]) for b in buys)
+    assert k["invested"] == pytest.approx(allotted, abs=0.01)
+    assert k["unrealised_gain"] == pytest.approx(value - allotted, abs=0.01)
+    assert k["stamp_duty"] == pytest.approx(stamp) and stamp == pytest.approx(75.0, abs=0.01)
+    assert k["total_gain"] == pytest.approx(value - 1500000, abs=0.01)   # what you gained on the cash you paid
+
+
+def test_a_positions_day_change_uses_both_navs_not_the_rounded_percentage(pg_db):
+    """summary_table stores change_1d_pct as ROUND(..., 4). Rebuilding yesterday's value
+    out of that percentage -- units x nav x (1 - 1/(1 + chg/100)) -- reintroduces the
+    rounding as rupees. On the owner's real portfolio it was Rs 0.63 across two funds;
+    the NAV pair used here makes the same error about Rs 10."""
+    seed([(1001, "Alpha Flexi Cap Fund - Direct Plan - Growth", "Alpha MF", "Equity Scheme - Flexi Cap Fund", "Direct", "Growth")],
+         {1001: [(d(2024, 12, 30), 123.4567), (d(2024, 12, 31), 123.9999)]})
+    client = TestClient(app)
+    pid = new_portfolio(client)
+    add_txn(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-30",
+            units=1_000_000, apply_stamp_duty=False)
+
+    pos = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"][0]
+    exact = 1_000_000 * (123.9999 - 123.4567)
+    assert pos["day_change"] == pytest.approx(exact, abs=1e-6)
+
+    meta = hdb.scheme_meta([1001])[1001]
+    assert meta["nav_1d_ago"] == pytest.approx(123.4567)
+    legacy = 1_000_000 * 123.9999 * (1.0 - 1.0 / (1.0 + float(meta["change_1d_pct"]) / 100.0))
+    assert abs(legacy - exact) > 1.0      # the rounding, in rupees
 
 
 def test_user_nav_deviation_warns_but_is_kept(seeded):

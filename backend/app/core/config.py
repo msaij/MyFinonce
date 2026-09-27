@@ -44,8 +44,6 @@ class Settings(BaseSettings):
     amfi_history_url: str = "https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx"
     amfi_daily_url: str = "https://portal.amfiindia.com/spages/NAVAll.txt"
     enable_sync_daemon: bool = True
-    holdout_portfolios: bool = False
-    bl_ui: bool = False
     amfi_ssl_insecure: bool = False
     admin_token_optional: bool = False
     admin_token: str = ""
@@ -65,8 +63,6 @@ settings = Settings()
 def product_flags() -> dict:
     """Public flag map for /api/meta/status. Never includes ADMIN_TOKEN."""
     return {
-        "holdout_portfolios": bool(settings.holdout_portfolios),
-        "bl_ui": bool(settings.bl_ui),
         "admin_auth_required": bool(settings.admin_auth_required),
         "admin_token_configured": bool(settings.admin_token_configured),
         "amfi_ssl_insecure": bool(settings.amfi_ssl_insecure),

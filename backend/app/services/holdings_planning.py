@@ -120,7 +120,8 @@ def generate_instalments(mandate_id: int, confirm: bool) -> Dict[str, Any]:
 
 
 def mandate_view(m: Dict[str, Any]) -> Dict[str, Any]:
-    name = hdb.scheme_meta([m["scheme_code"]]).get(int(m["scheme_code"]), {}).get("scheme_name")
+    code = int(m["scheme_code"])
+    name = hdb.display_name(hdb.scheme_meta([code]).get(code, {"scheme_code": code}))
     return {**svc.to_json(m), "scheme_name": name, "current_amount": float(current_instalment(m)),
             "instalments_recorded": len(hdb.mandate_installment_dates(m["id"])),
             "instalments_pending": len(pending_instalments(m)), "upcoming": upcoming(m)}

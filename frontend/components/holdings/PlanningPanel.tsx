@@ -11,6 +11,7 @@ import { SearchCombobox } from "@/components/shared/SearchCombobox";
 import { StatCard } from "@/components/shared/StatCard";
 import {
   createSipMandate,
+  deleteGoal,
   generateInstalments,
   getGoalStatus,
   listGoals,
@@ -223,8 +224,19 @@ function SipForm({ portfolios, defaultPortfolio, onDone }: { portfolios: Portfol
 // --- Goals --------------------------------------------------------------------------------
 
 function GoalsSection({ portfolios }: { portfolios: Portfolio[] }) {
+  const queryClient = useQueryClient();
   const { data: goals = [] } = useQuery({ queryKey: ["holdings", "goals"], queryFn: listGoals });
   const [editing, setEditing] = useState<Goal | "new" | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const remove = useMutation({
+    mutationFn: deleteGoal,
+    onSuccess: (_r, id) => {
+      setErr(null);
+      queryClient.invalidateQueries({ queryKey: ["holdings", "goals"] });
+      setEditing((e) => (typeof e === "object" && e && e.id === id ? null : e));
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
   return (
     <section className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -241,9 +253,17 @@ function GoalsSection({ portfolios }: { portfolios: Portfolio[] }) {
         )}
       </div>
       {editing !== null && <GoalForm goal={editing === "new" ? null : editing} portfolios={portfolios} onDone={() => setEditing(null)} />}
+      {err && <Banner level="danger">{err}</Banner>}
       {goals.length === 0 && editing === null && <div className="text-sm" style={{ color: "var(--mf-muted)" }}>No goals yet: retirement, a house, a child&apos;s education…</div>}
       {goals.map((g) => (
-        <GoalCard key={g.id} goal={g} portfolios={portfolios} onEdit={() => setEditing(g)} />
+        <GoalCard
+          key={g.id}
+          goal={g}
+          portfolios={portfolios}
+          onEdit={() => setEditing(g)}
+          onDelete={() => remove.mutate(g.id)}
+          deleting={remove.isPending && remove.variables === g.id}
+        />
       ))}
     </section>
   );
@@ -312,7 +332,7 @@ function GoalForm({ goal, portfolios, onDone }: { goal: Goal | null; portfolios:
   );
 }
 
-function GoalCard({ goal, portfolios, onEdit }: { goal: Goal; portfolios: Portfolio[]; onEdit: () => void }) {
+function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal; portfolios: Portfolio[]; onEdit: () => void; onDelete: () => void; deleting: boolean }) {
   const [whatIf, setWhatIf] = useState("");
   const sip = parseNumber(whatIf);
   const debounced = useDebouncedValue(sip, 400);
@@ -349,7 +369,10 @@ function GoalCard({ goal, portfolios, onEdit }: { goal: Goal; portfolios: Portfo
             {formatInr(Number(goal.target_amount))} in today&apos;s money by {formatDate(goal.target_date)} · {linkedNames || "no portfolios linked"}
           </div>
         </div>
-        <button type="button" className="text-xs font-semibold" style={{ color: "var(--mf-accent)" }} onClick={onEdit}>Edit</button>
+        <div className="flex gap-3 text-xs font-semibold">
+          <button type="button" style={{ color: "var(--mf-accent)" }} onClick={onEdit}>Edit</button>
+          <button type="button" style={{ color: "var(--mf-danger)" }} disabled={deleting} onClick={onDelete}>Delete</button>
+        </div>
       </div>
 
       {isLoading && !s && <div className="mt-2 text-sm" style={{ color: "var(--mf-muted)" }}>Projecting…</div>}

@@ -110,8 +110,6 @@ services:
       - ADMIN_TOKEN=mf_local_admin
       - ADMIN_TOKEN_OPTIONAL=false
       - AMFI_SSL_INSECURE=false
-      - HOLDOUT_PORTFOLIOS=false
-      - BL_UI=false
       # Backend --reload: DEV_RELOAD=true docker compose up -d backend
       # Frontend remains a production image — after UI copy changes:
       #   docker compose up -d --build frontend

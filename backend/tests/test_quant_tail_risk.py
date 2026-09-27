@@ -96,6 +96,26 @@ class TestExpectedShortfallAndTailRisk:
         # Annualized values maintain same ordering
         assert metrics["cvar_99_ann_pct"] <= metrics["var_99_ann_pct"] + 1e-6
 
+    def test_tail_metrics_annualize_on_the_series_own_frequency(self):
+        """One return sample laid on two calendars. A liquid fund's daily VaR is the same
+        number either way, but annualising it must scale by sqrt(365.25/252) = 1.20x --
+        before, both series were annualised on 252 and the daily fund read 17% too calm."""
+        rng = np.random.default_rng(505)
+        rets = rng.normal(0.0002, 0.004, 800)
+
+        def tail(freq: str) -> dict:
+            dates = pd.date_range("2021-01-01", periods=800, freq=freq)
+            df = pd.DataFrame({"nav_date": dates, "nav": 100.0 * np.cumprod(1.0 + rets), "daily_return": rets})
+            return quant_analytics.compute_tail_risk_metrics(df)
+
+        cal, trd = tail("D"), tail("B")
+        assert cal["obs_per_year"] == pytest.approx(365.25, abs=1.0)
+        assert abs(trd["obs_per_year"] - 252.0) / 252.0 < 0.06
+        assert cal["var_95_daily_pct"] == pytest.approx(trd["var_95_daily_pct"])
+        scale = math.sqrt(cal["obs_per_year"] / trd["obs_per_year"])
+        assert cal["var_95_ann_pct"] == pytest.approx(trd["var_95_ann_pct"] * scale, rel=1e-3)
+        assert cal["cvar_99_ann_pct"] == pytest.approx(trd["cvar_99_ann_pct"] * scale, rel=1e-3)
+
     def test_drawdown_duration_and_recovery_metrics_hand_crafted(self):
         """Constructs an exact 7-day NAV sequence with known peak, trough, and recovery."""
         dates = pd.date_range("2024-01-01", periods=7, freq="D")

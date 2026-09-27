@@ -64,10 +64,10 @@ def regular_plan_costs(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             gap = float(reg_ter) - float(dir_ter)
             cost = p["current_value"] * gap / 100.0
             total_cost += max(cost, 0.0)
-            priced.append({"scheme_code": p["scheme_code"], "scheme_name": p["scheme_name"], "direct_code": twin,
-                           "direct_name": twin_meta[twin].get("scheme_name"), "ter_gap_pct": gap, "annual_cost": cost})
+            priced.append({"scheme_code": p["scheme_code"], "scheme_name": p["display_name"], "direct_code": twin,
+                           "direct_name": twin_meta[twin]["display_name"], "ter_gap_pct": gap, "annual_cost": cost})
         else:
-            unpriced.append(p["scheme_name"])
+            unpriced.append(p)
     if priced:
         names = ", ".join(x["scheme_name"] for x in priced[:3]) + ("…" if len(priced) > 3 else "")
         out.append(_insight(
@@ -82,26 +82,33 @@ def regular_plan_costs(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "regular_plan_unpriced", "info",
             f"{len(unpriced)} Regular plan{'s' if len(unpriced) > 1 else ''} without a comparable Direct TER",
             "We couldn't find an official TER for both the Regular plan and its Direct twin, so we don't estimate the cost: "
-            + ", ".join(unpriced[:3]) + ".",
-            [p["scheme_code"] for p in regulars if p["scheme_name"] in unpriced],
+            + ", ".join(p["display_name"] for p in unpriced[:3]) + ".",
+            [p["scheme_code"] for p in unpriced],
         ))
     return out
 
 
 def concentration(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    w = sorted([p for p in positions if p.get("weight_pct")], key=lambda p: -p["weight_pct"])
-    if len(w) < 2:
-        return []
-    top1, top2 = w[0]["weight_pct"], w[0]["weight_pct"] + w[1]["weight_pct"]
+    """Concentration among MARKET-LINKED money only. A large slice in a liquid,
+    overnight or arbitrage fund is parking, not a bet on one manager, so cash
+    equivalents are left out (their weights are re-based over what remains)."""
+    at_risk = [p for p in positions if p.get("current_value", 0) > 0
+               and ha.classify(p.get("category"), p.get("broad_category"), p.get("scheme_name")) != "Cash & Liquid"]
+    total = sum(p["current_value"] for p in at_risk)
+    w = sorted(({**p, "risk_weight": p["current_value"] / total * 100.0} for p in at_risk), key=lambda p: -p["risk_weight"])
     out = []
-    if top1 >= CONCENTRATION_TOP1_PCT or top2 >= CONCENTRATION_TOP2_PCT:
-        out.append(_insight(
-            "concentration", "info",
-            f"Your top {'fund is' if top1 >= CONCENTRATION_TOP1_PCT else 'two funds are'} {top1 if top1 >= CONCENTRATION_TOP1_PCT else top2:.0f}% of the portfolio",
-            f"{w[0]['scheme_name']} ({top1:.1f}%) and {w[1]['scheme_name']} ({w[1]['weight_pct']:.1f}%). "
-            "Concentration isn't wrong in itself, but one fund's manager or mandate then drives most of the outcome.",
-            [w[0]["scheme_code"], w[1]["scheme_code"]], top1_pct=top1, top2_pct=top2,
-        ))
+    if len(w) >= 2:
+        top1, top2 = w[0]["risk_weight"], w[0]["risk_weight"] + w[1]["risk_weight"]
+        if top1 >= CONCENTRATION_TOP1_PCT or top2 >= CONCENTRATION_TOP2_PCT:
+            out.append(_insight(
+                "concentration", "info",
+                f"Your top {'fund is' if top1 >= CONCENTRATION_TOP1_PCT else 'two funds are'} "
+                f"{top1 if top1 >= CONCENTRATION_TOP1_PCT else top2:.0f}% of your market-linked money",
+                f"{w[0]['display_name']} ({top1:.1f}%) and {w[1]['display_name']} ({w[1]['risk_weight']:.1f}%), excluding "
+                "liquid, overnight and arbitrage funds. Concentration isn't wrong in itself, but one fund's manager or "
+                "mandate then drives most of the outcome.",
+                [w[0]["scheme_code"], w[1]["scheme_code"]], top1_pct=top1, top2_pct=top2,
+            ))
     if len(w) >= MANY_FUNDS:
         out.append(_insight(
             "many_funds", "info", f"{len(w)} funds held",
@@ -123,7 +130,7 @@ def peer_ranking(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if r["percentile"] <= BOTTOM_QUARTILE:
             out.append(_insight(
                 "bottom_quartile", "warning",
-                f"{p['scheme_name']} is in the bottom quarter of its category",
+                f"{p['display_name']} is in the bottom quarter of its category",
                 f"Its {horizon} return of {r['value']:+.2f}% ranks at the {r['percentile']:.0f}th percentile among {r['peers']} active "
                 f"{p.get('plan_type') or ''} {p.get('category') or ''} schemes. One period says little about skill; worth a look, not a verdict.",
                 [p["scheme_code"]], percentile=r["percentile"], peers=r["peers"], horizon=horizon,
@@ -144,7 +151,7 @@ def stale_navs(positions: List[Dict[str, Any]], as_of: Optional[datetime.date], 
         if age >= days or p["flags"]["stale_nav"]:
             out.append(_insight(
                 "stale_nav", "danger",
-                f"{p['scheme_name']} hasn't published a NAV since {d.isoformat()}",
+                f"{p['display_name']} hasn't published a NAV since {d.isoformat()}",
                 f"{age} days without a NAV. The scheme may have been merged, wound up or renamed to a new AMFI code. "
                 "Your value for it is frozen at the last NAV. Check your latest statement.",
                 [p["scheme_code"]], days=age, latest_date=d.isoformat(),
@@ -169,6 +176,15 @@ def drift(pid: str) -> List[Dict[str, Any]]:
     return out
 
 
+def realised_drawdown(r: Dict[str, Any]) -> Optional[float]:
+    """Current drawdown from the portfolio's ACTUAL track record, or None. Never from
+    the current-mix replay a young portfolio's Risk tab falls back to: a drawdown
+    that never happened to you must not raise an insight or an alert."""
+    if r.get("basis") != "realised":
+        return None
+    return (r.get("metrics") or {}).get("current_drawdown_pct")
+
+
 def risk_signals(pid: str) -> List[Dict[str, Any]]:
     out = []
     try:
@@ -178,7 +194,7 @@ def risk_signals(pid: str) -> List[Dict[str, Any]]:
         return out
     if r.get("empty") or r.get("insufficient"):
         return out
-    dd = (r.get("metrics") or {}).get("current_drawdown_pct")
+    dd = realised_drawdown(r)
     if dd is not None and dd <= DEEP_DRAWDOWN_PCT:
         out.append(_insight(
             "drawdown", "info", f"Portfolio is {abs(dd):.1f}% below its peak",
@@ -198,6 +214,23 @@ def risk_signals(pid: str) -> List[Dict[str, Any]]:
 
 # --- Public -----------------------------------------------------------------------------------
 
+TER_SEVERITY = {"high": "warning", "inconsistent": "warning", "low": "info", "unverified": "info", "missing": "info"}
+
+
+def ter_quality(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Data quality: expense ratios that look wrong or unverified, judged against
+    the fund's own category (svc.ter_context). A TER that is simply high but in
+    line with its peers is not flagged -- that's the category, not bad data."""
+    ctx = svc.ter_context(hdb.scheme_meta([p["scheme_code"] for p in positions]))
+    names = {p["scheme_code"]: p["display_name"] for p in positions}
+    return [
+        _insight("ter_check", TER_SEVERITY[c["status"]], f"Check {names[code]}'s expense ratio",
+                 c["reason"] + (f" Source date: {c['as_of']}." if c.get("as_of") else ""),
+                 [code], status=c["status"], ter_pct=c["ter_pct"], category_spread=c["category_spread"])
+        for code, c in ctx.items() if c["status"] in TER_SEVERITY
+    ]
+
+
 def insights(pid: str) -> Dict[str, Any]:
     summ = svc.summary(pid)
     positions = [p for p in summ["positions"] if not p["is_closed"]]
@@ -205,6 +238,7 @@ def insights(pid: str) -> Dict[str, Any]:
         return {"insights": [], "as_of": summ["as_of"]}
     items = (
         stale_navs(positions, summ["as_of"])
+        + ter_quality(positions)
         + regular_plan_costs(positions)
         + drift(pid)
         + peer_ranking(positions)
@@ -244,8 +278,7 @@ def evaluate_rule(rule: Dict[str, Any]) -> int:
                 fired += hdb.fire_alert(rule["id"], f"drift:{i['numbers']['asset_class']}:{period}", "warning", i["title"])
     elif kind == "drawdown":
         threshold = -abs(float(rule["threshold"] or 10))
-        r = risk_svc.risk(pid)
-        dd = (r.get("metrics") or {}).get("current_drawdown_pct")
+        dd = realised_drawdown(risk_svc.risk(pid))
         if dd is not None and dd <= threshold:
             fired += hdb.fire_alert(rule["id"], f"drawdown:{threshold}:{period}", "warning",
                                     f"Portfolio is {abs(dd):.1f}% below its peak (alert at {abs(threshold):.0f}%)")
@@ -257,7 +290,7 @@ def evaluate_rule(rule: Dict[str, Any]) -> int:
         for p in positions:
             if p["flags"]["regular_plan"]:
                 fired += hdb.fire_alert(rule["id"], f"regular:{p['scheme_code']}", "info",
-                                        f"{p['scheme_name']} is a Regular plan")
+                                        f"{p['display_name']} is a Regular plan")
     return fired
 
 
