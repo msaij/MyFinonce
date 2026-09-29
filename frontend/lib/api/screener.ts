@@ -29,6 +29,9 @@ export interface ScreenerRow {
   low_52w: number | null;
   dist_from_52w_high_pct: number | null;
   isin: string | null;
+  /** SEBI riskometer from AMFI's fund-performance data; null where AMFI publishes none. */
+  riskometer?: string | null;
+  riskometer_as_of?: string | null;
 }
 
 export interface ScreenerKpis {

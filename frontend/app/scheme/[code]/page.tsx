@@ -18,6 +18,8 @@ import { formatDate, formatInr, formatSignedPct, toneOf } from "@/lib/format";
 import { formatSignedInr, formatUnits } from "@/lib/holdings";
 import { AXIS, SERIES_1, SERIES_2 } from "@/lib/holdingsChart";
 import { useDateRangeStore } from "@/lib/stores/dateRange";
+import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
+import { RISK_ABOUT, riskRank } from "@/lib/riskometer";
 
 /** Every horizon summary_table carries, shortest first. `years` marks the ones whose
  *  stored figure is CUMULATIVE over that span -- printing "3 years 22.3%" beside
@@ -214,7 +216,7 @@ export default function SchemeDossierPage() {
   ].filter(Boolean) as string[];
 
   return (
-    <AppShell pageContext={{ label: "Scheme", value: profile.display_name ?? String(code) }}>
+    <AppShell>
       <h1 className="mf-page-title">{profile.display_name ?? profile.scheme_name}</h1>
       <p className="mf-page-caption">
         {[profile.fund_house, profile.category].filter(Boolean).join(" · ")}
@@ -272,7 +274,17 @@ export default function SchemeDossierPage() {
         />
         <StatCard title="Category" value={String(profile.category ?? "—")} sub={String(profile.broad_category ?? "")} />
         <StatCard title="AMC" value={String(profile.fund_house ?? "—")} />
-        <StatCard title="ISIN" value={String(profile.isin ?? "—")} />
+        {/* In the ISIN card's place: the ISIN is already in the caption above. */}
+        <StatCard
+          title="Riskometer"
+          value={profile.riskometer ?? "Not published"}
+          sub={
+            profile.riskometer
+              ? `Level ${riskRank(profile.riskometer)} of 6${profile.riskometer_as_of ? ` · as of ${formatDate(profile.riskometer_as_of)}` : ""}`
+              : "AMFI publishes none for this scheme"
+          }
+          tooltip={<FormulaTooltip label="Riskometer" description={RISK_ABOUT} />}
+        />
       </div>
 
       {position && (

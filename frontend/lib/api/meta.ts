@@ -14,6 +14,10 @@ export interface MetaStatus {
   ter_records_count?: number;
   ter_official_schemes?: number;
   flags?: ProductFlags;
+  /** The sync job running now, from any trigger; null when none is. */
+  sync_activity?: { kind: string; label: string; trigger: string; step: string; started_at: number } | null;
+  /** A historical NAV or TER backfill is running. */
+  backfill_running?: boolean;
 }
 
 export interface ProductFlags {

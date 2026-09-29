@@ -110,7 +110,7 @@ function CompareContent() {
   });
 
   return (
-    <AppShell pageContext={selectedCodes.length ? { label: "Selected Funds", value: String(selectedCodes.length) } : undefined}>
+    <AppShell>
       <h1 className="mf-page-title">Compare & Simulate</h1>
       <p className="mf-page-caption">Compare mutual fund schemes side-by-side, then backtest the same funds together as a weighted portfolio.</p>
 

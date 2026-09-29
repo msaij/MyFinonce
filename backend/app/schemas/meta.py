@@ -23,6 +23,10 @@ class MetaStatus(BaseModel):
     ter_records_count: Optional[int] = 0
     ter_official_schemes: Optional[int] = 0
     flags: dict = {}
+    # The sync job running now (kind, label, trigger, step, started_at), or None.
+    sync_activity: Optional[dict] = None
+    # A historical NAV or TER backfill is running.
+    backfill_running: bool = False
 
 
 class MetaFilters(BaseModel):

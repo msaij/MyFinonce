@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.core.serialize import df_to_records, sanitize_floats
 from app.db import holdings as hdb
 from app.db import queries as db
+from app.db import riskometer
 
 router = APIRouter(prefix="/api/schemes", tags=["schemes"])
 
@@ -92,6 +93,9 @@ def get_scheme_profile(scheme_code: int) -> dict:
     # same way the charts, search box and Holdings do -- the stored scheme_name is only
     # the base fund, which every plan/option variant shares.
     profile["display_name"] = hdb.display_name(profile)
+    # SEBI's riskometer, from the scheme master (the summary row this profile starts from
+    # carries no such column).
+    riskometer.attach([profile])
     # "Good or bad?" needs a peer group, not just a number: percentile among ACTIVE
     # schemes of the same category AND plan type, so a Direct fund is never flattered by
     # being ranked against Regular plans carrying a distributor commission.

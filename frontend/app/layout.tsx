@@ -4,13 +4,12 @@ import { AppProviders } from "@/lib/providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Indian Mutual Funds",
-  description: "AMFI-sourced mutual fund analytics dashboard.",
+  title: "myFinonce",
+  description: "Indian mutual fund analytics on official AMFI data, NSE IPOs and financial calculators.",
 };
 
-// AppShell (Sidebar + DateRangePicker) is applied per-page, not here, so each
-// page can pass its own pageContext (see fetcher/date_picker.py's
-// page_context param) -- see app/page.tsx for the pattern.
+// AppShell (Sidebar + controls bar) is applied per-page, not here, so a page outside the
+// mutual-fund analytics can drop the fund controls (hideDateRange) -- see app/page.tsx.
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {

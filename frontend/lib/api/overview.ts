@@ -157,6 +157,9 @@ export interface FundListRow {
   return_1y_pct: number | null;
   return_3y_pct: number | null;
   return_5y_pct: number | null;
+  /** SEBI riskometer from AMFI's fund-performance data; null where AMFI publishes none. */
+  riskometer: string | null;
+  riskometer_as_of: string | null;
 }
 
 export const getAllFunds = (planType = "All Plans", optionType = "All Options") =>

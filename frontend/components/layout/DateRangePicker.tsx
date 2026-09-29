@@ -2,11 +2,13 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 import { getMetaFilters, getMetaStatus } from "@/lib/api/meta";
 import { formatDate } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
+import { triggerText } from "@/lib/syncJobs";
 import {
   PRESET_OPTIONS,
   Preset,
@@ -72,8 +74,10 @@ export function DateRangePicker() {
   const { data: status } = useQuery({
     queryKey: ["meta-status"],
     queryFn: getMetaStatus,
-    refetchInterval: 60_000,
+    // Faster while data is updating, so the line below clears soon after the sync ends.
+    refetchInterval: (q) => (q.state.data?.sync_activity || q.state.data?.backfill_running ? 10_000 : 60_000),
   });
+  const activity = status?.sync_activity;
 
   useEffect(() => {
     if (!status) return;
@@ -181,16 +185,48 @@ export function DateRangePicker() {
         </div>
       </div>
 
-      {/* Sync Status Banner */}
-      <div className="text-[0.72rem]" style={{ color: isBeforeMin ? "var(--mf-warning)" : "var(--mf-muted)" }}>
-        {isBeforeMin ? (
-          <>
-            ⚠️ Selected: {formatDate(start)} to {formatDate(end)} ({span}D) | Local data begins: {formatDate(status?.min_date)}
-          </>
-        ) : (
-          <>
-            🟢 Synced through {formatDate(status?.max_date)} | Active: {formatDate(start)} to {formatDate(end)} ({span}D)
-          </>
+      {/* Status row: how current the data is, and -- beside it -- whether it is updating now. */}
+      <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-[0.72rem]">
+        <span style={{ color: isBeforeMin || status?.is_stale ? "var(--mf-warning)" : "var(--mf-muted)" }}>
+          {isBeforeMin ? (
+            <>
+              ⚠️ Selected: {formatDate(start)} to {formatDate(end)} ({span}D) | Local data begins: {formatDate(status?.min_date)}
+            </>
+          ) : status?.is_stale ? (
+            // The app's one NAV-freshness signal: it says so when AMFI has published newer NAVs.
+            <>
+              ⚠️ NAVs only through {formatDate(status.max_date)}; AMFI has published up to{" "}
+              {status.expected_date ? formatDate(status.expected_date) : "a later day"} ·{" "}
+              <Link href="/admin" className="font-semibold underline">
+                catch up in Data Management
+              </Link>{" "}
+              | Active: {formatDate(start)} to {formatDate(end)} ({span}D)
+            </>
+          ) : (
+            <>
+              🟢 Synced through {formatDate(status?.max_date)} | Active: {formatDate(start)} to {formatDate(end)} ({span}D)
+            </>
+          )}
+        </span>
+
+        {(activity || status?.backfill_running) && (
+          <Link
+            href="/admin"
+            role="status"
+            title={activity ? "Figures may change when it finishes. Click for details in Data Management." : "Click for progress in Data Management."}
+            className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-semibold"
+            style={{ borderColor: "var(--mf-accent)", background: "var(--mf-accent-bg)", color: "var(--mf-accent)" }}
+          >
+            <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent" aria-hidden />
+            {activity ? (
+              <>
+                Updating AMFI data · {activity.label}
+                {activity.trigger && activity.trigger !== "manual" ? ` (${triggerText(activity.trigger)})` : ""} · {activity.step}…
+              </>
+            ) : (
+              <>Historical backfill running…</>
+            )}
+          </Link>
         )}
       </div>
     </div>

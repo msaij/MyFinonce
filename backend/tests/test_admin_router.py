@@ -58,23 +58,52 @@ class TestStatus:
         assert body["cost_coverage"]["total_schemes"] == 2
 
 
+def _wait_for_job(client, timeout=10.0):
+    """Manual syncs run in the background; wait for the tracker to go idle."""
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        job = client.get("/api/admin/status").json()["sync_job"]
+        if not job["is_running"]:
+            return job
+        time.sleep(0.05)
+    raise AssertionError("sync job did not finish")
+
+
 class TestManualActions:
-    def test_trigger_daily_sync_success(self, client, monkeypatch):
+    def test_trigger_daily_sync_runs_in_the_background_and_records_its_outcome(self, client, monkeypatch):
         monkeypatch.setattr(amfi_sync, "sync_daily_nav", lambda _trigger="manual": (True, "Synced 5 schemes"))
         resp = client.post("/api/admin/sync/daily")
-        assert resp.status_code == 200
-        assert resp.json() == {"success": True, "message": "Synced 5 schemes"}
+        assert resp.status_code == 200 and resp.json()["success"] is True
+        last = _wait_for_job(client)["last"]["nav"]
+        assert last["ok"] is True and last["message"] == "Synced 5 schemes" and last["trigger"] == "manual"
 
-    def test_trigger_daily_sync_failure_is_502_not_500(self, client, monkeypatch):
+    def test_a_failed_daily_sync_is_recorded_as_failed(self, client, monkeypatch):
         monkeypatch.setattr(amfi_sync, "sync_daily_nav", lambda _trigger="manual": (False, "AMFI portal unreachable"))
-        resp = client.post("/api/admin/sync/daily")
-        assert resp.status_code == 502
-        assert "AMFI portal unreachable" in resp.json()["detail"]
+        assert client.post("/api/admin/sync/daily").status_code == 200
+        last = _wait_for_job(client)["last"]["nav"]
+        assert last["ok"] is False and "AMFI portal unreachable" in last["message"]
 
-    def test_trigger_ter_sync_success(self, client, monkeypatch):
+    def test_trigger_ter_sync(self, client, monkeypatch):
         monkeypatch.setattr(amfi_sync, "sync_official_ter", lambda _trigger="manual": (True, "TER sync ok"))
-        resp = client.post("/api/admin/sync/ter")
-        assert resp.status_code == 200
+        assert client.post("/api/admin/sync/ter").status_code == 200
+        assert _wait_for_job(client)["last"]["ter"]["message"] == "TER sync ok"
+
+    def test_a_second_sync_is_refused_while_one_runs(self, client, monkeypatch):
+        import threading
+        release = threading.Event()
+        monkeypatch.setattr(amfi_sync, "sync_official_ter", lambda _trigger="manual": (release.wait(5), (True, "ok"))[1])
+        assert client.post("/api/admin/sync/ter").status_code == 200
+        busy = client.post("/api/admin/sync/daily")
+        assert busy.status_code == 409 and "TER sync (manual)" in busy.json()["detail"]
+        # Backfills and a manual rebuild wait too; stopping a backfill never does.
+        assert client.post("/api/admin/backfill/historical/start", json={"start_year": 2025}).status_code == 409
+        assert client.post("/api/admin/backfill/ter/start", json={"n_months": 12}).status_code == 409
+        assert client.post("/api/admin/recompute-summary").status_code == 409
+        assert client.post("/api/admin/backfill/historical/stop").status_code == 200
+        assert client.get("/api/meta/status").json()["sync_activity"]["kind"] == "ter"
+        release.set()
+        _wait_for_job(client)
 
     def test_recompute_summary(self, client):
         resp = client.post("/api/admin/recompute-summary")

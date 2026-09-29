@@ -48,6 +48,9 @@ def _feed(monkeypatch, rows):
         def fetch_all(self, report_date=None):
             return iter(rows)
 
+        def fetch_latest_full(self, *a, **k):
+            return FEED_DATE, list(rows)
+
     monkeypatch.setattr("app.amfi_perf_client.AmfiPerfClient", FakeClient)
 
 

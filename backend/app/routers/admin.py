@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict
 from app import amfi_sync, app_logging, auth, data_audit
 from app.core.config import settings
 from app.core.serialize import sanitize_floats
+from app.db import coverage
 from app.db import holdings as hdb
 from app.db import queries as db
 from app.schemas.admin import AuditRun, HistoricalBackfillStartRequest, TerBackfillStartRequest
@@ -39,7 +40,12 @@ def get_status() -> dict:
             "sync_history": amfi_sync.get_sync_history(),
             "ter_sync_history": amfi_sync.get_ter_sync_history(),
             "cost_coverage": db.get_cost_data_coverage(),
-            "full_refresh": amfi_sync.get_full_refresh_status(),
+            # The same coverage over schemes still publishing NAVs -- the figure that means
+            # something; cost_coverage above divides by every scheme ever listed.
+            "live_coverage": coverage.live_scheme_coverage(),
+            # The sync job running now (full refresh, NAV, TER or catch-up, from any trigger)
+            # and each kind's last run, which survives restarts.
+            "sync_job": amfi_sync.get_sync_job_status(),
             "ter_backfill_status": amfi_sync.get_ter_backfill_status(),
             "backfill_status": amfi_sync.get_backfill_status(),
             # Durable, unlike backfill_status, which only describes the current
@@ -92,22 +98,24 @@ def set_factor_proxies(req: FactorProxyUpdate, _auth: None = Depends(_require_ad
     return {"success": True, "proxies": fm.get_factor_proxies()}
 
 
-# --- Manual actions (all synchronous/blocking, matching the original's st.spinner() UX --
-# a page load fires a POST and waits for it to resolve, exactly as the original blocked on
-# the button click). ---
+# --- Manual syncs: background jobs, like the scheduled ones. Each returns as soon as the job
+# starts (a TER fetch alone can take minutes, longer than a proxy holds a POST open); progress
+# and the outcome arrive through /status's sync_job block. Only one sync job runs at a time,
+# whoever started it, so a button pressed during the nightly refresh gets a 409 naming it. ---
+
+
+def _start_sync(kind: str, started_message: str) -> dict:
+    started, busy = amfi_sync.start_sync_job(kind, "manual")
+    if not started:
+        raise HTTPException(status_code=409, detail=f"{busy} is already running; try again when it finishes.")
+    return {"success": True, "message": started_message}
 
 
 @router.post("/sync/all")
 def trigger_full_refresh(_auth: None = Depends(_require_admin)) -> dict:
-    """Starts NAVs -> plan/option resolution -> TER -> one summary rebuild, in that order
-    because each step depends on the one before it.
-
-    Returns as soon as the job starts: the chain takes minutes against live AMFI, which is
-    far longer than a proxy will hold a POST open. Progress and the per-step outcome arrive
-    through /status's full_refresh block."""
-    if not amfi_sync.start_full_refresh(_trigger="manual"):
-        raise HTTPException(status_code=409, detail="A full refresh is already running.")
-    return {"success": True, "message": "Full refresh started. Progress appears below and in the Activity Log."}
+    """NAVs -> plan/option resolution -> TER -> one summary rebuild, in that order because
+    each step depends on the one before it."""
+    return _start_sync("full", "Full refresh started. Progress appears below and in the Activity Log.")
 
 
 @router.get("/verify")
@@ -133,22 +141,26 @@ def get_latest_audit() -> dict:
 
 @router.post("/sync/daily")
 def trigger_daily_sync(_auth: None = Depends(_require_admin)) -> dict:
-    success, msg = amfi_sync.sync_daily_nav(_trigger="manual")
-    if not success:
-        raise HTTPException(status_code=502, detail=f"Sync failed: {msg}")
-    return {"success": True, "message": msg}
+    return _start_sync("nav", "NAV sync started.")
 
 
 @router.post("/sync/ter")
 def trigger_ter_sync(_auth: None = Depends(_require_admin)) -> dict:
-    success, msg = amfi_sync.sync_official_ter(_trigger="manual")
-    if not success:
-        raise HTTPException(status_code=502, detail=f"TER sync failed: {msg}")
-    return {"success": True, "message": msg}
+    return _start_sync("ter", "TER sync started; it can take a few minutes.")
+
+
+def _refuse_while_syncing(what: str) -> None:
+    """Backfills and a manual rebuild wait for a running sync job: they rewrite the same
+    tables, and running beside it only doubles the work (and, for a rebuild, publishes a
+    half-synced state). Stopping a backfill is never refused."""
+    activity = amfi_sync.current_sync_activity()
+    if activity:
+        raise HTTPException(status_code=409, detail=f"{activity['label']} ({activity['trigger']}) is running; start the {what} when it finishes.")
 
 
 @router.post("/recompute-summary")
 def recompute_summary(_auth: None = Depends(_require_admin)) -> dict:
+    _refuse_while_syncing("rebuild")
     stats = db.get_database_stats(force_refresh=True)
     db.refresh_summary_table()
     return {"success": True, "message": f"Summary table recomputed and indexed across {stats['schemes_count']:,} schemes."}
@@ -159,6 +171,7 @@ def recompute_summary(_auth: None = Depends(_require_admin)) -> dict:
 
 @router.post("/backfill/ter/start")
 def start_ter_backfill(req: TerBackfillStartRequest, _auth: None = Depends(_require_admin)) -> dict:
+    _refuse_while_syncing("TER backfill")
     ok = amfi_sync.start_ter_backfill(n_months=req.n_months, resume=req.resume)
     if not ok:
         raise HTTPException(status_code=409, detail="A TER backfill job is already running.")
@@ -193,6 +206,7 @@ def backfill_chunk_count(start_year: int = Query(2020, ge=2000)) -> dict:
 
 @router.post("/backfill/historical/start")
 def start_historical_backfill(req: HistoricalBackfillStartRequest, _auth: None = Depends(_require_admin)) -> dict:
+    _refuse_while_syncing("backfill")
     ok = amfi_sync.start_historical_backfill(
         start_year=req.start_year, max_chunks=req.max_chunks, resume=req.resume)
     if not ok:

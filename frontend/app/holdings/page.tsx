@@ -17,6 +17,7 @@ import { Banner } from "@/components/shared/Banner";
 import { DataTable, type ColumnConfig } from "@/components/shared/DataTable";
 import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
 import { StatCard } from "@/components/shared/StatCard";
+import { RiskBadge } from "@/components/shared/RiskBadge";
 import {
   archivePortfolio,
   backupUrl,
@@ -178,7 +179,12 @@ function HoldingsContent() {
               </button>
               <div className="text-[0.7rem]" style={{ color: "var(--mf-muted)" }} title={p.category ?? undefined}>
                 {[p.sebi_category ?? p.category, p.asset_class].filter(Boolean).join(" · ")}
-                {p.riskometer && <> · Risk: {p.riskometer}</>}
+                {p.riskometer && (
+                  <>
+                    {" · "}
+                    <RiskBadge level={p.riskometer} />
+                  </>
+                )}
                 {where && <> · In {where}</>}
               </div>
               {positionBadges(p).length > 0 && (
@@ -311,7 +317,7 @@ function HoldingsContent() {
     : undefined;
 
   return (
-    <AppShell pageContext={{ label: "Holdings", value: current?.name ?? "All portfolios", sub: k ? formatInr(k.current_value) : undefined }}>
+    <AppShell>
       <h1 className="mf-page-title">Holdings</h1>
       <p className="mf-page-caption">
         Your own mutual fund portfolios, valued daily at official AMFI NAVs. Every figure traces back to a transaction you entered.

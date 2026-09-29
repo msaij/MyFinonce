@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.serialize import df_to_records, sanitize_floats
 from app.db import queries as db
+from app.db import riskometer
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
@@ -63,7 +64,7 @@ def screener(
     limit: int = 1000,
 ) -> list[dict]:
     df = db.get_screener_dataframe(sort_by=sort_by, ascending=ascending, limit=limit, **f.as_kwargs())
-    return df_to_records(df)
+    return riskometer.attach(df_to_records(df))
 
 
 @router.get("/kpis")
@@ -79,6 +80,11 @@ def screener_export_csv(
     ascending: bool = True,
 ) -> StreamingResponse:
     df = db.get_screener_dataframe(sort_by=sort_by, ascending=ascending, limit=100_000, **f.as_kwargs())
+    if not df.empty:
+        risk = riskometer.riskometers(df["scheme_code"].tolist())
+        df = df.copy()  # the dataframe is cached; never add columns to the shared copy
+        df["riskometer"] = [(risk.get(int(c)) or {}).get("riskometer") for c in df["scheme_code"]]
+        df["riskometer_as_of"] = [(risk.get(int(c)) or {}).get("riskometer_as_of") for c in df["scheme_code"]]
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     buf.seek(0)

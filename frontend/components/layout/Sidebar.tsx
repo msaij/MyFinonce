@@ -3,115 +3,151 @@
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
 
 import { NonAdviceNotice } from "@/components/shared/Disclaimer";
 import { getAlertCount } from "@/lib/api/holdings";
-import { getMetaStatus } from "@/lib/api/meta";
-import { formatDate } from "@/lib/format";
-import { useDateRangeStore } from "@/lib/stores/dateRange";
-import { StatusPill } from "./StatusPill";
 
 /**
- * Port of date_picker.py's render_sidebar_status() -- a real 5-job function
- * (brand/live-feed pill, active-time-horizon card, page-context slot,
- * quick-sync button, telemetry drawer), not an incidental widget. See the
- * migration plan's frontend architecture note on this.
+ * The left menu: brand, the page links (grouped as the owner set them out) and the
+ * not-investment-advice notice.
  *
- * The quick "Sync Closing NAVs Now" button and daemon-start side effect are
- * intentionally NOT ported here yet -- those are write/admin actions that
- * belong with the Data Management page's admin router (Phase 9), not a
- * read-only sidebar. This shows status only for now.
+ * It deliberately does not repeat what a page already shows: the Plan / Option / Window
+ * controls and how current the NAVs are sit in the top bar of every page that uses them,
+ * each page names its own subject, and the database statistics live on Data Management.
+ *
+ * At laptop width and above it is fixed on the left; below that it is a drawer AppShell opens.
  */
 
+type IconName = "calculator" | "ipo" | "overview" | "holdings" | "screener" | "compare" | "quant" | "data";
+
+interface NavItem {
+  href: string;
+  label: string;
+  icon: IconName;
+  /** Full name, for the tooltip, when the label is shortened. */
+  title?: string;
+  /** Other paths that belong to this page (a fund's own page sits with fund research). */
+  also?: string[];
+}
+
 // A group with no title renders its links without a heading: standalone pages that belong to no domain.
-const NAV_GROUPS: { title: string | null; items: { href: string; label: string }[] }[] = [
-  { title: null, items: [{ href: "/calculator", label: "Calculator" }] },
-  { title: "Stock Market", items: [{ href: "/nse-ipo", label: "NSE IPO" }] },
+const NAV_GROUPS: { title: string | null; items: NavItem[] }[] = [
+  { title: null, items: [{ href: "/calculator", label: "Calculator", icon: "calculator" }] },
+  { title: "Stock Market", items: [{ href: "/nse-ipo", label: "NSE IPO", icon: "ipo" }] },
   {
     title: "Mutual Funds",
     // Market overview, then your own portfolio, then single-fund research; data upkeep last.
     items: [
-      { href: "/", label: "Overview" },
-      { href: "/holdings", label: "Holdings" },
-      { href: "/screener", label: "Scheme Screener" },
-      { href: "/compare", label: "Compare & Simulate" },
-      { href: "/quant", label: "Quantitative MF Analysis" },
-      { href: "/admin", label: "Data Management" },
+      { href: "/", label: "Overview", icon: "overview" },
+      { href: "/holdings", label: "Holdings", icon: "holdings" },
+      { href: "/screener", label: "Scheme Screener", icon: "screener", also: ["/scheme/"] },
+      { href: "/compare", label: "Compare & Simulate", icon: "compare" },
+      { href: "/quant", label: "Quant Analysis", icon: "quant", title: "Quantitative MF Analysis" },
+      { href: "/admin", label: "Data Management", icon: "data" },
     ],
   },
 ];
 
-const isActive = (pathname: string, href: string) => pathname === href || (href !== "/" && pathname.startsWith(href));
+const isActive = (pathname: string, item: NavItem) =>
+  pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href)) || !!item.also?.some((p) => pathname.startsWith(p));
 
-export function Sidebar({ pageContext, showScope = true }: { pageContext?: { label: string; value: string; sub?: string }; showScope?: boolean }) {
+/** Simple 18px line icons, drawn in the link's own colour. */
+function NavIcon({ name }: { name: IconName }) {
+  const paths: Record<IconName, React.ReactNode> = {
+    calculator: (
+      <>
+        <rect x="5" y="3" width="14" height="18" rx="2" />
+        <path d="M8 7h8M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15v3M8 18h.01M12 18h.01" />
+      </>
+    ),
+    ipo: <path d="M4 17l5-5 4 4 7-8M15 8h5v5" />,
+    overview: (
+      <>
+        <rect x="4" y="4" width="7" height="7" rx="1.5" />
+        <rect x="13" y="4" width="7" height="7" rx="1.5" />
+        <rect x="4" y="13" width="7" height="7" rx="1.5" />
+        <rect x="13" y="13" width="7" height="7" rx="1.5" />
+      </>
+    ),
+    holdings: (
+      <>
+        <rect x="3" y="7" width="18" height="13" rx="2" />
+        <path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3 12h18" />
+      </>
+    ),
+    screener: <path d="M4 5h16l-6 7v6l-4 2v-8L4 5z" />,
+    compare: <path d="M7 4v16M17 4v16M7 8h5M12 16h5M4 20h6M14 20h6" />,
+    quant: <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />,
+    data: (
+      <>
+        <ellipse cx="12" cy="6" rx="7" ry="3" />
+        <path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3" />
+      </>
+    ),
+  };
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      {paths[name]}
+    </svg>
+  );
+}
+
+export function Sidebar({ open = false, onClose }: { open?: boolean; onClose?: () => void }) {
   const pathname = usePathname();
-  const { preset, start, end, planType, optionType } = useDateRangeStore();
-  const [telemetryOpen, setTelemetryOpen] = useState(false);
-
-  const { data: status } = useQuery({
-    queryKey: ["meta-status"],
-    queryFn: getMetaStatus,
-    refetchInterval: 60_000,
-  });
   // Unacknowledged holdings alerts (evaluated server-side after each NAV sync).
-  const { data: alertCount } = useQuery({
-    queryKey: ["holdings", "alert-count"],
-    queryFn: getAlertCount,
-    refetchInterval: 60_000,
-  });
+  const { data: alertCount } = useQuery({ queryKey: ["holdings", "alert-count"], queryFn: getAlertCount, refetchInterval: 60_000 });
   const unackedAlerts = alertCount?.unacked ?? 0;
-
-  // Before `status` resolves, `status?.is_stale` is undefined (falsy) -- without this guard
-  // the pill would flash green ("Live (Closing NAVs)") during initial load on a database
-  // that turns out to be stale once the query returns. Treat undefined as neutral loading.
-  const pillLabel =
-    status === undefined
-      ? "Checking feed..."
-      : status.is_stale
-        ? "Feed Behind (Catch-up Needed)"
-        : "Live (Closing NAVs)";
-  const pillLevel =
-    status === undefined ? "neutral" : status.is_stale ? "warning" : "success";
 
   return (
     <aside
-      className="fixed inset-y-0 left-0 z-30 flex h-screen w-64 flex-col gap-3 overflow-y-auto border-r p-4 scrollbar-thin"
-      style={{
-        borderColor: "var(--mf-border)",
-        background: "var(--mf-card-bg)",
-      }}
+      className={`fixed inset-y-0 left-0 z-40 flex h-screen w-64 flex-col gap-4 overflow-y-auto border-r p-4 scrollbar-thin transition-transform duration-200 lg:z-30 lg:translate-x-0 ${
+        open ? "translate-x-0 shadow-xl" : "-translate-x-full"
+      }`}
+      style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}
+      aria-label="Main menu"
     >
-      <div className="flex items-center gap-2">
-        <div className="text-xl font-bold tracking-tight">myFinonce</div>
+      <div className="flex items-center justify-between">
+        <Link href="/" className="text-xl font-bold tracking-tight" onClick={onClose}>
+          myFinonce
+        </Link>
+        <button type="button" onClick={onClose} className="rounded-lg px-2 py-1 text-sm lg:hidden" style={{ color: "var(--mf-muted)" }} aria-label="Close menu">
+          ✕
+        </button>
       </div>
 
-      <nav className="flex flex-col gap-1">
+      <nav className="flex flex-col" aria-label="Pages">
         {NAV_GROUPS.map((group, gi) => (
-          <div key={group.title ?? `ungrouped-${gi}`} className={`flex flex-col gap-1 ${gi === 0 ? "" : "mt-3"}`}>
+          <div key={group.title ?? `ungrouped-${gi}`} className={`flex flex-col gap-0.5 ${gi === 0 ? "" : "mt-4"}`}>
             {group.title && (
-              <div className="mb-1 text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
+              <div className="mb-1 px-3 text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
                 {group.title}
               </div>
             )}
             {group.items.map((item) => {
-              const active = isActive(pathname, item.href);
+              const active = isActive(pathname, item);
               return (
                 <Link
                   key={item.href}
                   href={item.href}
-                  className="rounded-lg px-3 py-1.5 text-sm"
+                  onClick={onClose}
+                  aria-current={active ? "page" : undefined}
+                  title={item.title}
+                  className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-sm transition-colors hover:bg-black/5 dark:hover:bg-white/5"
                   style={{
-                    background: active ? "var(--mf-accent-bg)" : "transparent",
+                    background: active ? "var(--mf-accent-bg)" : undefined,
                     color: active ? "var(--mf-accent)" : "var(--mf-fg)",
                     fontWeight: active ? 600 : 400,
                   }}
                 >
-                  {item.label}
+                  <span style={{ color: active ? "var(--mf-accent)" : "var(--mf-muted)" }}>
+                    <NavIcon name={item.icon} />
+                  </span>
+                  <span className="flex-1">{item.label}</span>
                   {item.href === "/holdings" && unackedAlerts > 0 && (
                     <span
-                      className="ml-2 rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold"
+                      className="rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold"
                       style={{ background: "var(--mf-danger)", color: "#fff" }}
+                      title={`${unackedAlerts} unread holdings alert${unackedAlerts === 1 ? "" : "s"}`}
                       aria-label={`${unackedAlerts} unread holdings alert${unackedAlerts === 1 ? "" : "s"}`}
                     >
                       {unackedAlerts}
@@ -124,82 +160,8 @@ export function Sidebar({ pageContext, showScope = true }: { pageContext?: { lab
         ))}
       </nav>
 
-      <div className="mt-2 flex flex-col gap-2">
-        <StatusPill label={pillLabel} level={pillLevel} />
-
-        {showScope && (
-        <div className="filter-box">
-          <div className="text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
-            Active Scope
-          </div>
-          <div className="mt-0.5 font-bold">{preset}</div>
-          {start && end && (
-            <div className="mt-0.5 text-[0.78rem]" style={{ color: "var(--mf-muted)" }}>
-              {formatDate(start)} → {formatDate(end)}
-            </div>
-          )}
-          <div className="mt-2 flex flex-wrap items-center gap-1 border-t pt-1.5 text-[0.72rem]" style={{ borderColor: "var(--mf-border)" }}>
-            <span className="font-semibold" style={{ color: "var(--mf-muted)" }}>Plan:</span>
-            <span className="font-medium" style={{ color: "var(--mf-accent)" }}>{planType}</span>
-            <span className="mx-0.5" style={{ color: "var(--mf-muted)" }}>•</span>
-            <span className="font-semibold" style={{ color: "var(--mf-muted)" }}>Option:</span>
-            <span className="font-medium" style={{ color: "var(--mf-accent)" }}>{optionType}</span>
-          </div>
-        </div>
-        )}
-
-        {pageContext && (
-          <div className="filter-box">
-            <div className="text-[0.68rem] font-bold uppercase tracking-wide" style={{ color: "var(--mf-muted)" }}>
-              {pageContext.label}
-            </div>
-            <div className="mt-0.5 font-semibold">{pageContext.value}</div>
-            {pageContext.sub && (
-              <div className="mt-0.5 text-[0.75rem]" style={{ color: "var(--mf-muted)" }}>
-                {pageContext.sub}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
       <div className="mt-auto">
         <NonAdviceNotice />
-      </div>
-
-      <div className="border-t pt-2" style={{ borderColor: "var(--mf-border)" }}>
-        <button
-          type="button"
-          className="w-full text-left text-xs font-semibold"
-          style={{ color: "var(--mf-muted)" }}
-          onClick={() => setTelemetryOpen((v) => !v)}
-        >
-          {telemetryOpen ? "▾" : "▸"} 💾 Database Telemetry
-        </button>
-        {telemetryOpen && status && (
-          <div className="mt-2 flex flex-col gap-1 text-xs" style={{ color: "var(--mf-muted)" }}>
-            <div>• Tracked Schemes: {status.schemes_count.toLocaleString()}</div>
-            <div>• Historical NAVs: {status.nav_count.toLocaleString()}</div>
-            <div>• AMCs: {status.amc_count.toLocaleString()}</div>
-            {status.ter_official_schemes !== undefined && status.ter_official_schemes > 0 && (
-              <div>• Official TER Schemes: {status.ter_official_schemes.toLocaleString()}</div>
-            )}
-            {/* One row per change in a scheme's TER, not per daily disclosure: AMFI
-                republishes identical figures every day and those collapse into a single
-                period, so this is far smaller than the number of files fetched. */}
-            {status.ter_records_count !== undefined && status.ter_records_count > 0 && (
-              <div>• TER Periods Stored: {status.ter_records_count.toLocaleString()}</div>
-            )}
-            <div>
-              • Coverage:{" "}
-              {status.min_date && status.max_date
-                ? `${formatDate(status.min_date)} to ${formatDate(status.max_date)}`
-                : "No data yet"}
-            </div>
-            <div>• Storage: {status.file_size_mb} MB</div>
-            <div>• Engine: PostgreSQL 16</div>
-          </div>
-        )}
       </div>
     </aside>
   );

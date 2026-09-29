@@ -11,6 +11,11 @@ import { formatSignedPct, formatDate, toneOf } from "@/lib/format";
 import { useDebouncedValue } from "@/lib/hooks";
 import { formatTer } from "@/lib/holdings";
 import { getAllFunds, type FundListRow } from "@/lib/api/overview";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import { RISK_ABOUT, RISK_LEVELS, riskRank } from "@/lib/riskometer";
+
+const RISK_ALL = "All risk levels";
+const RISK_NONE = "Not published";
 
 const STATUS_OPTIONS = ["All", "Active", "Inactive"] as const;
 type Status = (typeof STATUS_OPTIONS)[number];
@@ -35,6 +40,14 @@ const COLUMNS: ColumnConfig[] = [
   },
   { key: "broad_category", label: "Asset class" },
   { key: "category", label: "Category", tooltip: "SEBI category as AMFI files it." },
+  {
+    key: "riskometer",
+    label: "Riskometer",
+    // By the scale's order, Low first; funds without one sort last either way.
+    sortValue: (r) => riskRank(r.riskometer),
+    render: (r) => <RiskBadge level={r.riskometer as string | null} asOf={r.riskometer_as_of as string | null} emptyText="-" />,
+    tooltip: RISK_ABOUT,
+  },
   {
     key: "is_active",
     label: "Status",
@@ -83,6 +96,7 @@ export function AllFundsTab({ planType, optionType }: { planType: string; option
   const [assetClass, setAssetClass] = useState("All asset classes");
   const [amc, setAmc] = useState("All fund houses");
   const [status, setStatus] = useState<Status>("All");
+  const [risk, setRisk] = useState(RISK_ALL);
   const [pageSize, setPageSize] = useState(100);
   const [page, setPage] = useState(0);
   const [sortKey, setSortKey] = useState<string | null>(null);
@@ -106,21 +120,31 @@ export function AllFundsTab({ planType, optionType }: { planType: string; option
       if (amc !== "All fund houses" && r.fund_house !== amc) return false;
       if (status === "Active" && !r.is_active) return false;
       if (status === "Inactive" && r.is_active) return false;
+      if (risk === RISK_NONE ? !!r.riskometer : risk !== RISK_ALL && r.riskometer !== risk) return false;
       if (!tokens.length) return true;
       const hay = `${r.display_name} ${r.fund_house ?? ""} ${r.category ?? ""}`.toLowerCase();
       return tokens.every((t) => hay.includes(t));
     });
-  }, [all, debouncedSearch, assetClass, amc, status]);
+  }, [all, debouncedSearch, assetClass, amc, status, risk]);
 
   // Sorted across the whole filtered list, then paged -- DataTable alone would only sort the visible page.
   const sorted = useMemo(() => sortTableRows(filtered, sortKey, sortDir, COLUMNS) as FundListRow[], [filtered, sortKey, sortDir]);
 
   const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
-  useEffect(() => setPage(0), [debouncedSearch, assetClass, amc, status, pageSize, sortKey, sortDir, planType, optionType]);
+  useEffect(() => setPage(0), [debouncedSearch, assetClass, amc, status, risk, pageSize, sortKey, sortDir, planType, optionType]);
   const current = Math.min(page, pageCount - 1);
   const pageRows = sorted.slice(current * pageSize, (current + 1) * pageSize);
 
   const activeCount = useMemo(() => all.filter((r) => r.is_active).length, [all]);
+  // How many schemes sit at each level, shown in the filter so an empty choice is never a surprise.
+  const riskCounts = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const r of all) {
+      const k = r.riskometer ?? RISK_NONE;
+      out[k] = (out[k] ?? 0) + 1;
+    }
+    return out;
+  }, [all]);
 
   const pagerButton = (label: string, target: number, disabled: boolean) => (
     <button
@@ -160,7 +184,7 @@ export function AllFundsTab({ planType, optionType }: { planType: string; option
 
   return (
     <div className="mt-6 space-y-4">
-      <div className="filter-box grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="filter-box grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
         <label className="flex flex-col gap-1 text-xs font-medium sm:col-span-2" style={{ color: "var(--mf-muted)" }}>
           <span className="flex items-center">
             Search
@@ -177,6 +201,25 @@ export function AllFundsTab({ planType, optionType }: { planType: string; option
         </label>
         <FilterSelect label="Asset class" value={assetClass} onChange={setAssetClass} options={["All asset classes", ...assetClasses]} />
         <FilterSelect label="Fund house" value={amc} onChange={setAmc} options={["All fund houses", ...amcs]} />
+        <label className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+          <span className="flex items-center">
+            Riskometer
+            <FormulaTooltip label="Riskometer" description={RISK_ABOUT} />
+          </span>
+          <select
+            value={risk}
+            onChange={(e) => setRisk(e.target.value)}
+            className="rounded-lg border px-2 py-1.5 text-sm"
+            style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+          >
+            {[RISK_ALL, ...RISK_LEVELS, RISK_NONE].map((o) => (
+              <option key={o} value={o} className="bg-white text-slate-900">
+                {o}
+                {o !== RISK_ALL ? ` (${(riskCounts[o] ?? 0).toLocaleString()})` : ""}
+              </option>
+            ))}
+          </select>
+        </label>
         <div className="grid grid-cols-2 gap-3">
           <FilterSelect label="Status" value={status} onChange={(v) => setStatus(v as Status)} options={[...STATUS_OPTIONS]} />
           <FilterSelect label="Rows per page" value={String(pageSize)} onChange={(v) => setPageSize(Number(v))} options={PAGE_SIZES.map(String)} />

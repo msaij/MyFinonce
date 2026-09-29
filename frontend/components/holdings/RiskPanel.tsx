@@ -33,6 +33,8 @@ import {
   monthsToDays,
 } from "@/lib/holdings";
 import { AXIS, LOSS, REFERENCE, SERIES_1, SERIES_2 } from "@/lib/holdingsChart";
+import { RISK_RAMP } from "@/lib/riskometer";
+import { RiskBadge } from "@/components/shared/RiskBadge";
 
 const pct = (v: number | null | undefined, d = 2) => (v === null || v === undefined ? "-" : `${v.toFixed(d)}%`);
 const num = (v: number | null | undefined, d = 2) => (v === null || v === undefined ? "-" : v.toFixed(d));
@@ -45,9 +47,6 @@ const FACTOR_ABOUT: Record<string, string> = {
   momentum: "Tilt toward recent winners over recent losers. Positive means your funds tend to hold what has been rising.",
 };
 
-/** SEBI's six riskometer levels, lowest first, on one hue from light to dark: an ordinal
- *  scale, so darker reads as "more" without needing a legend to decode the order. */
-const RISK_RAMP = ["#fdebd9", "#fbd0a8", "#f6ab6f", "#eb6834", "#c04b16", "#8a320b"];
 
 function SubHeading({ title, about }: { title: string; about: string }) {
   return (
@@ -93,7 +92,7 @@ const RISKOMETER_COLUMNS: ColumnConfig[] = [
     key: "level",
     label: "SEBI riskometer",
     sortValue: (row) => (row.rank as number | null) ?? 0,
-    render: (row, v) => (v ? String(v) : <span style={{ color: "var(--mf-muted)" }}>Not published yet</span>),
+    render: (row, v) => <RiskBadge level={v as string | null} asOf={row.as_of as string | null} emptyText="Not published yet" />,
   },
   { key: "weight_pct", label: "Share of your money", format: "pct", decimals: 1 },
   { key: "as_of", label: "As of", format: "date" },

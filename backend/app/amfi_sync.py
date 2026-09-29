@@ -798,49 +798,224 @@ def restate_recent_navs(dry_run: bool = False, window_days: int = NAV_RESTATEMEN
             "failed_ranges": failed_ranges, "suspect": suspects[:_RESTATEMENT_SUSPECT_SAMPLE]}
 
 
-# --- ONE REFRESH ----------------------------------------------------------------------
+# --- SYNC JOBS ----------------------------------------------------------------------------
+#
+# Every sync -- the 00:05 full refresh, the 23:30 NAV pass, the hourly and startup catch-up,
+# and each button on the Data Management page -- runs as a "sync job" through this one
+# tracker. That gives three things the scheduled runs used to lack:
+#
+# * Visibility: what is running, why (its trigger) and which step it is on, for the Data
+#   Management page and the top bar of every fund page. The 00:05 refresh used to call
+#   sync_all() directly, bypassing the state the page watched, so it ran unseen.
+# * One at a time: a job that finds another running does not start. The button used to be
+#   able to start a second full refresh on top of the scheduled one -- safe (writes queue
+#   on WRITE_LOCK) but every step done twice.
+# * Memory across restarts: each kind's last run is kept in sync_meta, where the in-process
+#   sync histories reset with every container start.
+#
+# The two historical backfills keep their own trackers: they are resumable multi-hour
+# jobs with chunk progress, and a catch-up must still be able to run beside one.
 
-
-FULL_REFRESH_STATE: Dict[str, Any] = {
-    "is_running": False,
-    "step": "",
-    "started_at": None,
-    "finished_at": None,
-    "last_result": None,
+SYNC_JOB_KINDS: Dict[str, str] = {
+    "full": "Full refresh",
+    "nav": "NAV sync",
+    "ter": "TER sync",
+    "catchup": "Catch-up",
 }
-_FULL_REFRESH_LOCK = threading.Lock()
+_SYNC_JOB_LOCK = threading.Lock()
+SYNC_JOB_STATE: Dict[str, Any] = {"is_running": False, "kind": None, "trigger": None, "step": "", "started_at": None}
+SYNC_JOB_META_PREFIX = "sync_job_last:"
+# A full refresh that failed is retried by the hourly catch-up, but not more often than this:
+# the chain includes a multi-minute TER fetch that should not hammer AMFI's portal.
+FULL_REFRESH_RETRY_SECONDS = 3 * 3600
+# The nightly slot the full refresh belongs to (IST); a refresh older than the latest slot is due.
+FULL_REFRESH_SLOT = datetime.time(0, 5)
 
 
-def get_full_refresh_status() -> Dict[str, Any]:
-    with _FULL_REFRESH_LOCK:
-        return dict(FULL_REFRESH_STATE)
+def _load_last_jobs() -> Dict[str, Optional[Dict[str, Any]]]:
+    keys = [SYNC_JOB_META_PREFIX + k for k in SYNC_JOB_KINDS]
+    raw = db.get_sync_meta_values(keys)
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for kind in SYNC_JOB_KINDS:
+        value = raw.get(SYNC_JOB_META_PREFIX + kind)
+        try:
+            out[kind] = json.loads(value) if value else None
+        except (TypeError, ValueError):
+            out[kind] = None
+    return out
 
 
-def _full_refresh_worker(trigger: str) -> None:
+def get_sync_job_status() -> Dict[str, Any]:
+    """The job running now (if any) and the last completed run of each kind."""
+    with _SYNC_JOB_LOCK:
+        current = dict(SYNC_JOB_STATE)
+    current["label"] = SYNC_JOB_KINDS.get(current["kind"]) if current["kind"] else None
+    current["last"] = _load_last_jobs()
+    return current
+
+
+def current_sync_activity() -> Optional[Dict[str, Any]]:
+    """What the top bar says while data is updating: the running job, else None."""
+    with _SYNC_JOB_LOCK:
+        if not SYNC_JOB_STATE["is_running"]:
+            return None
+        s = dict(SYNC_JOB_STATE)
+    return {"kind": s["kind"], "label": SYNC_JOB_KINDS.get(s["kind"]), "trigger": s["trigger"],
+            "step": s["step"], "started_at": s["started_at"]}
+
+
+def _claim_sync_job(kind: str, trigger: str) -> Optional[str]:
+    """Marks `kind` as running. Returns None on success, else the label of what is running."""
+    with _SYNC_JOB_LOCK:
+        if SYNC_JOB_STATE["is_running"]:
+            return f"{SYNC_JOB_KINDS.get(SYNC_JOB_STATE['kind'], 'A sync')} ({SYNC_JOB_STATE['trigger']})"
+        SYNC_JOB_STATE.update({"is_running": True, "kind": kind, "trigger": trigger, "step": "Starting",
+                               "started_at": time.time()})
+    return None
+
+
+def _job_message(kind: str, result: Dict[str, Any]) -> str:
+    if result.get("message"):
+        return str(result["message"])
+    if kind == "full":
+        nav = (result.get("nav") or {}).get("message") or ""
+        ter = (result.get("ter") or {}).get("message") or ""
+        return " | ".join(p for p in (f"NAV: {nav}" if nav else "", f"TER: {ter}" if ter else "") if p)
+    return ""
+
+
+def _execute_sync_job(kind: str, trigger: str, body: Any) -> Dict[str, Any]:
+    """Runs a claimed job, records its outcome durably, and always releases the claim."""
+    started = time.time()
+
     def step(name: str) -> None:
-        with _FULL_REFRESH_LOCK:
-            FULL_REFRESH_STATE["step"] = name
+        with _SYNC_JOB_LOCK:
+            SYNC_JOB_STATE["step"] = name
 
     try:
-        result = sync_all(_trigger=trigger, progress=step)
-    except Exception as e:  # noqa: BLE001 -- a worker thread must not die silently
-        logger.exception("Full refresh failed")
-        result = {"ok": False, "nav": {"ok": False, "message": str(e)}, "ter": None, "resolve": None}
-    with _FULL_REFRESH_LOCK:
-        FULL_REFRESH_STATE.update({"is_running": False, "step": "", "finished_at": time.time(), "last_result": result})
+        result = body(trigger, step) or {}
+    except Exception as e:  # noqa: BLE001 -- a worker must never die silently or hold the claim
+        logger.exception(f"{SYNC_JOB_KINDS.get(kind, kind)} ({trigger}) failed")
+        result = {"ok": False, "message": str(e)}
+    finished = time.time()
+    record = {
+        "kind": kind, "trigger": trigger, "ok": bool(result.get("ok")), "message": _job_message(kind, result),
+        "started_at": started, "finished_at": finished, "elapsed_seconds": round(finished - started, 1),
+        "result": result,
+    }
+    try:
+        db.set_sync_meta_value(SYNC_JOB_META_PREFIX + kind, json.dumps(record, default=str))
+    except Exception:  # noqa: BLE001 -- losing the record must not lose the run
+        logger.exception("Could not store the sync job record")
+    with _SYNC_JOB_LOCK:
+        SYNC_JOB_STATE.update({"is_running": False, "kind": None, "trigger": None, "step": "", "started_at": None})
+    return result
 
 
-def start_full_refresh(_trigger: str = "manual") -> bool:
-    """Runs the refresh in a background thread: the whole chain took 218s against live
-    AMFI, which no proxy or browser will hold a POST open for. Callers poll
-    get_full_refresh_status(), exactly as the two backfills already work."""
-    with _FULL_REFRESH_LOCK:
-        if FULL_REFRESH_STATE["is_running"]:
-            return False
-        FULL_REFRESH_STATE.update({"is_running": True, "step": "starting", "started_at": time.time(),
-                                   "finished_at": None, "last_result": None})
-    threading.Thread(target=_full_refresh_worker, args=(_trigger,), name="AMFI_Full_Refresh", daemon=True).start()
-    return True
+def run_sync_job(kind: str, trigger: str, body: Any) -> Optional[Dict[str, Any]]:
+    """Runs a job in the calling thread (the scheduler's). None if another job is running --
+    it is skipped, not queued: the running job is doing the same work or more."""
+    busy = _claim_sync_job(kind, trigger)
+    if busy:
+        logger.info(f"{SYNC_JOB_KINDS[kind]} ({trigger}) skipped: {busy} is already running.")
+        return None
+    return _execute_sync_job(kind, trigger, body)
+
+
+def start_sync_job(kind: str, trigger: str = "manual") -> Tuple[bool, Optional[str]]:
+    """Starts a job in a background thread for the page: the full chain takes minutes, which
+    no proxy or browser holds a POST open for. (started, label of the job already running)."""
+    body = _SYNC_JOB_BODIES[kind]
+    busy = _claim_sync_job(kind, trigger)
+    if busy:
+        return False, busy
+    threading.Thread(target=_execute_sync_job, args=(kind, trigger, body),
+                     name=f"AMFI_{kind}_sync", daemon=True).start()
+    return True, None
+
+
+def _full_body(trigger: str, step: Any) -> Dict[str, Any]:
+    return sync_all(_trigger=trigger, progress=step)
+
+
+def _nav_body(trigger: str, step: Any) -> Dict[str, Any]:
+    step("Syncing today's NAVs")
+    ok, msg = sync_daily_nav(_trigger=trigger)
+    return {"ok": ok, "message": msg}
+
+
+def _ter_body(trigger: str, step: Any) -> Dict[str, Any]:
+    step("Syncing official TER")
+    ok, msg = sync_official_ter(_trigger=trigger)
+    return {"ok": ok, "message": msg}
+
+
+def _fill_missing_days(step: Any, current_max: Optional[datetime.date], expected: Optional[datetime.date]) -> int:
+    """Fills the days between the newest stored NAV and the expected one from AMFI's history
+    API (the daily file carries one day only). Returns the NAV rows written."""
+    if not current_max or not expected or (expected - current_max).days <= 1:
+        return 0
+    written = 0
+    cur_start = current_max
+    while cur_start < expected:
+        cur_end = min(expected, cur_start + datetime.timedelta(days=88))
+        step(f"Filling missing days {cur_start.isoformat()} to {cur_end.isoformat()}")
+        try:
+            sch_cnt, nav_cnt = backfill_single_chunk(cur_start, cur_end)
+            written += nav_cnt
+            logger.info(f"Auto-filled {nav_cnt:,} NAV records across {sch_cnt:,} schemes for {cur_start} to {cur_end}.")
+        except Exception as e:  # noqa: BLE001 -- the daily sync below still runs
+            logger.error(f"Error during multi-day gap auto-backfill: {e}")
+        cur_start = cur_end + datetime.timedelta(days=1)
+    return written
+
+
+def _catchup_body(trigger: str, step: Any) -> Dict[str, Any]:
+    stale, current_max, expected = is_database_stale()
+    filled = _fill_missing_days(step, current_max, expected) if stale else 0
+    step("Syncing today's NAVs")
+    ok, msg = sync_daily_nav(_trigger=trigger)
+    return {"ok": ok, "message": msg + (f" (filled {filled:,} NAVs for missed days)" if filled else ""), "filled": filled}
+
+
+def _catchup_full_body(trigger: str, step: Any) -> Dict[str, Any]:
+    """A missed nightly refresh: fill missed days first, then the whole chain, so plan
+    identification, TER, the NAV re-check and the audit are not skipped until tomorrow."""
+    stale, current_max, expected = is_database_stale()
+    filled = _fill_missing_days(step, current_max, expected) if stale else 0
+    result = sync_all(_trigger=trigger, progress=step)
+    if filled:
+        result["filled"] = filled
+    return result
+
+
+_SYNC_JOB_BODIES: Dict[str, Any] = {"full": _full_body, "nav": _nav_body, "ter": _ter_body, "catchup": _catchup_body}
+
+
+def _latest_full_refresh_slot(now_epoch: float, now_ist: datetime.datetime) -> float:
+    """Epoch seconds of the most recent 00:05 IST at or before now."""
+    slot = now_ist.replace(hour=FULL_REFRESH_SLOT.hour, minute=FULL_REFRESH_SLOT.minute, second=0, microsecond=0)
+    if now_ist < slot:
+        slot -= datetime.timedelta(days=1)
+    return now_epoch - (now_ist - slot).total_seconds()
+
+
+def full_refresh_due(last: Optional[Dict[str, Any]], now_epoch: Optional[float] = None,
+                     now_ist: Optional[datetime.datetime] = None) -> bool:
+    """True when no successful full refresh has finished since the latest nightly slot --
+    the machine was off at 00:05, or that run failed. A failed attempt is retried only
+    after FULL_REFRESH_RETRY_SECONDS."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    now_ist = _now_ist() if now_ist is None else now_ist
+    slot = _latest_full_refresh_slot(now_epoch, now_ist)
+    if not last or not last.get("finished_at"):
+        return True
+    finished = float(last["finished_at"])
+    if last.get("ok") and finished >= slot:
+        return False
+    if not last.get("ok") and finished >= slot and now_epoch - finished < FULL_REFRESH_RETRY_SECONDS:
+        return False
+    return finished < slot or not last.get("ok")
 
 
 def sync_all(_trigger: str = "manual", progress: Optional[Any] = None) -> Dict[str, Any]:
@@ -1157,9 +1332,11 @@ def resolve_plan_options(dry_run: bool = False) -> Dict[str, Any]:
     from app.amfi_perf_client import AmfiPerfClient, parse_nav_date, to_nav
 
     client = AmfiPerfClient()
-    funds = list(client.fetch_all())
+    # Not the feed's own latest date as-is: over a weekend or holiday that date lists a
+    # hundred funds, and the snapshot below is replaced whole.
+    _report_date, funds = client.fetch_latest_full()
     if not funds:
-        return {"ok": False, "reason": "AMFI fund-performance feed returned no rows.",
+        return {"ok": False, "reason": "AMFI fund-performance feed has no full trading day in the last week.",
                 "resolved": 0, "plan_changed": 0, "option_changed": 0}
 
     dates = {parse_nav_date(f.get("navDate")) for f in funds}
@@ -1566,37 +1743,29 @@ def is_database_stale() -> Tuple[bool, Optional[datetime.date], Optional[datetim
         return False, None, None
 
 
-def check_and_catchup_sync() -> bool:
-    """
-    Evaluates database staleness and automatically triggers catch-up.
-    If multiple days were missed (e.g. computer was turned off for a long weekend or vacation),
-    it automatically queries AMFI's official historical range API to seamlessly fill all missing
-    intermediate days so there are zero data gaps in the charts.
-    """
+def catch_up(trigger: str = "heartbeat") -> Optional[str]:
+    """Brings the database up to date if it has fallen behind; returns the job kind it ran.
+
+    * The nightly full refresh was missed (machine off at 00:05) or failed: the whole chain,
+      after filling any missed days -- plans, TER, the NAV re-check and the audit included,
+      not just NAVs, which used to leave those a day behind until the next midnight.
+    * Only NAVs are behind: missed days filled, then today's NAVs.
+
+    A fresh database with no NAVs yet gets the NAV catch-up only; the full chain has
+    nothing to identify plans or match TER against until NAVs exist."""
     stale, current_max, expected = is_database_stale()
-    if not stale:
-        return False
+    if current_max is not None and full_refresh_due(_load_last_jobs().get("full")):
+        logger.info(f"Full refresh due ({trigger}): none has succeeded since the last nightly slot.")
+        return "full" if run_sync_job("full", trigger, _catchup_full_body) is not None else None
+    if stale:
+        logger.info(f"Database behind ({trigger}): local data at {current_max}, expected {expected}. Catching up...")
+        return "catchup" if run_sync_job("catchup", trigger, _catchup_body) is not None else None
+    return None
 
-    logger.info(f"Database staleness detected! Local data is at {current_max}, expected {expected}. Initiating automatic catch-up...")
 
-    # If gap is more than 1 day (e.g. missed 3 days, a week, etc.), backfill the intermediate days
-    if current_max and (expected - current_max).days > 1:
-        gap_days = (expected - current_max).days
-        logger.info(f"Multi-day gap detected ({gap_days} days). Auto-filling missing range: {current_max} to {expected}...")
-        try:
-            cur_start = current_max
-            while cur_start < expected:
-                cur_end = min(expected, cur_start + datetime.timedelta(days=88))
-                sch_cnt, nav_cnt = backfill_single_chunk(cur_start, cur_end)
-                logger.info(f"Auto-filled {nav_cnt:,} intermediate NAV records across {sch_cnt:,} schemes for {cur_start} to {cur_end}.")
-                cur_start = cur_end + datetime.timedelta(days=1)
-        except Exception as e:
-            logger.error(f"Error during multi-day gap auto-backfill: {e}")
-
-    # Always fetch latest daily closing master feed and refresh summary table
-    success, msg = sync_daily_nav(_trigger="catchup")
-    logger.info(f"Daily sync completed: success={success}, msg={msg}")
-    return success
+def check_and_catchup_sync() -> bool:
+    """Kept for callers of the old name; see catch_up()."""
+    return catch_up("catchup") is not None
 
 
 def run_scheduled_sync_daemon():
@@ -1608,30 +1777,33 @@ def run_scheduled_sync_daemon():
 
     logger.info("Starting AMFI daily sync daemon in background thread...")
 
-    # 1. Startup catch-up: If the app was opened past 12 AM (e.g. computer was turned off overnight),
-    # catch up immediately in background!
+    # 1. Startup catch-up: if the machine was off overnight, the missed full refresh (or just
+    # the missed NAVs) runs now rather than waiting for the next midnight.
+    ran = None
     try:
         time.sleep(3)  # Brief delay to allow initial app load before launching catch-up
-        check_and_catchup_sync()
+        ran = catch_up("startup")
     except Exception as e:
         logger.error(f"Startup catch-up error: {e}")
 
-    # 1b. Startup TER catch-up: current month's official TER, refreshed once per app start
-    # regardless of the daily schedule below (e.g. after a long-running container restart).
-    try:
-        sync_official_ter(_trigger="startup")
-    except Exception as e:
-        logger.error(f"Startup TER sync error: {e}")
+    # 1b. This month's official TER once per start, unless the catch-up's full refresh
+    # has just fetched it.
+    if ran != "full":
+        try:
+            run_sync_job("ter", "startup", _ter_body)
+        except Exception as e:
+            logger.error(f"Startup TER sync error: {e}")
 
     # 2. Daily midnight triggers (when AMFI finalizes the day's NAVs). The 00:05 run is the
     # full refresh -- NAVs, then the plan/option resolution that depends on those NAVs, then
     # TER (whose matching depends on the plan), then ONE summary rebuild. The late run is
-    # NAVs only: TER is a monthly disclosure and plans do not change intraday.
-    schedule.every().day.at("00:05").do(sync_all, _trigger="scheduled_00:05")
-    schedule.every().day.at("23:30").do(sync_daily_nav, _trigger="scheduled_23:30")
+    # NAVs only: TER is a monthly disclosure and plans do not change intraday. Both go
+    # through the job tracker, so they show on the page and never overlap another sync.
+    schedule.every().day.at("00:05").do(run_sync_job, "full", "scheduled_00:05", _full_body)
+    schedule.every().day.at("23:30").do(run_sync_job, "nav", "scheduled_23:30", _nav_body)
 
-    # 3. Hourly heartbeat catch-up: Checks every hour if data has fallen behind
-    schedule.every(1).hours.do(check_and_catchup_sync)
+    # 3. Hourly heartbeat: a missed or failed full refresh, or NAVs that have fallen behind.
+    schedule.every(1).hours.do(catch_up, "heartbeat")
 
     while True:
         try:

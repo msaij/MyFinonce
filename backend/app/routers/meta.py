@@ -29,6 +29,10 @@ def status() -> MetaStatus:
         ter_records_count=stats.get("ter_count", 0),
         ter_official_schemes=stats.get("ter_official_schemes", 0),
         flags=product_flags(),
+        # So every page can say its figures are updating, not just Data Management.
+        sync_activity=amfi_sync.current_sync_activity(),
+        backfill_running=bool(amfi_sync.get_backfill_status().get("is_running")
+                              or amfi_sync.get_ter_backfill_status().get("is_running")),
     )
 
 

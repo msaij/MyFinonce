@@ -29,8 +29,11 @@ import {
   getLatestAudit,
   runAudit,
   type AuditCheck,
-  type SyncHistory,
+  type SyncJobKind,
+  type SyncJobRecord,
+  type SyncJobStatus,
 } from "@/lib/api/admin";
+import { durationText, nextScheduledRun, refreshSteps, triggerText, untilText, whenText, type RefreshStep } from "@/lib/syncJobs";
 
 const EARLIEST_BACKFILL_YEAR = 2000;
 
@@ -60,43 +63,103 @@ function epochToStr(seconds: number | null): string {
   return new Date(seconds * 1000).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
-function SyncHealthCards({ title, caption, history, freshnessNote }: { title: string; caption: string; history: SyncHistory; freshnessNote?: React.ReactNode }) {
+/** The last run of one sync kind: when, why, how long, and what it said. */
+function LastJobLine({ record }: { record: SyncJobRecord | null }) {
+  if (!record) return null;
   return (
-    <div className="mt-6">
-      <h3 className="text-base font-bold">{title}</h3>
-      <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
-        {caption}
-      </p>
-      <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-3">
-        {freshnessNote}
-        <StatCard
-          title="Last Sync Attempt"
-          value={history.last_attempt_at ? formatDate(history.last_attempt_at) : "None yet"}
-          sub={history.last_attempt_at ? `Trigger: ${history.last_attempt_trigger ?? "manual"}` : "Since this container started"}
-        />
-        <StatCard
-          title="Last Successful Sync"
-          value={history.last_success_at ? formatDate(history.last_success_at) : "None yet"}
-          sub={history.last_success_msg ?? "Since this container started"}
-          tone={history.last_success_at ? "pos" : "neutral"}
-        />
-        <StatCard
-          title="Sync Attempts (This Session)"
-          value={`${history.total_syncs}`}
-          sub={history.total_failures ? `${history.total_failures} failed` : "0 failed"}
-          tone={history.total_failures ? "warn" : "neutral"}
-        />
-      </div>
-      {history.last_error && history.last_attempt_at === history.last_failure_at && (
-        <div className="mt-3">
-          <Banner level="warning">
-            <b>Most recent sync attempt failed:</b> {history.last_error}. It will retry automatically on the next scheduled run.
-          </Banner>
-        </div>
-      )}
+    <p className="mt-2 text-xs" style={{ color: record.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>
+      <span style={{ color: "var(--mf-muted)" }}>
+        Last run {whenText(record.finished_at)} · {triggerText(record.trigger)} · {durationText(record.elapsed_seconds)}:{" "}
+      </span>
+      {record.message || (record.ok ? "done" : "failed")}
+    </p>
+  );
+}
+
+const JOB_ROWS: { kind: SyncJobKind; label: string; when: string }[] = [
+  { kind: "full", label: "Full refresh", when: "Nightly 00:05 IST: NAVs, plan/option, riskometer & AUM, TER, rebuild, audit" },
+  { kind: "nav", label: "NAV sync", when: "Evening 23:30 IST: the day's NAVs" },
+  { kind: "ter", label: "TER sync", when: "On startup: this month's official TER" },
+  { kind: "catchup", label: "Catch-up", when: "Hourly, only when a scheduled run was missed" },
+];
+
+/** Each sync kind's last run, from records kept in the database -- so, unlike the in-memory
+ *  counters this replaces, a restart does not wipe it back to "None yet". */
+function SyncHistoryTable({ job }: { job: SyncJobStatus }) {
+  const cell = "px-3 py-2 align-top";
+  return (
+    <div className="mt-3 overflow-x-auto rounded-xl border" style={{ borderColor: "var(--mf-border)" }}>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs" style={{ color: "var(--mf-muted)" }}>
+            <th className={cell}>Job</th>
+            <th className={cell}>Last run</th>
+            <th className={cell}>Took</th>
+            <th className={cell}>Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          {JOB_ROWS.map(({ kind, label, when }) => {
+            const r = job.last[kind];
+            const running = job.is_running && job.kind === kind;
+            return (
+              <tr key={kind} className="border-t" style={{ borderColor: "var(--mf-border)" }}>
+                <td className={cell} style={{ minWidth: 190 }}>
+                  <div className="font-semibold">{label}</div>
+                  <div className="text-xs" style={{ color: "var(--mf-muted)" }}>{when}</div>
+                </td>
+                <td className={`${cell} whitespace-nowrap`}>
+                  {running ? (
+                    <StatusPill label="Running now" level="neutral" />
+                  ) : r ? (
+                    <>
+                      {whenText(r.finished_at)}
+                      <div className="text-xs" style={{ color: "var(--mf-muted)" }}>{triggerText(r.trigger)}</div>
+                    </>
+                  ) : (
+                    <span style={{ color: "var(--mf-muted)" }}>Not run yet</span>
+                  )}
+                </td>
+                <td className={`${cell} whitespace-nowrap`}>{running ? whenText(job.started_at) : r ? durationText(r.elapsed_seconds) : ""}</td>
+                <td className={cell} style={{ minWidth: 260 }}>
+                  {running ? (
+                    <span className="text-xs">{job.step || "Starting"}…</span>
+                  ) : r ? (
+                    <span className="text-xs" style={{ color: r.ok ? "var(--mf-fg)" : "var(--mf-danger)" }}>
+                      {r.ok ? "" : "Failed: "}
+                      {r.message || (r.ok ? "Done" : "no detail")}
+                    </span>
+                  ) : null}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
+
+/** The last full refresh, step by step. The run counts as a success once its NAVs land, so
+ *  this is the only place a failed enrichment step (riskometer, AUM, plan/option) shows. */
+function RefreshStepList({ steps }: { steps: RefreshStep[] }) {
+  if (!steps.length) return null;
+  return (
+    <ul className="mt-3 flex flex-col gap-1.5">
+      {steps.map((s) => (
+        <li key={s.name} className="flex flex-wrap items-baseline gap-x-3 text-xs">
+          <span className="flex-none" style={{ width: 92 }}>
+            <StatusPill label={s.ok ? "OK" : "Problem"} level={s.ok ? "success" : "danger"} />
+          </span>
+          <span className="flex-none font-semibold" style={{ width: 200 }}>{s.name}</span>
+          <span className="flex-1" style={{ color: s.ok ? "var(--mf-muted)" : "var(--mf-danger)", minWidth: 220 }}>{s.text}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const pct = (part: number, whole: number) => `${((part / Math.max(1, whole)) * 100).toFixed(1)}%`;
 
 function auditPill(check: AuditCheck): { label: string; level: "success" | "warning" | "danger" | "neutral" } {
   if (check.status === "error") return { label: "Check failed", level: "danger" };
@@ -296,14 +359,7 @@ export default function DataManagementPage() {
     enabled: backfillStartYear >= EARLIEST_BACKFILL_YEAR && backfillStartYear <= new Date().getFullYear(),
   });
 
-  const fullRefreshMut = useMutation({
-    mutationFn: runFullRefresh,
-    onSuccess: () => {
-      invalidate();
-      queryClient.invalidateQueries({ queryKey: ["verification"] });
-      queryClient.invalidateQueries({ queryKey: ["data-quality"] });
-    },
-  });
+  const fullRefreshMut = useMutation({ mutationFn: runFullRefresh, onSuccess: invalidate });
   const dailySyncMut = useMutation({ mutationFn: triggerDailySync, onSuccess: invalidate });
   const terSyncMut = useMutation({ mutationFn: triggerTerSync, onSuccess: invalidate });
   const recomputeMut = useMutation({ mutationFn: recomputeSummary, onSuccess: invalidate });
@@ -313,15 +369,34 @@ export default function DataManagementPage() {
   const stopHistBackfillMut = useMutation({ mutationFn: stopHistoricalBackfill, onSuccess: invalidate });
 
   const stats = status?.stats;
-  const refresh = status?.full_refresh;
-  // The nightly/manual refresh ends by auditing the data it just wrote, in a background
-  // thread; re-read the stored audit when a refresh finishes rather than polling for it.
-  const refreshFinishedAt = refresh?.finished_at;
+  // Every sync -- nightly, catch-up or a button here -- runs as one tracked job at a time.
+  const job = status?.sync_job;
+  const lastFull = job?.last.full ?? null;
+  const busy = !!job?.is_running;
+  const busyText = busy ? `${job?.label} (${triggerText(job?.trigger)}) is running` : "";
+  // The refresh ends by auditing the data it just wrote; re-read the stored audit and the
+  // checks when one finishes rather than polling for them.
+  const refreshFinishedAt = lastFull?.finished_at;
   useEffect(() => {
-    if (refreshFinishedAt) queryClient.invalidateQueries({ queryKey: ["data-audit"] });
+    if (!refreshFinishedAt) return;
+    queryClient.invalidateQueries({ queryKey: ["data-audit"] });
+    queryClient.invalidateQueries({ queryKey: ["verification"] });
+    queryClient.invalidateQueries({ queryKey: ["data-quality"] });
   }, [refreshFinishedAt, queryClient]);
   const cov = status?.cost_coverage;
-  const total = Math.max(1, cov?.total_schemes ?? 1);
+  const live = status?.live_coverage;
+  const steps = refreshSteps(lastFull?.result);
+  const stepProblems = steps.filter((s) => !s.ok && s.name !== "Data audit").length;
+  // The same query DataAuditPanel reads, so the at-a-glance card and the panel agree.
+  const { data: audit } = useQuery({ queryKey: ["data-audit"], queryFn: getLatestAudit });
+  const auditFailing = audit && !audit.empty ? (audit.summary?.errors ?? 0) + (audit.summary?.check_failures ?? 0) : 0;
+  // For "next run in 3 h"; a minute's resolution is plenty.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, []);
+  const nextRun = nextScheduledRun(now);
   // Asked of the backend, like NAV's chunk count, rather than estimated here. The estimate
   // this replaces was wrong twice over: a stray constant made "since 2026" read as 18
   // months for a nine-month span, and it ignored AMFI's 2018 floor, so "since 2015"
@@ -389,17 +464,59 @@ export default function DataManagementPage() {
         )}
       </div>
 
-      {activeTab === "overview" && status && stats && cov && (
+      {job?.is_running && (
         <div className="mt-4">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <Banner level="info">
+            <b>{job.label}</b> is running ({triggerText(job.trigger)}), started {whenText(job.started_at)} · {job.step || "Starting"}… It runs in the
+            background; you can leave this page. Other syncs wait until it finishes.
+          </Banner>
+        </div>
+      )}
+
+      {activeTab === "overview" && status && stats && cov && live && job && (
+        <div className="mt-4">
+          <h3 className="text-base font-bold">At a glance</h3>
+          <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             {status.staleness.is_stale ? (
-              <StatCard title="NAV Freshness" value="Sync Pending" sub={`Expected through ${status.staleness.expected_date ? formatDate(status.staleness.expected_date) : "today"}`} tone="warn" />
+              <StatCard title="NAV data" value="Sync pending" sub={`Have ${formatDate(status.staleness.current_max_date ?? "")}, AMFI has ${formatDate(status.staleness.expected_date ?? "")}`} tone="warn" />
             ) : (
-              <StatCard title="NAV Freshness" value="Live" sub={`Synced through ${status.staleness.current_max_date ? formatDate(status.staleness.current_max_date) : "-"}`} tone="pos" />
+              <StatCard title="NAV data" value="Up to date" sub={`Through ${status.staleness.current_max_date ? formatDate(status.staleness.current_max_date) : "-"}, AMFI's latest`} tone="pos" />
             )}
-            <StatCard title="Background Sync Daemon" value={status.enable_sync_daemon ? "Enabled" : "Disabled"} sub={status.enable_sync_daemon ? "Auto NAV + TER sync on schedule" : "Manual sync only, for now"} tone={status.enable_sync_daemon ? "pos" : "warn"} />
-            <StatCard title="Database Storage" value={`${stats.file_size_mb} MB`} sub={`${stats.schemes_count.toLocaleString("en-IN")} schemes · ${stats.nav_count.toLocaleString("en-IN")} NAV records`} />
+            <StatCard
+              title="Last full refresh"
+              value={lastFull ? whenText(lastFull.finished_at) : "Not run yet"}
+              sub={
+                !lastFull
+                  ? "Runs nightly at 00:05 IST"
+                  : !lastFull.ok
+                    ? `Failed (${triggerText(lastFull.trigger)}), see Sync history`
+                    : stepProblems
+                      ? `${stepProblems} step${stepProblems === 1 ? "" : "s"} had a problem, see below`
+                      : `${triggerText(lastFull.trigger)} · took ${durationText(lastFull.elapsed_seconds)}`
+              }
+              tone={!lastFull ? "" : !lastFull.ok ? "neg" : stepProblems ? "warn" : "pos"}
+            />
+            <StatCard
+              title="Data audit"
+              value={!audit || audit.empty ? "Not run yet" : auditFailing ? `${auditFailing} check${auditFailing === 1 ? "" : "s"} failing` : "All clear"}
+              sub={
+                audit && !audit.empty
+                  ? `${auditFailing ? `${(audit.summary?.error_rows ?? 0).toLocaleString("en-IN")} rows · ` : ""}${audit.run_at ? formatDate(audit.run_at) : ""} (${triggerText(audit.trigger)})`
+                  : "Row-level checks, below"
+              }
+              tone={!audit || audit.empty ? "" : auditFailing ? "neg" : "pos"}
+            />
+            <StatCard
+              title="Database"
+              value={`${(Number(stats.file_size_mb) / 1024).toFixed(1)} GB`}
+              sub={`${stats.nav_count.toLocaleString("en-IN")} NAVs since ${stats.min_date ? formatDate(stats.min_date) : "-"}`}
+            />
           </div>
+          <p className="mt-3 text-xs" style={{ color: status.enable_sync_daemon ? "var(--mf-muted)" : "var(--mf-danger)" }}>
+            {status.enable_sync_daemon
+              ? `Background sync is on. Next: ${nextRun.label} at ${new Date(nextRun.at * 1000).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST (${untilText(nextRun.at, now)}). An hourly check catches up any run that was missed.`
+              : "Background sync is off (ENABLE_SYNC_DAEMON), so the data only changes when you sync from the Sync & Backfill tab."}
+          </p>
 
           {(status.ter_backfill_status.is_running || status.backfill_status.is_running) && (
             <div className="mt-4">
@@ -414,78 +531,75 @@ export default function DataManagementPage() {
           )}
 
           <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
-            TER Coverage
+            Coverage of live schemes
           </h3>
           <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
-            How many of {(cov.total_schemes ?? 0).toLocaleString("en-IN")} tracked schemes have a dated, sourced expense ratio -- see the Reference tab for what each status means.
+            Counted over the {live.live_schemes.toLocaleString("en-IN")} schemes still publishing NAVs. The other{" "}
+            {(live.listed_schemes - live.live_schemes).toLocaleString("en-IN")} of {live.listed_schemes.toLocaleString("en-IN")} ever listed have matured,
+            merged or wound up and can never carry a current TER or riskometer (over all of them, official TER would read {pct(cov.ter_official, cov.total_schemes)}).
+            {cov.ter_legacy > 0 && ` ${cov.ter_legacy.toLocaleString("en-IN")} schemes still carry an unverified legacy TER.`}
           </p>
-          <div className="mt-3 grid grid-cols-2 gap-4 md:grid-cols-3">
-            <StatCard title="Official (AMFI TER Portal)" value={cov.ter_official.toLocaleString("en-IN")} sub={`${((cov.ter_official / total) * 100).toFixed(1)}% of schemes`} tone="pos" />
-            <StatCard title="Legacy (Unverified)" value={cov.ter_legacy.toLocaleString("en-IN")} sub={`${((cov.ter_legacy / total) * 100).toFixed(1)}% of schemes`} tone="warn" />
-            <StatCard title="Unknown" value={cov.ter_unknown.toLocaleString("en-IN")} sub={`${((cov.ter_unknown / total) * 100).toFixed(1)}% of schemes`} tone={cov.ter_unknown > 0 ? "neg" : "neutral"} />
+          <div className="mt-3 grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <StatCard
+              title="Official TER"
+              value={pct(live.ter_official, live.live_schemes)}
+              sub={`${live.ter_official.toLocaleString("en-IN")} of ${live.live_schemes.toLocaleString("en-IN")} · AMFI TER portal`}
+              tone={live.ter_official / Math.max(1, live.live_schemes) >= 0.95 ? "pos" : "warn"}
+            />
+            <StatCard
+              title="Riskometer"
+              value={pct(live.riskometer, live.live_schemes)}
+              sub={`${live.riskometer.toLocaleString("en-IN")} of ${live.live_schemes.toLocaleString("en-IN")}${live.riskometer_as_of ? ` · as of ${formatDate(live.riskometer_as_of)}` : ""}`}
+              tone={live.riskometer / Math.max(1, live.live_schemes) >= 0.9 ? "pos" : "warn"}
+            />
+            {live.unknown_plan != null && (
+              <StatCard
+                title="Plan confirmed"
+                value={pct(live.live_schemes - live.unknown_plan, live.live_schemes)}
+                sub={`${live.unknown_plan.toLocaleString("en-IN")} with no Direct/Regular from AMFI`}
+                tone={live.unknown_plan / Math.max(1, live.live_schemes) <= 0.05 ? "pos" : "warn"}
+              />
+            )}
+            {live.unknown_option != null && (
+              <StatCard
+                title="Option confirmed"
+                value={pct(live.live_schemes - live.unknown_option, live.live_schemes)}
+                sub={`${live.unknown_option.toLocaleString("en-IN")} with no Growth/IDCW from AMFI`}
+                tone={live.unknown_option / Math.max(1, live.live_schemes) <= 0.05 ? "pos" : "warn"}
+              />
+            )}
           </div>
-          {quality && (
-            <div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-3">
-              <StatCard title="Official TER coverage" value={`${(quality.ter_official_coverage_ratio * 100).toFixed(1)}%`} sub={`${quality.ter_official_schemes} / ${quality.schemes_count}`} />
-              <StatCard title="NAV gap rate" value={quality.nav_gap_rate != null ? quality.nav_gap_rate.toFixed(2) : "—"} sub="lag weeks vs today" />
-              <StatCard title="Market proxy last NAV" value={quality.factor_market_last_nav ?? "—"} />
+          {/* Info findings restate the cards above; only warnings add something. */}
+          {verification && verification.findings.some((f) => f.level === "warning") && (
+            <div className="mt-3 flex flex-col gap-2">
+              {verification.findings
+                .filter((f) => f.level === "warning")
+                .map((f, i) => (
+                  <Banner key={i} level="warning">{f.text}</Banner>
+                ))}
             </div>
-          )}
-
-          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
-            Data check
-          </h3>
-          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
-            What the database actually holds, reconciled after every refresh{verification ? ` · checked ${formatDate(verification.checked_at)}` : ""}.
-          </p>
-          {verification && (
-            <>
-              <div className="mt-3 grid grid-cols-2 gap-4 md:grid-cols-4">
-                <StatCard
-                  title="NAV coverage"
-                  value={`${verification.nav.rows.toLocaleString("en-IN")} rows`}
-                  sub={verification.nav.first_date ? `${formatDate(verification.nav.first_date)} to ${formatDate(verification.nav.last_date)}` : ""}
-                />
-                <StatCard
-                  title="Days behind AMFI"
-                  value={verification.nav.lag_days !== null ? String(verification.nav.lag_days) : "—"}
-                  tone={(verification.nav.lag_days ?? 0) > 1 ? "warn" : "pos"}
-                  sub={verification.nav.expected_date ? `expected through ${formatDate(verification.nav.expected_date)}` : ""}
-                />
-                <StatCard
-                  title="Plan unconfirmed"
-                  value={verification.schemes.unknown_plan.toLocaleString("en-IN")}
-                  tone={verification.schemes.unknown_plan > 0 ? "warn" : "pos"}
-                  sub={`of ${verification.schemes.active.toLocaleString("en-IN")} active schemes`}
-                />
-                <StatCard
-                  title="Option unconfirmed"
-                  value={verification.schemes.unknown_option.toLocaleString("en-IN")}
-                  sub="AMFI states neither a plan nor an option for these"
-                />
-              </div>
-              {verification.findings.length > 0 && (
-                <div className="mt-3 flex flex-col gap-2">
-                  {verification.findings.map((f, i) => (
-                    <Banner key={i} level={f.level === "warning" ? "warning" : "info"}>{f.text}</Banner>
-                  ))}
-                </div>
-              )}
-            </>
           )}
 
           <DataAuditPanel />
 
-          <SyncHealthCards
-            title="NAV Sync Health"
-            caption="Automated schedule: every night at 00:05 IST and 23:30 IST, plus an hourly heartbeat that catches up automatically if any run is missed or fails."
-            history={status.sync_history}
-          />
-          <SyncHealthCards
-            title="Official TER Sync Health"
-            caption="A separate, daily sync against AMFI's own TER-disclosure portal -- different source, different schedule, tracked independently. Covers the current calendar month only on the automated schedule; see the Sync & Backfill tab for older months."
-            history={status.ter_sync_history}
-          />
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Sync history
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Each job&apos;s last run, whether scheduled, started by you or caught up after a missed run. Kept in the database, so it survives restarts.
+          </p>
+          <SyncHistoryTable job={job} />
+          {lastFull && steps.length > 0 && (
+            <div className="mt-4">
+              <div className="text-sm font-semibold">
+                Last full refresh, step by step{" "}
+                <span className="text-xs font-normal" style={{ color: "var(--mf-muted)" }}>
+                  ({whenText(lastFull.finished_at)}, {triggerText(lastFull.trigger)})
+                </span>
+              </div>
+              <RefreshStepList steps={steps} />
+            </div>
+          )}
         </div>
       )}
 
@@ -496,37 +610,46 @@ export default function DataManagementPage() {
             <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
               Today&apos;s NAVs, then the plan/option resolution those NAVs make possible, then this month&apos;s official TER, then one
               rebuild of the performance table. That order matters: TER matching reads a scheme&apos;s plan to decide which of AMFI&apos;s
-              two disclosed expense ratios belongs to it.
+              two disclosed expense ratios belongs to it. It runs by itself every night at 00:05; if the machine was off then, it runs at
+              the next start or hourly check.
             </p>
             <button
               type="button"
-              disabled={fullRefreshMut.isPending || refresh?.is_running}
+              disabled={fullRefreshMut.isPending || busy}
+              title={busy ? busyText : undefined}
               onClick={() => fullRefreshMut.mutate()}
               className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
               style={{ background: "var(--mf-accent)", color: "white" }}
             >
-              {refresh?.is_running ? "Refreshing…" : "Run full refresh"}
+              {job?.is_running && job.kind === "full" ? "Refreshing…" : "Run full refresh"}
             </button>
+            {busy && job?.kind !== "full" && <p className="mt-2 text-xs" style={{ color: "var(--mf-muted)" }}>Waiting: {busyText}.</p>}
             {fullRefreshMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(fullRefreshMut.error)}</p>}
-            {refresh?.is_running && (
-              <div className="mt-2">
-                <Banner level="info">{refresh.step || "Starting"}… This runs in the background; you can leave this page.</Banner>
+            {lastFull && !(job?.is_running && job.kind === "full") && (
+              <div className="mt-3 text-xs">
+                <div className="font-semibold">
+                  Last run {whenText(lastFull.finished_at)} · {triggerText(lastFull.trigger)} · took {durationText(lastFull.elapsed_seconds)}
+                  {lastFull.result?.filled ? ` · filled ${lastFull.result.filled.toLocaleString("en-IN")} NAVs for missed days` : ""}
+                </div>
+                <ul className="mt-1 flex flex-col gap-1">
+                  {lastFull.result?.nav ? (
+                    <li style={{ color: lastFull.result.nav.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>NAV: {lastFull.result.nav.message}</li>
+                  ) : (
+                    <li style={{ color: lastFull.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>{lastFull.message}</li>
+                  )}
+                  {lastFull.result?.resolve && (
+                    <li style={{ color: "var(--mf-muted)" }}>
+                      Plans:{" "}
+                      {lastFull.result.resolve.ok
+                        ? `${lastFull.result.resolve.resolved?.toLocaleString("en-IN")} schemes identified, ${lastFull.result.resolve.plan_changed} plan(s) corrected, ${lastFull.result.resolve.option_changed} option(s) filled`
+                        : lastFull.result.resolve.reason}
+                    </li>
+                  )}
+                  {lastFull.result?.ter && (
+                    <li style={{ color: lastFull.result.ter.ok ? "var(--mf-success)" : "var(--mf-warning)" }}>TER: {lastFull.result.ter.message}</li>
+                  )}
+                </ul>
               </div>
-            )}
-            {!refresh?.is_running && refresh?.last_result && (
-              <ul className="mt-2 flex flex-col gap-1 text-xs">
-                <li style={{ color: refresh.last_result.nav.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>NAV: {refresh.last_result.nav.message}</li>
-                <li style={{ color: "var(--mf-muted)" }}>
-                  Plans:{" "}
-                  {refresh.last_result.resolve?.ok
-                    ? `${refresh.last_result.resolve.resolved?.toLocaleString("en-IN")} schemes identified, ${refresh.last_result.resolve.plan_changed} plan(s) corrected, ${refresh.last_result.resolve.option_changed} option(s) filled`
-                    : refresh.last_result.resolve?.reason}
-                </li>
-                {refresh.last_result.ter && (
-                  <li style={{ color: refresh.last_result.ter.ok ? "var(--mf-success)" : "var(--mf-warning)" }}>TER: {refresh.last_result.ter.message}</li>
-                )}
-                <li style={{ color: "var(--mf-muted)" }}>Finished in {refresh.last_result.elapsed_seconds}s.</li>
-              </ul>
             )}
           </div>
 
@@ -544,15 +667,16 @@ export default function DataManagementPage() {
               </p>
               <button
                 type="button"
-                disabled={dailySyncMut.isPending}
+                disabled={dailySyncMut.isPending || busy}
+                title={busy ? busyText : undefined}
                 onClick={() => dailySyncMut.mutate()}
                 className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                 style={{ background: "var(--mf-accent)", color: "white" }}
               >
-                {dailySyncMut.isPending ? "Syncing..." : "Start Daily NAV Sync Now"}
+                {job?.is_running && job.kind === "nav" ? "Syncing…" : "Start Daily NAV Sync Now"}
               </button>
-              {dailySyncMut.isSuccess && <p className="mt-2 text-xs" style={{ color: "var(--mf-success)" }}>{dailySyncMut.data.message}</p>}
               {dailySyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(dailySyncMut.error)}</p>}
+              <LastJobLine record={job?.last.nav ?? null} />
             </div>
             <div className="filter-box">
               <div className="text-sm font-semibold">Trigger Official TER Sync</div>
@@ -561,15 +685,16 @@ export default function DataManagementPage() {
               </p>
               <button
                 type="button"
-                disabled={terSyncMut.isPending}
+                disabled={terSyncMut.isPending || busy}
+                title={busy ? busyText : undefined}
                 onClick={() => terSyncMut.mutate()}
                 className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                 style={{ background: "var(--mf-accent)", color: "white" }}
               >
-                {terSyncMut.isPending ? "Syncing..." : "Sync Official TER Now"}
+                {job?.is_running && job.kind === "ter" ? "Syncing…" : "Sync Official TER Now"}
               </button>
-              {terSyncMut.isSuccess && <p className="mt-2 text-xs" style={{ color: "var(--mf-success)" }}>{terSyncMut.data.message}</p>}
               {terSyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(terSyncMut.error)}</p>}
+              <LastJobLine record={job?.last.ter ?? null} />
             </div>
             <div className="filter-box">
               <div className="text-sm font-semibold">Re-materialize Performance Table</div>
@@ -581,7 +706,8 @@ export default function DataManagementPage() {
               </p>
               <button
                 type="button"
-                disabled={recomputeMut.isPending}
+                disabled={recomputeMut.isPending || busy}
+                title={busy ? busyText : undefined}
                 onClick={() => recomputeMut.mutate()}
                 className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                 style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
@@ -631,8 +757,10 @@ export default function DataManagementPage() {
               {status.ter_backfill_status.finished_at && <Banner level="info">TER backfill session completed at {epochToStr(status.ter_backfill_status.finished_at)}.</Banner>}
               <button
                 type="button"
+                disabled={busy}
+                title={busy ? busyText : undefined}
                 onClick={() => startTerBackfillMut.mutate(12)}
-                className="rounded-lg px-4 py-2 text-sm font-semibold"
+                className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                 style={{ background: "var(--mf-accent)", color: "white" }}
               >
                 Backfill Last 12 Months of TER
@@ -652,7 +780,8 @@ export default function DataManagementPage() {
                 />
                 <button
                   type="button"
-                  disabled={!terMonths}
+                  disabled={!terMonths || busy}
+                  title={busy ? busyText : undefined}
                   onClick={() => startTerBackfillMut.mutate(terMonths)}
                   className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                   style={{ background: "var(--mf-accent)", color: "white" }}
@@ -716,8 +845,10 @@ export default function DataManagementPage() {
               )}
               <button
                 type="button"
+                disabled={busy}
+                title={busy ? busyText : undefined}
                 onClick={() => startHistBackfillMut.mutate({ year: 2025, max: 4 })}
-                className="rounded-lg px-4 py-2 text-sm font-semibold"
+                className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                 style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
               >
                 Backfill Past 1 Year (4 Quarters)
@@ -737,7 +868,8 @@ export default function DataManagementPage() {
                 />
                 <button
                   type="button"
-                  disabled={!chunkCountData}
+                  disabled={!chunkCountData || busy}
+                  title={busy ? busyText : undefined}
                   onClick={() => startHistBackfillMut.mutate({ year: backfillStartYear })}
                   className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
                   style={{ background: "var(--mf-accent)", color: "white" }}
@@ -761,7 +893,9 @@ export default function DataManagementPage() {
                         startHistBackfillMut.mutate({ year: backfillStartYear, resume: false });
                       }
                     }}
-                    className="mt-2 rounded-lg px-3 py-1.5 text-xs font-semibold"
+                    disabled={busy}
+                    title={busy ? busyText : undefined}
+                    className="mt-2 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
                     style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
                   >
                     Re-download Everything (Ignore Checkpoints)

@@ -30,6 +30,8 @@ import { formatInr, formatSignedPct } from "@/lib/format";
 import { formatTer } from "@/lib/holdings";
 import { formatCrore, formatPp } from "@/lib/overview";
 import { useFilterStore } from "@/lib/stores/filters";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import { RISK_ABOUT, riskRank } from "@/lib/riskometer";
 
 const SECTION = "compare_simulate";
 const DEFAULT_RF_PCT = 6.5;
@@ -255,6 +257,7 @@ export function CompareTab({ codes, start, end, amount, onAmountChange }: Compar
     plan_type: f.plan_type ?? null,
     option_type: f.option_type ?? null,
     riskometer: f.riskometer ?? null,
+    riskometer_as_of: f.riskometer_as_of ?? null,
     aum: f.aum_cr ?? null,
     isin: f.isin ?? null,
   }));
@@ -578,7 +581,13 @@ export function CompareTab({ codes, start, end, amount, onAmountChange }: Compar
             { key: "asset_class", label: "Asset Class", tooltip: "The app's asset-class grouping of the category (liquid, overnight and arbitrage funds count as Cash & Liquid)." },
             { key: "plan_type", label: "Plan", tooltip: "Direct (no distributor commission) or Regular." },
             { key: "option_type", label: "Option", tooltip: "Growth reinvests everything; IDCW pays out, and its NAV drops by each payout." },
-            { key: "riskometer", label: "Riskometer", tooltip: "SEBI riskometer level, as last disclosed." },
+            {
+              key: "riskometer",
+              label: "Riskometer",
+              tooltip: RISK_ABOUT,
+              sortValue: (r) => riskRank(r.riskometer),
+              render: (r) => <RiskBadge level={r.riskometer as string | null} asOf={r.riskometer_as_of as string | null} emptyText="-" />,
+            },
             { key: "aum", label: "Fund AUM", tooltip: "Assets under management of the whole fund (all plans), from AMFI's snapshot.", render: (r) => formatCrore(r.aum as number | null) },
             { key: "isin", label: "ISIN", tooltip: "The plan's ISIN (growth / payout)." },
           ]}

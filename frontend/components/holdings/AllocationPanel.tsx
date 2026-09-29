@@ -10,6 +10,8 @@ import { StatCard } from "@/components/shared/StatCard";
 import { getAllocation, type Allocation, type AllocationBucket, type PortfolioKey } from "@/lib/api/holdings";
 import { formatDate, formatInr } from "@/lib/format";
 import { AXIS, SERIES_1 } from "@/lib/holdingsChart";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import { riskRank } from "@/lib/riskometer";
 
 /** A single fund holding more than this share is flagged: one fund's mishap is then a portfolio event. */
 const FUND_WARN_PCT = 40;
@@ -157,7 +159,9 @@ function HoldingsByClass({ holdings }: { holdings: Allocation["holdings"] }) {
     { key: "category", label: "SEBI category", tooltip: "The fund's SEBI category, with AMFI's section prefix dropped." },
     { key: "fund_house", label: "Fund house" },
     {
-      key: "riskometer", label: "Riskometer", render: (_r, v) => (v ? String(v) : "-"),
+      key: "riskometer", label: "Riskometer",
+      sortValue: (r) => riskRank(r.riskometer),
+      render: (_r, v) => <RiskBadge level={v as string | null} emptyText="-" />,
       tooltip: "SEBI's official risk label for the fund (Low to Very High), from AMFI's fund data. The Risk tab shows where your money sits on the scale.",
     },
     { key: "value", label: "Value", format: "inr" },

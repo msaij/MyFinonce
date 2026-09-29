@@ -23,6 +23,9 @@ _COLUMNS = (
     "latest_nav", "latest_date", "change_1d_pct", "return_30d_pct",
     "return_1y_pct", "return_3y_pct", "return_5y_pct",
 )
+# From the scheme master, not the price summary: the riskometer is AMFI's per-fund label,
+# stored on schemes by the nightly refresh (see amfi_sync.resolve_plan_options).
+_RISK_COLUMNS = ("riskometer", "riskometer_as_of")
 
 
 @cached(ttl=600)
@@ -31,8 +34,9 @@ def all_funds(plan_type: str = "All Plans", option_type: str = "All Options") ->
     filter. The tab searches, filters and sorts the full list in the browser."""
     where_sql, params = _build_screener_where(plan_type=plan_type, option_type=option_type)
     sql = f"""
-        SELECT {", ".join(f"s.{c}" for c in _COLUMNS)}
+        SELECT {", ".join(f"s.{c}" for c in _COLUMNS)}, {", ".join(f"m.{c}" for c in _RISK_COLUMNS)}
         FROM summary_table s
+        LEFT JOIN schemes m ON m.scheme_code = s.scheme_code
         {where_sql}
         ORDER BY s.scheme_name, s.scheme_code
     """
@@ -40,10 +44,11 @@ def all_funds(plan_type: str = "All Plans", option_type: str = "All Options") ->
         rows = con.execute(sql, params).fetchall()
     out = []
     for r in rows:
-        row = dict(zip(_COLUMNS, r))
+        row = dict(zip(_COLUMNS + _RISK_COLUMNS, r))
         row["display_name"] = format_scheme_display_name(
             row["scheme_name"], row["plan_type"], row["option_type"], row["scheme_code"]
         )
-        row["latest_date"] = row["latest_date"].isoformat() if row["latest_date"] else None
+        for k in ("latest_date", "riskometer_as_of"):
+            row[k] = row[k].isoformat() if row[k] else None
         out.append(row)
     return out

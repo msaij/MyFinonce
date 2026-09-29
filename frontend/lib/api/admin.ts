@@ -71,13 +71,28 @@ export interface HistoricalBackfillProgress {
   completed_units: string[];
 }
 
+/** Coverage over schemes still publishing NAVs, not every scheme ever listed. */
+export interface LiveCoverage {
+  live_schemes: number;
+  listed_schemes: number;
+  ter_official: number;
+  riskometer: number;
+  riskometer_as_of: string | null;
+  /** Live schemes AMFI states no Direct/Regular plan for. Optional because the backend is
+   *  restarted separately from a frontend rebuild, and an ops page must not crash on skew. */
+  unknown_plan?: number;
+  /** Live schemes with no confirmed Growth/IDCW option. */
+  unknown_option?: number;
+}
+
 export interface AdminStatus {
   stats: DatabaseStats;
   staleness: Staleness;
   sync_history: SyncHistory;
   ter_sync_history: SyncHistory;
   cost_coverage: CostCoverage;
-  full_refresh: FullRefreshStatus;
+  live_coverage: LiveCoverage;
+  sync_job: SyncJobStatus;
   ter_backfill_status: TerBackfillStatus;
   backfill_status: HistoricalBackfillStatus;
   backfill_progress: HistoricalBackfillProgress;
@@ -107,14 +122,32 @@ export interface FullRefreshResult {
   };
 }
 
-/** The chain runs in a background thread (it takes minutes), so the UI polls this out of
- *  /status rather than holding a request open. */
-export interface FullRefreshStatus {
+export type SyncJobKind = "full" | "nav" | "ter" | "catchup";
+
+/** One completed sync job, kept in the database so it survives restarts. */
+export interface SyncJobRecord {
+  kind: SyncJobKind;
+  /** "manual", "scheduled_00:05", "scheduled_23:30", "heartbeat", "startup". */
+  trigger: string;
+  ok: boolean;
+  message: string;
+  started_at: number;
+  finished_at: number;
+  elapsed_seconds: number;
+  /** For a full refresh, the per-step outcome. */
+  result: (Partial<FullRefreshResult> & { message?: string; filled?: number }) | null;
+}
+
+/** Every sync -- scheduled, catch-up or a button -- runs as a job through one tracker, one
+ *  at a time, in the background; the page polls this out of /status. */
+export interface SyncJobStatus {
   is_running: boolean;
+  kind: SyncJobKind | null;
+  label: string | null;
+  trigger: string | null;
   step: string;
   started_at: number | null;
-  finished_at: number | null;
-  last_result: FullRefreshResult | null;
+  last: Record<SyncJobKind, SyncJobRecord | null>;
 }
 
 export interface Verification {

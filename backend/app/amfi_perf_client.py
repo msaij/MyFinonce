@@ -7,7 +7,7 @@ the Direct-plan and Regular-plan NAV side by side on a stated date -- which iden
 scheme codes by arithmetic instead of by guesswork (see amfi_sync.resolve_plan_options).
 
 It also carries each scheme's SEBI riskometer level and AUM, which AMFI publishes nowhere
-else in machine-readable form; neither is stored yet.
+else in machine-readable form: both are stored (schemes.riskometer, amfi_fund_snapshot).
 
 The endpoints are undocumented -- they are what the page itself calls. Requests are POSTs
 with a JSON body and the whole open-ended universe is ~46 sub-category calls, so this is
@@ -21,7 +21,7 @@ import json
 import logging
 import ssl
 import urllib.request
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger("amfi_perf_client")
 
@@ -35,6 +35,12 @@ CATEGORY_IDS = (1, 2, 3, 4, 5, 6)
 #: Open Ended. Close Ended is maturityType 2 and is not synced: those schemes cannot be
 #: bought and their NAVs are not what a holder of an open-ended plan needs matched.
 MATURITY_OPEN_ENDED = 1
+
+#: A trading day's feed lists ~2,000 funds. The feed's own report date runs on through
+#: weekends and holidays, when it lists only the ~100 funds that publish a NAV every calendar
+#: day -- a sample, not the day's picture: resolving against it confirms almost nothing, and
+#: the fund snapshot, which is replaced whole, would lose 95% of its funds.
+FULL_FEED_MIN_ROWS = 1000
 
 
 class AmfiPerfClient:
@@ -94,6 +100,25 @@ class AmfiPerfClient:
                 })
                 for row in ((body or {}).get("data") or []):
                     yield {**row, "_category_id": category_id, "_sub_category": sub.get("name")}
+
+    def fetch_latest_full(self, max_days_back: int = 7,
+                          min_rows: int = FULL_FEED_MIN_ROWS) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        """The newest report date that carries a full trading day, with its rows; (None, [])
+        when none of the last `max_days_back` days does. Saturdays and Sundays are skipped
+        without a fetch; a weekday holiday gives itself away by its row count."""
+        latest = parse_nav_date(self.report_date())
+        if latest is None:
+            return None, []
+        for back in range(max_days_back + 1):
+            day = latest - datetime.timedelta(days=back)
+            if day.weekday() >= 5:
+                continue
+            label = day.strftime("%d-%b-%Y")
+            rows = list(self.fetch_all(label))
+            if len(rows) >= min_rows:
+                return label, rows
+            logger.info(f"AMFI fund-performance {label}: {len(rows)} funds, not a full trading day; trying the day before.")
+        return None, []
 
 
 def parse_nav_date(raw: Optional[str]) -> Optional[datetime.date]:

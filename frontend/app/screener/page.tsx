@@ -19,6 +19,8 @@ import { useFilterStore } from "@/lib/stores/filters";
 import { getMetaFilters } from "@/lib/api/meta";
 import { getScreener, getScreenerKpis, type ScreenerFilterParams } from "@/lib/api/screener";
 import { getNavHistory } from "@/lib/api/schemes";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import { RISK_ABOUT, riskRank } from "@/lib/riskometer";
 
 const SECTION = "screener";
 
@@ -56,6 +58,13 @@ const SCREENER_TABLE_COLUMNS: ColumnConfig[] = [
   },
   { key: "fund_house", label: "AMC" },
   { key: "category", label: "Category" },
+  {
+    key: "riskometer",
+    label: "Riskometer",
+    sortValue: (row) => riskRank(row.riskometer),
+    render: (row) => <RiskBadge level={row.riskometer as string | null} asOf={row.riskometer_as_of as string | null} emptyText="-" />,
+    tooltip: RISK_ABOUT,
+  },
   // No Plan/Option columns: the Scheme Name above is the app-wide label, which already ends
   // in "(Direct - Growth) [149170]". Repeating both in their own columns pushed the return
   // figures off the right edge to restate what every row already said.
@@ -321,7 +330,7 @@ function ScreenerContent() {
   if (schemeCode) activeFilterLabels.push(`Isolated scheme code: ${schemeCode}`);
 
   return (
-    <AppShell pageContext={isolatedName ? { label: "Isolated Scheme", value: isolatedName } : undefined}>
+    <AppShell>
       <h1 className="mf-page-title">Mutual Fund Scheme Screener</h1>
       <p className="mf-page-caption">Institutional screener for all mutual fund schemes using official AMFI 4-decimal data.</p>
 
@@ -351,7 +360,11 @@ function ScreenerContent() {
           <StatCard title={`Top Performer (${span}D)`} value="-" sub="No data" />
         )}
         {isolatedRow ? (
-          <StatCard title="Fund Category / AMC" value={String(isolatedRow.category ?? "N/A")} sub={String(isolatedRow.fund_house ?? "")} />
+          <StatCard
+            title="Fund Category / AMC"
+            value={String(isolatedRow.category ?? "N/A")}
+            sub={`${isolatedRow.fund_house ?? ""}${isolatedRow.riskometer ? ` · Riskometer: ${isolatedRow.riskometer}` : ""}`}
+          />
         ) : kpis?.lag_performer ? (
           <StatCard
             title={`Lagging Performer (${span}D)`}
