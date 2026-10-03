@@ -161,6 +161,41 @@ class TestHistoricalCrisisReplayScenarios:
         assert "layout" in fig
 
 
+def _steady(start="2019-06-01", end="2021-06-01", daily=0.0002):
+    dates = pd.date_range(start, end, freq="D")
+    return pd.DataFrame({"nav_date": dates, "nav": 100.0 * (1 + daily) ** np.arange(len(dates))})
+
+
+def test_a_benchmark_that_did_not_fall_is_not_replaced_by_the_nifty():
+    """A liquid-fund peer blend never dipped in March 2020. Its 0.00% used to be swapped for
+    the scenario's hard-coded Nifty 50 figure, so Holdings showed the benchmark falling 38%."""
+    covid = evaluate_historical_stress_scenarios(1, df_hist=_steady(), benchmark_series=_steady())["covid_march_2020"]
+    assert covid["available"] and covid["benchmark_drawdown_pct"] == 0.0
+    assert covid["excess_drawdown_pct"] == 0.0
+
+
+def test_the_nifty_stands_in_only_when_no_benchmark_is_passed():
+    """No benchmark passed: the Nifty 50 index fund's own NAVs, or failing those the
+    scenario's recorded Nifty fall -- either way a Nifty-sized fall, never missing."""
+    covid = evaluate_historical_stress_scenarios(1, df_hist=_steady())["covid_march_2020"]
+    assert covid["benchmark_drawdown_pct"] is not None and covid["benchmark_drawdown_pct"] < -30
+
+
+def test_a_passed_benchmark_without_data_for_the_window_is_unknown_not_the_nifty():
+    covid = evaluate_historical_stress_scenarios(1, df_hist=_steady(),
+                                                 benchmark_series=_steady("2021-01-01", "2021-06-01"))["covid_march_2020"]
+    assert covid["benchmark_drawdown_pct"] is None and covid["excess_drawdown_pct"] is None
+
+
+def test_a_window_the_fund_missed_reports_nothing_and_still_charts():
+    """Not a green 0.00% "Zero DD": the fund has no drawdown for a crisis it never saw."""
+    res = evaluate_historical_stress_scenarios(1, df_hist=_steady("2023-01-01", "2024-12-31"))
+    covid = res["covid_march_2020"]
+    assert covid["available"] is False
+    assert covid["max_drawdown_pct"] is None and covid["benchmark_drawdown_pct"] is None
+    assert "data" in generate_stress_figure(res["scenarios"], "Young Fund")
+
+
 # --- Messy NAV input (ported from the retired adversarial suite) ------------------------
 
 def _crisis_frame(dates, drop_pct, from_date):

@@ -101,10 +101,12 @@ def _compute_single_scenario(
         "peak_nav": None,
         "trough_date": None,
         "trough_nav": None,
-        "max_drawdown_pct": 0.0,
+        # Unknown, not zero: a window the fund did not live through has no drawdown to
+        # report, and 0.0 here rendered as a green "0.00% (Zero DD)".
+        "max_drawdown_pct": None,
         "drawdown_pct": None,
-        "benchmark_drawdown_pct": 0.0,
-        "excess_drawdown_pct": 0.0,
+        "benchmark_drawdown_pct": None,
+        "excess_drawdown_pct": None,
         "drawdown_duration_days": 0,
         "recovery_date": None,
         "recovery_duration_days": None,
@@ -199,7 +201,7 @@ def _compute_single_scenario(
                 rec_duration = None
 
     # Benchmark metrics
-    bench_dd_pct = 0.0
+    bench_dd_pct: Optional[float] = None
     b = pd.DataFrame()
     if df_bench is not None and not df_bench.empty:
         b = df_bench.copy()
@@ -235,12 +237,16 @@ def _compute_single_scenario(
                     bench_dd = (b_trough_nav - b_peak_nav) / b_peak_nav if b_peak_nav > 0 else 0.0
                     bench_dd_pct = float(round(bench_dd * 100.0, 4))
 
-    # If empirical benchmark was not available in DB, fall back to scenario benchmark default
-    if bench_dd_pct == 0.0 and "benchmark_mdd_pct" in scenario_cfg:
+    # The scenario's own Nifty 50 figure stands in only when no benchmark series was passed
+    # at all. A benchmark that was passed and did not fall has a 0.00% drawdown -- the old
+    # "== 0.0" test swapped that for the Nifty's -38.44%, so a liquid-fund peer blend that
+    # never dipped was shown falling 38% in March 2020. One passed but without data for the
+    # window is unknown (None), not the Nifty.
+    if bench_dd_pct is None and (df_bench is None or df_bench.empty) and "benchmark_mdd_pct" in scenario_cfg:
         bench_dd_pct = float(scenario_cfg["benchmark_mdd_pct"])
 
     # Excess drawdown: Fund DD - Benchmark DD (positive means fund dropped less)
-    excess_dd_pct = float(round(max_dd_pct - bench_dd_pct, 4))
+    excess_dd_pct = float(round(max_dd_pct - bench_dd_pct, 4)) if bench_dd_pct is not None else None
 
     # Downside Beta during crisis
     downside_beta = 1.0
@@ -472,7 +478,8 @@ def generate_stress_figure(scenarios: List[Dict[str, Any]], scheme_name: str) ->
         # Direct/Regular twin as the same legend entry.
         name=scheme_name,
         marker_color="#DC2626",
-        text=[f"{v:.2f}%" for v in fund_dds],
+        # A window with no data has no bar and says so, rather than a 0.00% bar.
+        text=[f"{v:.2f}%" if v is not None else "no data" for v in fund_dds],
         textposition="outside",
     ))
     fig.add_trace(go.Bar(
@@ -480,7 +487,7 @@ def generate_stress_figure(scenarios: List[Dict[str, Any]], scheme_name: str) ->
         y=bench_dds,
         name="Benchmark (Nifty 50)",
         marker_color="#475569",
-        text=[f"{v:.2f}%" for v in bench_dds],
+        text=[f"{v:.2f}%" if v is not None else "no data" for v in bench_dds],
         textposition="outside",
     ))
 

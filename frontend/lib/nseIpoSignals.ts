@@ -62,7 +62,7 @@ const isTotal = (r: NseBidRow) => r.category.trim().toLowerCase() === "total";
 const isSpecialQuota = (r: NseBidRow) => !!r.sr_no && /^\d+$/.test(r.sr_no) && !isQib(r) && !isNii(r) && !isRetail(r);
 
 /** Consolidated (all exchanges) when it carries reserved quantities, else NSE's own table. */
-export function bidRows(d: NseIssueDetail): NseBidRow[] {
+function bidRows(d: NseIssueDetail): NseBidRow[] {
   const consolidatedTotal = d.bid_details_consolidated.find(isTotal);
   return consolidatedTotal?.shares_offered ? d.bid_details_consolidated : d.bid_details_nse;
 }
@@ -85,7 +85,7 @@ const RUPEES: Record<string, number> = { million: 1e6, mn: 1e6, crore: 1e7, cror
 /** The first amount in a clause, in rupees. NSE states each part either in money
  *  ("Rs. 3,200 million", "Rs. 29,000 lakhs", "2870 million") or in shares ("10,00,000 Equity
  *  Shares", or a bare "7,14,000"); shares are valued at the top of the band. */
-export function clauseRupees(clause: string, price: number | null): number | null {
+function clauseRupees(clause: string, price: number | null): number | null {
   const m = clause.match(/(\d[\d,]*(?:\.\d+)?)\s*(million|mn|crores?|cr|lakhs?|lacs?)?/i);
   if (!m) return null;
   const n = Number(m[1].replace(/,/g, ""));
@@ -129,7 +129,7 @@ const info = (d: NseIssueDetail, ...titles: RegExp[]) => {
 
 // --- time ---------------------------------------------------------------------------------
 
-export function todayIST(now: Date = new Date()): string {
+function todayIST(now: Date = new Date()): string {
   return now.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 

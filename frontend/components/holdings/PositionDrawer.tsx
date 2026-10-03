@@ -142,9 +142,8 @@ export function PositionDrawer({ pid, schemeCode, onClose }: { pid: PortfolioKey
               tone={toneOf(p.xirr_pct)}
               sub={p.xirr_pct === null ? xirrReason(p.xirr_note) : "Money-weighted, annualised"}
             />
-            <StatCard title="Realised gain" value={formatSignedInr(p.realised_gain)} tone={toneOf(p.realised_gain)} sub="FIFO, on units sold" />
             <StatCard title="Dividends" value={formatInr(p.dividend_income)} />
-            <StatCard title="Cash paid in" value={formatInr(p.total_invested)} sub={`Stamp duty ${formatInr(p.stamp_duty)} · Redeemed ${formatInr(p.total_redeemed)}`} />
+            <StatCard title="Cash paid in" value={formatInr(p.total_invested)} sub={`Stamp duty ${formatInr(p.stamp_duty)}`} />
             <StatCard
               title="TER"
               value={p.expense_ratio !== null ? `${formatTer(p.expense_ratio)}%` : "—"}

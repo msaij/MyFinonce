@@ -239,7 +239,13 @@ def _holdings_risk(pid: str) -> Dict[str, Any]:
     bc = backcast(pid)
     if bc["empty"] or len(bc["weights"]) < 2:
         return {"available": False, "reason": "Needs at least two funds."}
-    weights, meta, nav = bc["weights"], bc["meta"], bc["nav"]
+    # The funds' NAVs as published, NOT carried forward. On the carried-forward union
+    # calendar a fund that skips days AMFI prices others on (Motilal Liquid published 305
+    # days in 2025 against Axis's and Mirae's 365) shows zero-return days and then a lump,
+    # which read as it moving differently from its twins: a 0.50 correlation between three
+    # liquid funds, and more "effective bets" than funds. Returns are taken between the
+    # dates every compared fund published, so each spans the same stretch of time.
+    weights, meta, nav = bc["weights"], bc["meta"], bc["raw_nav"]
     end = nav.index[-1]
     window = nav.loc[nav.index >= end - pd.Timedelta(days=RISK_WINDOW_DAYS)]
     codes = [c for c in weights if c in window.columns]
@@ -271,11 +277,15 @@ def _holdings_risk(pid: str) -> Dict[str, Any]:
           "risk_pct": float(rb["percentage_risk_contributions"][str(c)])} for c in codes),
         key=lambda r: -r["risk_pct"],
     )
+    # Same SEBI category, not the same raw AMFI label: AMFI files one category under two
+    # labels, so Motilal Liquid ("Debt Scheme - Liquid Fund") could never pair with Axis or
+    # Mirae Liquid ("Income/Debt Oriented Schemes - Liquid Fund").
+    cat = {c: svc.sebi_category(meta[c].get("category")) for c in codes}
     redundant = [
         {"a": int(a), "a_name": labels[a], "b": int(b), "b_name": labels[b],
-         "correlation": float(corr.loc[a, b]), "category": meta[a].get("category")}
+         "correlation": float(corr.loc[a, b]), "category": cat[a]}
         for i, a in enumerate(codes) for b in codes[i + 1:]
-        if float(corr.loc[a, b]) >= REDUNDANT_CORR and meta[a].get("category") == meta[b].get("category")
+        if float(corr.loc[a, b]) >= REDUNDANT_CORR and cat[a] is not None and cat[a] == cat[b]
     ]
     return {
         "available": True,
@@ -360,6 +370,8 @@ def _backcast_cached(pid_key: str, ledger_v: int, data_v: int) -> Dict[str, Any]
     return {"empty": False, "index": index, "returns": port_r, "coverage": covered.reindex(index.index),
             "obs_per_year": obs_per_year,
             "weights": weights, "meta": meta, "total_value": total, "nav": nav,
+            # As published -- no carry-forward -- for comparing funds with each other.
+            "raw_nav": all_nav.reindex(columns=codes),
             "bench": bench, "bench_code": bench_code if bench is not None and bench_code else None, "bench_name": bench_name}
 
 

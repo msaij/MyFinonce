@@ -132,7 +132,7 @@ function parse(tokens: Token[]): number {
 }
 
 /** Trims binary floating-point noise: 0.1 + 0.2 shows as 0.3, not 0.30000000000000004. */
-export const tidy = (v: number) => Number(v.toPrecision(12));
+const tidy = (v: number) => Number(v.toPrecision(12));
 
 export function evaluate(src: string): EvalResult {
   if (!src.trim()) return { ok: false, error: "" };
@@ -146,7 +146,7 @@ export function evaluate(src: string): EvalResult {
 }
 
 const OPS = ["+", "−", "×", "÷", "^"];
-export const isOperator = (c: string | undefined) => !!c && OPS.includes(c);
+const isOperator = (c: string | undefined) => !!c && OPS.includes(c);
 const endsWithValue = (s: string) => /[0-9)%]$/.test(s);
 
 /** ± on the number being typed: 5 → −5, 5+3 → 5+(−3), and back again. */

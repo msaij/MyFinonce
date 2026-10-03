@@ -20,6 +20,8 @@ class MetaStatus(BaseModel):
     db_path: str
     is_stale: bool
     expected_date: Optional[datetime.date]
+    # Stale only because tonight's scheduled evening sync has not had its slot yet.
+    sync_scheduled: bool = False
     ter_records_count: Optional[int] = 0
     ter_official_schemes: Optional[int] = 0
     flags: dict = {}

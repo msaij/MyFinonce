@@ -167,6 +167,37 @@ describe("prepayments", () => {
     expect(paidOff(r)).toBeCloseTo(P, 4);
   });
 
+  it("starts the recurring prepayments in the chosen month, and only those", () => {
+    // A lock-in: nothing extra until Oct 2027, a year after the first EMI.
+    const r = emiSchedule(P, 8.5, 240, "2026-10", {
+      startMonth: "2027-10",
+      monthly: 5000,
+      yearly: 100_000,
+      yearlyMonth: 3,
+      stepUpPct: 5,
+      oneTime: [{ month: "2027-01", amount: 50_000 }],
+    });
+    const before = r.rows.filter((x) => x.month < "2027-10");
+    // Only the one-time payment, which has its own month, lands before the start.
+    expect(before.filter((x) => x.prepayment > 0).map((x) => [x.month, x.prepayment])).toEqual([["2027-01", 50_000]]);
+    expect(r.rows.find((x) => x.month === "2027-10")!.prepayment).toBeCloseTo(5000, 6);
+    // Mar 2027 is before the start: no yearly lump; Mar 2028 has it on top of the monthly extra.
+    expect(r.rows.find((x) => x.month === "2028-03")!.prepayment).toBeCloseTo(105_000, 6);
+    // The first anniversary (Oct 2027) is on the start month, so the step-up begins there.
+    expect(r.rows[11].emi).toBeCloseTo(base.emi, 6);
+    expect(r.rows[12].emi).toBeCloseTo(base.emi * 1.05, 6);
+    expect(paidOff(r)).toBeCloseTo(P, 4);
+    // Starting later prepays less and saves less than starting at once.
+    const atOnce = emiSchedule(P, 8.5, 240, "2026-10", { monthly: 5000, yearly: 100_000, yearlyMonth: 3, stepUpPct: 5, oneTime: [{ month: "2027-01", amount: 50_000 }] });
+    expect(r.totalInterest).toBeGreaterThan(atOnce.totalInterest);
+  });
+
+  it("a step-up waits for the first anniversary on or after the start month", () => {
+    const r = emiSchedule(P, 8.5, 240, "2026-10", { startMonth: "2027-12", stepUpPct: 10 });
+    expect(r.rows[12].emi).toBeCloseTo(base.emi, 6); // Oct 2027: before the start
+    expect(r.rows[24].emi).toBeCloseTo(base.emi * 1.1, 6); // Oct 2028: first anniversary after it
+  });
+
   it("never prepays more than is owed", () => {
     const r = emiSchedule(100_000, 10, 12, "2026-10", { oneTime: [{ month: "2026-10", amount: 1_000_000 }] });
     expect(r.rows).toHaveLength(1);

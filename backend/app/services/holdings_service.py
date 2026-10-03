@@ -27,6 +27,7 @@ import contextlib
 import csv
 import datetime
 import io
+import math
 import threading
 import uuid
 from collections import defaultdict
@@ -497,6 +498,9 @@ def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: Lis
     prev_nav = float(prev_nav) if prev_nav is not None and prev_nav == prev_nav else None
     units_then = units - float(units_new_today)
     day_change = units_then * (nav - prev_nav) if (units_then and nav is not None and prev_nav is not None) else 0.0
+    # What those units were worth at the previous close: the base the 1-day tile's
+    # percentage is taken on, summed across funds.
+    day_base = units_then * prev_nav if (units_then and nav is not None and prev_nav is not None) else 0.0
     xirr_pct, xirr_note = compute_xirr(pos.cash_flows, info.get("latest_date"), value)
     first_flow = min((d for d, _ in pos.cash_flows), default=None)
     ter = info.get("expense_ratio")
@@ -527,6 +531,7 @@ def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: Lis
         "total_invested": float(pos.total_invested),
         "total_redeemed": float(pos.total_redeemed),
         "day_change": day_change,
+        "day_base": day_base,
         "xirr_pct": xirr_pct,
         "xirr_note": xirr_note,
         "xirr_available_on": (first_flow + datetime.timedelta(days=MIN_XIRR_DAYS)).isoformat()
@@ -579,6 +584,35 @@ def ter_context(meta: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def _nav_matches(a: Any, b: Any) -> bool:
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    return a == a and b == b and abs(a - b) <= max(0.00015, abs(b) * 1e-7)
+
+
+def _allotted_at_latest(t: Dict[str, Any], info: Dict[str, Any]) -> bool:
+    """Whether a transaction's units were allotted at the fund's latest NAV, and so have not
+    been held through its latest move (the 1D column and tile leave them out).
+
+    Read off the NAV the units were allotted at, not the trade date, which gets it wrong
+    both ways: a liquid fund bought on the latest date is allotted at the PREVIOUS day's
+    NAV and has earned the latest accrual, while an order placed on a Saturday is allotted
+    at Monday's NAV and has not earned Friday-to-Monday. The trade date decides only when
+    the NAV settles nothing (no NAV on record, a split-rescaled row, or equal NAVs)."""
+    latest = _as_date(info.get("latest_date"))
+    if latest is None:
+        return False
+    trade = _as_date(t["trade_date"])
+    if t.get("units_scale", 1) == 1 and trade >= latest - datetime.timedelta(days=7):
+        at_latest = _nav_matches(t.get("nav"), info.get("latest_nav"))
+        at_previous = _nav_matches(t.get("nav"), info.get("nav_1d_ago"))
+        if at_latest != at_previous:
+            return at_latest
+    return trade >= latest
+
+
 def summary(pid: str) -> Dict[str, Any]:
     """Positions and KPIs for a view. Cached per (view, ledger version, market-data
     version), so the several analytics that start from it in one request share it.
@@ -600,12 +634,11 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             held_in[code].append(pid_i)
     meta = hdb.scheme_meta(list(by_code))
     split_codes = {int(t["scheme_code"]) for t in txns if t["units_scale"] != 1}
-    # Net units allotted on (or after) each fund's latest NAV date: not yet held for a move.
+    # Net units allotted AT each fund's latest NAV: not yet held for its latest move.
     units_new_today: Dict[int, Decimal] = defaultdict(Decimal)
     for t in txns:
         code = int(t["scheme_code"])
-        latest = _as_date(meta.get(code, {}).get("latest_date"))
-        if latest is not None and _as_date(t["trade_date"]) >= latest:
+        if _allotted_at_latest(t, meta.get(code, {})):
             units_new_today[code] += ledger.unit_sign(t["txn_type"]) * ledger.effective_units(t)
     from app.services import holdings_analytics as ha  # local: ha imports this module
     positions = [
@@ -613,8 +646,11 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
                       units_new_today[code])
         for code, parts in by_code.items()
     ]
+    # Where each fund's 1D move starts: it spans several days after a holiday or a skipped NAV.
+    prev_dates = hdb.previous_nav_dates({p["scheme_code"]: _as_date(p.get("latest_date")) for p in positions})
     for p in positions:
         p["asset_class"] = ha.classify(p.get("category"), p.get("broad_category"), p.get("scheme_name"))
+        p["prev_nav_date"] = prev_dates.get(p["scheme_code"])
 
     open_pos = [p for p in positions if not p["is_closed"]]
     total_value = sum(p["current_value"] for p in open_pos)
@@ -632,13 +668,13 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
     net_contributed = -sum(float(v) for _, v in pf_flows)
     xirr_pct, xirr_note = compute_xirr(pf_flows, as_of, total_value)
 
-    # The portfolio's 1-day change comes from a one-day window of the same
-    # time-weighted engine that powers the "Last N days" tiles beneath it, so the two
-    # rows agree by construction rather than by coincidence. Summing the per-position
-    # day_change above would not do: those are each fund's own NAV move applied to
-    # today's unit balance, so units bought today would be credited a day's move they
-    # never earned (on the real ledger, Rs 217 of it on one Rs 1,000,000 purchase).
-    day = ha.day_change(key)
+    # The 1-day tile is the sum of the table's 1D column: each fund's own latest NAV move on
+    # the units held before it. It used to be a one-day window of the time-weighted
+    # series, which on a day AMFI had priced only some funds counted the rest as
+    # unchanged (-Rs 1,491.84 for Rs 21.5 lakh of funds with no NAV yet), and then briefly
+    # the last date all funds shared, which dropped moves already published (+Rs 432.52
+    # beside a table adding to -Rs 38.64). Only each fund's own latest move is complete.
+    day = ha.day_change(positions)
     # Value-weighted expense ratio over the funds that have one, and how much of the
     # money that covers -- a weighted TER over half the portfolio must say so.
     with_ter = [p for p in open_pos if p["annual_fee"] is not None]
@@ -650,6 +686,16 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
     # so its money is counted to its last flow (every rupee is back out by then anyway).
     days_to = _as_date(as_of) or max((d for d, _ in pf_flows), default=None)
     avg_days = ledger.average_days_invested(results.values(), days_to)
+    # The portfolio XIRR waits until the MONEY has been invested for MIN_XIRR_DAYS on
+    # average, not merely until the first rupee has: a Rs 1,500 opening purchase followed
+    # a fortnight later by Rs 53 lakh would otherwise publish a yearly rate annualised from
+    # ~12 days of the money's actual life, where one arbitrage expiry-day dip swings it by
+    # whole percentage points. The date assumes no further purchases (each one delays it).
+    xirr_available_on = (first_flow + datetime.timedelta(days=MIN_XIRR_DAYS)).isoformat() \
+        if (xirr_note == "too_short" and first_flow is not None) else None
+    if avg_days is not None and avg_days < MIN_XIRR_DAYS and days_to is not None:
+        xirr_pct, xirr_note = None, "too_short"
+        xirr_available_on = (days_to + datetime.timedelta(days=math.ceil(MIN_XIRR_DAYS - avg_days))).isoformat()
     return {
         "portfolio_ids": portfolio_ids,
         "as_of": as_of,
@@ -674,10 +720,12 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             "xirr_pct": xirr_pct,
             "xirr_note": xirr_note,
             # When a withheld XIRR will start to show, so the tile can promise a date rather
-            # than repeat a reason. Calendar days here, unlike the NAV-day windows: the
-            # threshold is measured in calendar days from the first cash flow.
-            "xirr_available_on": (first_flow + datetime.timedelta(days=MIN_XIRR_DAYS)).isoformat()
-                                 if (xirr_note == "too_short" and first_flow is not None) else None,
+            # than repeat a reason. Calendar days, from the money-weighted rule above.
+            "xirr_available_on": xirr_available_on,
+            # The oldest latest-NAV among funds held: when it trails as_of, some funds have
+            # not published the newest date yet (the value uses each fund's latest NAV).
+            "oldest_nav_date": min((p["latest_date"] for p in open_pos if p["latest_date"] and not p["flags"]["stale_nav"]),
+                                   default=None),
             "first_investment_date": first_flow.isoformat() if first_flow is not None else None,
             # How long the money behind Total gain has been invested: each rupee put in counts
             # from its purchase to the valuation date (or to the redemption that took it out,
@@ -690,6 +738,9 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             "benchmark_since_start_pct": since["benchmark_pct"],
             "excess_since_start_pp": since["excess_pp"],
             "benchmark_name": since["benchmark_name"],
+            # The same comparison in rupees: your gain vs the same cash in the peers.
+            "gain_vs_peers": since["gain_vs_peers"],
+            "peer_gain": since["peer_gain"],
             "day_change": day["gain"],
             "day_change_pct": day["change_pct"],
             "day_benchmark_pct": day["benchmark_change_pct"],

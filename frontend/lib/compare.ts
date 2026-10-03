@@ -9,7 +9,7 @@ import type { CompareFund, CompareResult, Point } from "@/lib/api/compare";
 
 /** Fixed categorical order (the app's chart palette, validated for colour-vision
  *  deficiency). A fund keeps its colour by its position in the selection, on every chart. */
-export const FUND_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
+const FUND_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
 
 export function fundColor(index: number): string {
   return FUND_COLORS[index % FUND_COLORS.length];

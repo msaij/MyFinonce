@@ -18,10 +18,6 @@ export const SERIES_2 = "#eb6834";
 export const GAIN = "#047857";
 export const LOSS = "#b91c1c";
 export const REFERENCE = CHART_MUTED_COLOR;
-export const GRID = "#e1e0d9";
+const GRID = "#e1e0d9";
 
 export const AXIS = { gridcolor: GRID, zerolinecolor: "#c3c2b7", linecolor: "#c3c2b7" } as const;
-
-export function signedTone(v: number): string {
-  return v >= 0 ? GAIN : LOSS;
-}

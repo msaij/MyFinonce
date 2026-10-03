@@ -1,7 +1,7 @@
 """Read-only SQL for the Compare & Simulate backtest.
 
 Its own module, not more of db/queries.py, because that file is under a product freeze
-until the maintainability refactor splits it by domain (docs/maintainability-refactor.md).
+until the maintainability refactor splits it by domain.
 NAV history and scheme identity are still read through the existing helpers
 (queries.get_nav_history_dataframe, holdings.scheme_meta); only what they do not offer
 lives here.

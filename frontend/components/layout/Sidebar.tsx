@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 
 import { NonAdviceNotice } from "@/components/shared/Disclaimer";
 import { getAlertCount } from "@/lib/api/holdings";
+import { shortcutFor } from "@/lib/shortcuts";
 
 /**
  * The left menu: brand, the page links (grouped as the owner set them out) and the
@@ -131,7 +132,7 @@ export function Sidebar({ open = false, onClose }: { open?: boolean; onClose?: (
                   href={item.href}
                   onClick={onClose}
                   aria-current={active ? "page" : undefined}
-                  title={item.title}
+                  title={[item.title, shortcutFor(item.href) ? `Shortcut: F then ${shortcutFor(item.href)!.toUpperCase()}` : ""].filter(Boolean).join(" · ") || undefined}
                   className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-sm transition-colors hover:bg-black/5 dark:hover:bg-white/5"
                   style={{
                     background: active ? "var(--mf-accent-bg)" : undefined,
@@ -160,7 +161,11 @@ export function Sidebar({ open = false, onClose }: { open?: boolean; onClose?: (
         ))}
       </nav>
 
-      <div className="mt-auto">
+      <div className="mt-auto flex flex-col gap-2">
+        {/* Keyboard users only: there are no shortcuts to discover on a phone. */}
+        <div className="hidden px-3 text-[0.7rem] lg:block" style={{ color: "var(--mf-muted)" }}>
+          Press <span className="rounded border px-1 font-mono font-semibold" style={{ borderColor: "var(--mf-border)" }}>?</span> for keyboard shortcuts
+        </div>
         <NonAdviceNotice />
       </div>
     </aside>

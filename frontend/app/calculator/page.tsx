@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { CALCULATORS } from "@/components/calculator/registry";
+import { UsdInrTile } from "@/components/calculator/UsdInrTile";
 import { useUrlSync } from "@/lib/hooks";
 
 /**
@@ -78,9 +79,14 @@ function CalculatorContent() {
             </Fragment>
           ))}
         </nav>
+        <div className="ml-auto">
+          <UsdInrTile />
+        </div>
       </div>
       <p className="mb-4 mt-2 text-sm" style={{ color: "var(--mf-muted)" }}>
-        {active.description} Worked out in your browser; nothing you enter is saved.
+        {/* "Nothing you enter is saved" stopped being true when the EMI calculator began
+            remembering its inputs in this browser; what stays true is that none of it leaves. */}
+        {active.description} Worked out in your browser; nothing you enter leaves it.
       </p>
 
       <Active key={active.id} />

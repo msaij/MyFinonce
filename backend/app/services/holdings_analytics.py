@@ -44,7 +44,7 @@ from app.services import holdings_service as svc
 #
 # Shared with the market Overview, so a fund is classed the same on both pages; see
 # app/classification.py for the rules.
-from app.classification import ASSET_CLASSES, classify  # noqa: E402,F401  (re-exported)
+from app.classification import ASSET_CLASSES, classify, sebi_category  # noqa: E402,F401  (re-exported)
 
 
 # --- Daily time series -------------------------------------------------------------
@@ -54,6 +54,11 @@ HOLDING_FLOW_SIGN = {"BUY": 1, "SIP": 1, "SWITCH_IN": 1, "REDEEM": -1, "SWITCH_O
 # Below this a portfolio is treated as empty: a few paise of rounding crumbs left
 # after a full redemption must not become the base of a +1,000,000% "return".
 MIN_BASE_VALUE = 1.0
+
+#: A held fund whose newest NAV is older than this (calendar days) is treated as stale --
+#: merged, wound up or suspended -- and no longer holds back the "every fund priced" date.
+#: Long enough for Diwali plus a weekend.
+STALE_NAV_DAYS = 7
 
 
 def explicit_benchmark(portfolio_ids: List[int]) -> Optional[int]:
@@ -88,10 +93,13 @@ def category_daily_returns(categories: List[str], start: datetime.date, end: dat
     return pd.DataFrame(cols)
 
 
-def blend_index(weights: pd.DataFrame, code_category: Dict[int, str], index: pd.DatetimeIndex) -> Optional[pd.Series]:
+def blend_index(weights: pd.DataFrame, code_category: Dict[int, str], index: pd.DatetimeIndex,
+                last_priced: Optional[Dict[int, pd.Timestamp]] = None) -> Optional[pd.Series]:
     """Index (base 100) of sum_i w_i,t * r_category(i),t. `weights` rows are the
     weights to apply on each date (they need not sum to 1 before normalisation).
-    Days a category has no peer return count as 0 for that slice."""
+    Days a category has no peer return count as 0 for that slice, and so do the days after
+    a fund's own last published NAV (`last_priced`): the portfolio carries that fund
+    unchanged until AMFI publishes it, so its peers must not be credited those days either."""
     if weights.empty or index.empty:
         return None
     cat_r = category_daily_returns(list(code_category.values()), index[0].date(), index[-1].date()).reindex(index).fillna(0.0)
@@ -99,7 +107,13 @@ def blend_index(weights: pd.DataFrame, code_category: Dict[int, str], index: pd.
         return None
     w = weights.reindex(index).fillna(0.0)
     w = w.div(w.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
-    r = sum(w[code] * cat_r[cat] for code, cat in code_category.items() if cat in cat_r.columns and code in w.columns)
+    last_priced = last_priced or {}
+
+    def peer_r(code: int, cat: str) -> pd.Series:
+        r_cat = cat_r[cat]
+        return r_cat.where(r_cat.index <= last_priced[code], 0.0) if code in last_priced else r_cat
+
+    r = sum(w[code] * peer_r(code, cat) for code, cat in code_category.items() if cat in cat_r.columns and code in w.columns)
     if isinstance(r, int):      # no holding had a category series
         return None
     r.iloc[0] = 0.0             # the index starts at 100 on the first date
@@ -107,11 +121,67 @@ def blend_index(weights: pd.DataFrame, code_category: Dict[int, str], index: pd.
 
 
 def blend_components(weights_now: Dict[int, float], code_category: Dict[int, str]) -> List[Dict[str, Any]]:
+    """The blend's make-up by SEBI category. Grouped by sebi_category, not AMFI's raw label:
+    AMFI files one category under two labels ("Debt Scheme - Liquid Fund" and the legacy
+    "Income/Debt Oriented Schemes - Liquid Fund"), which printed "Liquid Fund 77% · Liquid
+    Fund 13%" for one 90% liquid sleeve."""
     by_cat: Dict[str, float] = {}
     for code, w in weights_now.items():
-        by_cat[code_category.get(code) or "Unknown"] = by_cat.get(code_category.get(code) or "Unknown", 0.0) + w
+        cat = sebi_category(code_category.get(code)) or "Unknown"
+        by_cat[cat] = by_cat.get(cat, 0.0) + w
     total = sum(by_cat.values()) or 1.0
     return sorted(({"category": c, "weight_pct": v / total * 100.0} for c, v in by_cat.items()), key=lambda x: -x["weight_pct"])
+
+
+def _new_money_growth(new_money: List[Tuple[pd.Timestamp, pd.Timestamp, float, float, int]], bench_code: Optional[int],
+                      nav: pd.DataFrame, code_cat: Optional[Dict[int, str]], idx: pd.DatetimeIndex) -> List[float]:
+    """For each flow, how its benchmark grew from the allotment date to the day the money
+    enters the book (1.0 when it was allotted that same day, as most are)."""
+    if not new_money:
+        return []
+    if bench_code is not None:
+        b = nav[bench_code].dropna()
+
+        def level(day: pd.Timestamp) -> float:
+            v = b.asof(day) if len(b) and day >= b.index[0] else np.nan
+            return float(v) if v == v else np.nan
+
+        out = []
+        for moved, alloc, _net, _cash, _code in new_money:
+            lo, hi = level(alloc), level(moved)
+            out.append(hi / lo if (lo == lo and hi == hi and lo > 0) else 1.0)
+        return out
+    earliest = min(alloc for _m, alloc, _n, _c, _k in new_money)
+    cats = category_daily_returns(list((code_cat or {}).values()), earliest.date(), idx[-1].date())
+    cats.index = pd.to_datetime(cats.index)
+    out = []
+    for moved, alloc, _net, _cash, code in new_money:
+        cat = (code_cat or {}).get(code)
+        if moved <= alloc or cat not in cats.columns:
+            out.append(1.0)
+            continue
+        span = cats[cat].loc[(cats.index > alloc) & (cats.index <= moved)].dropna()
+        out.append(float((1.0 + span).prod()))
+    return out
+
+
+def _allotment_date(raw: Optional[pd.Series], trade_date: datetime.date, txn_nav: Any) -> pd.Timestamp:
+    """The date whose NAV a purchase was allotted at: the latest published NAV on or before
+    the trade date (at most a week back) that equals the transaction's NAV, else the trade
+    date. Liquid and overnight funds allot at the PREVIOUS day's NAV, so money in on the
+    15th is already credited the 15th's accrual -- a peer comparison that buys the
+    benchmark at the 15th's close would miss that day and flatter the portfolio."""
+    day = pd.Timestamp(trade_date)
+    try:
+        target = float(txn_nav)
+    except (TypeError, ValueError):
+        return day
+    if raw is None or not target:
+        return day
+    window = raw.loc[day - pd.Timedelta(days=7):day]
+    # AMCs and apps round the NAV they print; a tenth of a paisa either way is a match.
+    matches = window[(window - target).abs() <= max(0.00015, target * 1e-7)]
+    return matches.index[-1] if len(matches) else day
 
 
 def _asof_index(index: pd.DatetimeIndex, day: datetime.date) -> pd.Timestamp:
@@ -159,6 +229,19 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
     # A dividend paid out leaves through the NAV, not through units: no unit delta
     # carries it, so it is tracked on its own.
     payout = pd.Series(0.0, index=idx)
+    # Every external flow as the peers must take it: (the index day the cash enters the
+    # book, the date whose NAV it was allotted at -- a liquid fund's previous-day NAV, which
+    # may even precede the index -- the rupees that buy units, i.e. net of stamp duty, the
+    # signed cash itself, and the fund).
+    new_money: List[Tuple[pd.Timestamp, pd.Timestamp, float, float, int]] = []
+    raw_nav = {c: g.set_index("nav_date")["nav"].astype(float) for c, g in nav_long.groupby("scheme_code")}
+    for t in txns:
+        sign = PORTFOLIO_FLOW_SIGN.get(t["txn_type"], 0)
+        if sign:
+            code = int(t["scheme_code"])
+            net = sign * float(t["amount"]) - (float(t.get("stamp_duty") or 0.0) if sign > 0 else 0.0)
+            alloc = _allotment_date(raw_nav.get(code), t["trade_date"], t.get("nav")) if sign > 0 else pd.Timestamp(t["trade_date"])
+            new_money.append((_asof_index(idx, t["trade_date"]), alloc, net, sign * float(t["amount"]), code))
     for t in txns:
         d, code, ttype, amt = _asof_index(idx, t["trade_date"]), int(t["scheme_code"]), t["txn_type"], float(t["amount"])
         signed_units = ledger.unit_sign(ttype) * float(ledger.effective_units(t))
@@ -173,6 +256,21 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
     units_held = unit_delta.cumsum().clip(lower=0.0)
     values_by_code = (units_held * held_nav.fillna(0.0)).fillna(0.0)
     value = values_by_code.sum(axis=1)
+
+    # Each held fund's newest published NAV. The index runs to the newest NAV of ANY held
+    # fund, with the others carried forward: a fund AMFI has not priced yet for the last
+    # day(s) contributes no move for them until it publishes (the whole series is rebuilt
+    # then). Every published move is kept -- stopping the portfolio at the last date all
+    # funds share would throw away real, already-published moves (on 29 Sep 2026 an
+    # arbitrage fund's -Rs 434 expiry-day dip) to wait for a day's liquid accrual. The
+    # peer blend below is made to skip the same pending days, fund by fund, so the
+    # comparison stays like for like. A fund silent for over a week is stale (merged,
+    # wound up) and is not reported as pending.
+    latest_by_code = nav_long.groupby("scheme_code")["nav_date"].max()
+    newest = idx[-1]
+    held_now = [c for c in codes if units_held[c].iloc[-1] > 0]
+    awaiting = [c for c in held_now if c in latest_by_code
+                and newest - pd.Timedelta(days=STALE_NAV_DAYS) <= latest_by_code[c] < newest]
 
     # --- Daily return, sub-periods split at the cash flow ---------------------------
     #
@@ -223,7 +321,7 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
     r = (1.0 + r1) * (1.0 + r2) - 1.0
     twr = 100.0 * (1.0 + r).cumprod()
 
-    bench, bench_name, components = None, None, []
+    bench, bench_name, components, code_cat = None, None, [], None
     if bench_code and bench_code in nav.columns:
         b = nav[bench_code].reindex(idx).ffill()
         first_valid = b.first_valid_index()
@@ -235,11 +333,44 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
         code_cat = {c: m.get("category") for c, m in hdb.scheme_meta(codes).items()}
         weights = values_by_code.shift(1)
         weights.iloc[0] = values_by_code.iloc[0]
-        bench = blend_index(weights, code_cat, idx)
+        bench = blend_index(weights, code_cat, idx, last_priced=latest_by_code.to_dict())
         if bench is not None:
             bench_name = BLEND_NAME
             last = values_by_code.iloc[-1]
             components = blend_components({c: float(last[c]) for c in codes if last[c] > 0}, code_cat)
+
+    # --- The peers, handed your new money exactly as you invested it -----------------------
+    #
+    # The benchmark above moves the book you held YESTERDAY (sub-period r1 of the split). On
+    # a day money comes in, the portfolio's own figure also carries sub-period r2: the new
+    # money's stamp duty and unit rounding, and -- for a liquid fund, allotted at the
+    # previous day's NAV -- the day's accrual it has already earned. Left out of the
+    # benchmark, every purchase day flattered the portfolio by that accrual and charged it
+    # the stamp duty the peers never paid (0.01 pp on the owner's since-start comparison,
+    # enough to move the printed figure). So the peers take the same cash, net of the same
+    # stamp duty, allotted on the same date, and grow it until the day it enters the book at
+    # the NEW FUND'S own benchmark -- its category (or the chosen benchmark scheme), not the
+    # mix of the funds already held. The same pieces build a peer book in rupees for
+    # since_start's comparison.
+    peer_book = None
+    if bench is not None:
+        growth = _new_money_growth(new_money, bench_code if bench_name != BLEND_NAME else None, nav, code_cat, idx)
+        r_b = (bench / bench.shift(1) - 1.0).fillna(0.0)
+        extra = pd.Series(0.0, index=idx)          # net x growth - cash, by entry day
+        into_peers = pd.Series(0.0, index=idx)     # net x growth, by entry day
+        for (moved, _alloc, net, cash, _code), g in zip(new_money, growth):
+            extra.at[moved] += net * g - cash
+            into_peers.at[moved] += net * g
+        r2b = pd.Series(0.0, index=idx)
+        r2b[funded] = extra[funded] / post_flow[funded]
+        missing = bench.isna()
+        bench = 100.0 * ((1.0 + r_b) * (1.0 + r2b)).cumprod()
+        bench[missing] = np.nan
+        book, running = [], 0.0
+        for day in idx:
+            running = running * (1.0 + float(r_b.at[day])) + float(into_peers.at[day])
+            book.append(running)
+        peer_book = pd.Series(book, index=idx)
 
     return {
         "empty": False,
@@ -250,6 +381,8 @@ def _timeseries_cached(pid_key: str, ledger_v: int, data_v: int, benchmark: Opti
         "invested": pf_flow.cumsum(),
         "twr": twr,
         "values_by_code": values_by_code,
+        "peer_book": peer_book,
+        "awaiting_codes": awaiting,
         "holding_flows": hold_flow,
         "nav": held_nav,
         "bench_code": bench_code if bench is not None else None,
@@ -354,7 +487,22 @@ def recent_changes(pid: str, windows: Tuple[int, ...] = RECENT_WINDOWS) -> Dict[
             # NAV days, not calendar days: holidays make a date promise unkeepable.
             "days_needed": 0 if available else days + 1 - len(idx),
         })
-    return {"empty": False, "as_of": end.strftime("%Y-%m-%d"), "benchmark_name": ts["bench_name"], "windows": out}
+    return {"empty": False, "as_of": end.strftime("%Y-%m-%d"), "benchmark_name": ts["bench_name"], "windows": out,
+            **_pending_nav_info(ts)}
+
+
+def _pending_nav_info(ts: Dict[str, Any]) -> Dict[str, Any]:
+    """Which held funds have not yet published the newest NAV date, for the caption that
+    says their move for it is still to come."""
+    newest = ts["index"][-1]
+    last_values = ts["values_by_code"].iloc[-1]
+    total = float(last_values.sum()) or 1.0
+    codes = ts["awaiting_codes"]
+    return {
+        "latest_nav_date": newest.strftime("%Y-%m-%d"),
+        "awaiting_funds": len(codes),
+        "awaiting_value_pct": float(sum(last_values[c] for c in codes)) / total * 100.0,
+    }
 
 
 def since_start(pid: str) -> Dict[str, Any]:
@@ -366,7 +514,8 @@ def since_start(pid: str) -> Dict[str, Any]:
     honest answer from day two. Same basis as the Performance tab's "Since start" row."""
     ts = timeseries(pid)
     if ts["empty"]:
-        return {"twr_pct": None, "benchmark_pct": None, "excess_pp": None, "start": None, "benchmark_name": None}
+        return {"twr_pct": None, "benchmark_pct": None, "excess_pp": None, "start": None, "benchmark_name": None,
+                "as_of": None, "own_gain": None, "peer_gain": None, "gain_vs_peers": None}
     idx: pd.DatetimeIndex = ts["index"]
     first, end = idx[0], idx[-1]
     ret = _period_return(ts["twr"], first, end) if len(idx) > 1 else None
@@ -376,29 +525,75 @@ def since_start(pid: str) -> Dict[str, Any]:
         "benchmark_pct": bench_ret * 100.0 if bench_ret is not None else None,
         "excess_pp": (ret - bench_ret) * 100.0 if (ret is not None and bench_ret is not None) else None,
         "start": first.strftime("%Y-%m-%d"),
+        "as_of": end.strftime("%Y-%m-%d"),
         "benchmark_name": ts["bench_name"],
+        **_versus_peers_in_rupees(ts, end),
     }
 
 
-def day_change(pid: str) -> Dict[str, Any]:
-    """The portfolio's 1-day change for the headline KPI tile: {gain, change_pct, as_of}.
+def _versus_peers_in_rupees(ts: Dict[str, Any], end: pd.Timestamp) -> Dict[str, Optional[float]]:
+    """Your gain beside what the same cash, paid in on the same days, would have made in
+    the peer benchmark.
 
-    Just the shortest trailing window, from the same engine as the "Last N days" tiles
-    that sit directly beneath it, so the two rows cannot contradict each other.
+    The time-weighted comparison beside it scores each day equally, whatever was invested
+    that day -- right for judging the funds, misleading for a young portfolio. The owner's
+    opened with Rs 1,500 for its first fortnight, which lagged its peers by 0.16 pp; chained
+    in at full weight, that fortnight put the whole Rs 53 lakh portfolio "0.14 pp behind
+    peers" when, from the day the real money went in, it was ahead. In rupees every day
+    counts by the money actually at work. The peers pay the same stamp duty on each
+    purchase, buy at the same allotment date (a liquid fund's previous-day NAV), and a
+    withdrawal sells the same rupees' worth of the benchmark."""
+    book = ts["peer_book"]
+    if book is None:
+        return {"own_gain": None, "peer_gain": None, "gain_vs_peers": None}
+    paid_in = float(ts["flows"].loc[:end].sum())
+    own_gain = float(ts["value"].loc[end]) - paid_in
+    peer_gain = float(book.loc[end]) - paid_in
+    return {"own_gain": own_gain, "peer_gain": peer_gain, "gain_vs_peers": own_gain - peer_gain}
 
-    It used to be computed separately, as units x nav x (1 - 1/(1 + change_1d_pct/100)),
-    which was wrong twice over: it rebuilt yesterday's value from a percentage
-    summary_table rounds to 4 decimals (Rs 0.63 out on a real portfolio), and it applied
-    today's NAV move to units bought *today*, which had not been held for it. Those are
-    both properties of the formula, not bugs in it -- the only durable fix is to have one
-    engine rather than two."""
-    rc = recent_changes(pid, windows=(1,))
-    window = rc["windows"][0] if rc["windows"] else None
-    if window is None or not window["available"]:
-        # One NAV day of history (or none): there is no previous close to move from.
-        return {"gain": 0.0, "change_pct": None, "benchmark_change_pct": None, "as_of": rc.get("as_of")}
-    return {"gain": window["gain"], "change_pct": window["change_pct"],
-            "benchmark_change_pct": window["benchmark_change_pct"], "as_of": rc["as_of"]}
+
+def day_change(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The 1-day KPI tile: {gain, change_pct, benchmark_change_pct}.
+
+    Exactly the sum of the Holdings table's 1D column -- each fund's own latest NAV move on
+    the units held before it (holdings_service._position_row), which is also how brokers
+    show a day's change. When AMFI has priced only some funds for the newest date, a fund
+    still on the day before contributes its own latest move, not zero, and nothing already
+    published is dropped. The percentage is on what those units were worth before their
+    move; the peer figure is each fund's SEBI category over that same fund's last move,
+    weighted the same way."""
+    held = [p for p in positions if p.get("day_base")]
+    gain = float(sum(p["day_change"] for p in positions))
+    base = float(sum(p["day_base"] for p in held))
+    if base <= 0:
+        return {"gain": gain, "change_pct": None, "benchmark_change_pct": None}
+    return {"gain": gain, "change_pct": gain / base * 100.0, "benchmark_change_pct": _day_peer_pct(held, base)}
+
+
+def _day_peer_pct(held: List[Dict[str, Any]], base: float) -> Optional[float]:
+    from app.db import queries as db  # read-only use of the façade
+
+    latest = {int(p["scheme_code"]): pd.Timestamp(p["latest_date"]) for p in held if p.get("latest_date")}
+    if not latest:
+        return None
+    start = min(latest.values()) - pd.Timedelta(days=20)
+    nav = db.get_nav_history_dataframe(list(latest), start_date=start.date())
+    if nav.empty:
+        return None
+    nav["nav_date"] = pd.to_datetime(nav["nav_date"])
+    cats = category_daily_returns([p.get("category") for p in held], start.date(), max(latest.values()).date())
+    total, covered = 0.0, 0.0
+    for p in held:
+        code, cat = int(p["scheme_code"]), p.get("category")
+        if code not in latest or cat not in cats.columns:
+            continue
+        dates = nav.loc[(nav["scheme_code"] == code) & (nav["nav_date"] < latest[code]), "nav_date"]
+        if dates.empty:
+            continue
+        span = cats[cat].loc[(cats.index > dates.max()) & (cats.index <= latest[code])].dropna()
+        total += p["day_base"] * float((1.0 + span).prod() - 1.0)
+        covered += p["day_base"]
+    return total / covered * 100.0 if covered > 0 else None
 
 
 def gain_shares(gains: List[float]) -> Tuple[List[float], float, float]:
@@ -424,8 +619,8 @@ def performance(pid: str, benchmark: Optional[int] = None) -> Dict[str, Any]:
     if ts["empty"]:
         return {"empty": True}
     idx: pd.DatetimeIndex = ts["index"]
-    end = idx[-1]
     first = idx[0]
+    end = idx[-1]
 
     periods = []
     for label, days in PERIODS:

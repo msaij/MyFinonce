@@ -198,5 +198,3 @@ export const useDateRangeStore = create<DateRangeState>()(
     }
   )
 );
-
-export const useGlobalFilterStore = useDateRangeStore;

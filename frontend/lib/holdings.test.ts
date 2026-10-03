@@ -14,6 +14,7 @@ import {
   monthsToDays,
   excessTone,
   formFromTransaction,
+  formatMovePct,
   formatSignedInr,
   formatTer,
   windowPendingText,
@@ -35,6 +36,19 @@ const base = (over: Partial<TxnFormState> = {}): TxnFormState => ({
   schemeCode: 1001,
   value: "10000",
   ...over,
+});
+
+describe("day and window percentages", () => {
+  it("never prints a signed zero, and keeps a liquid portfolio's small moves visible", () => {
+    // Portfolio S on 29 Sep 2026: -0.0013% and peers +0.0007% read "-0.00% · peers +0.00%".
+    expect(formatMovePct(-0.001344)).toBe("-0.001%");
+    expect(formatMovePct(0.000692)).toBe("+0.001%");
+    expect(formatMovePct(-0.0003)).toBe("0.000%");
+    expect(formatMovePct(0.05729)).toBe("+0.057%");
+    expect(formatMovePct(0.10141)).toBe("+0.10%");
+    expect(formatMovePct(-0.24)).toBe("-0.24%");
+    expect(formatMovePct(null)).toBe("-");
+  });
 });
 
 describe("buildDraft", () => {

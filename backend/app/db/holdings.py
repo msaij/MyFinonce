@@ -1,9 +1,8 @@
 """SQL for the holdings ledger (portfolios + holding_transactions).
 
 Its own module rather than more of db/queries.py: that file is under a product
-freeze until the maintainability refactor splits it by domain (see
-docs/maintainability-refactor.md), and this is exactly the per-domain shape that
-split is heading toward.
+freeze until the maintainability refactor splits it by domain, and this is
+exactly the per-domain shape that split is heading toward.
 
 Writes here deliberately do NOT take connection.WRITE_LOCK. That lock orders the
 AMFI ingest jobs, and a historical backfill holds it for the length of a chunk --
@@ -191,6 +190,30 @@ def navs_on_dates(pairs: Iterable[Tuple[int, datetime.date]]) -> Dict[Tuple[int,
             (codes, dates),
         ).fetchall()
     return {(int(r[0]), r[1]): float(r[2]) for r in rows}
+
+
+def previous_nav_dates(latest: Dict[int, datetime.date]) -> Dict[int, datetime.date]:
+    """For each scheme, the NAV date just before the given (latest) one: the start of the
+    move the 1D column reports. Usually the day before; after a holiday or a fund that
+    skipped publishing, several days earlier -- which the table says rather than letting a
+    three-day move pass as one day's."""
+    pairs = [(int(c), d) for c, d in latest.items() if d is not None]
+    if not pairs:
+        return {}
+    with get_connection() as con:
+        rows = con.execute(
+            """
+            SELECT q.code, n.nav_date
+            FROM unnest(%s::bigint[], %s::date[]) AS q(code, d)
+            CROSS JOIN LATERAL (
+                SELECT nav_date FROM nav_history
+                WHERE scheme_code = q.code AND nav_date < q.d
+                ORDER BY nav_date DESC LIMIT 1
+            ) n
+            """,
+            ([c for c, _ in pairs], [d for _, d in pairs]),
+        ).fetchall()
+    return {int(r[0]): r[1] for r in rows}
 
 
 SCHEME_META_COLUMNS = (

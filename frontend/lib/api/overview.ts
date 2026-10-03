@@ -94,19 +94,6 @@ export interface PulseKpis {
   last_nav_date: string | null;
 }
 
-export interface OverviewKpis {
-  total_schemes: number;
-  latest_date: string | null;
-  top_performer: NamedReturn | null;
-  lag_performer: NamedReturn | null;
-  advancers: number;
-  decliners: number;
-  unchanged: number;
-  median_return: number;
-  avg_return: number;
-  best_cat: NamedReturn | null;
-}
-
 export interface MacroTrendPoint {
   nav_date: string;
   "Asset Class": string;
@@ -167,14 +154,6 @@ export const getAllFunds = (planType = "All Plans", optionType = "All Options") 
 
 export const getOverviewStats =(planType = "All Plans", optionType = "All Options") =>
   apiGet<OverviewStats>("/api/overview/stats", { plan_type: planType, option_type: optionType });
-
-export const getOverviewKpis = (planType: string, optionType: string = "All Options", startDate?: string, endDate?: string) =>
-  apiGet<OverviewKpis>("/api/overview/kpis", {
-    plan_type: planType,
-    option_type: optionType,
-    start_date: startDate,
-    end_date: endDate,
-  });
 
 export const getPulseKpis = (startDate: string, endDate: string, planType: string, optionType: string = "All Options") =>
   apiGet<PulseKpis>("/api/overview/pulse-kpis", {

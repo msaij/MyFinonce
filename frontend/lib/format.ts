@@ -30,8 +30,10 @@ export const CHART_MUTED_COLOR = "#475569";
 
 export function formatSignedPct(value: number | null | undefined, decimals = 4): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
-  return `${sign}${Math.abs(value).toFixed(decimals)}%`;
+  const mag = Math.abs(value).toFixed(decimals);
+  // Signed by what is printed: -0.0013 at 2 decimals is "0.00%", never "-0.00%".
+  const sign = Number(mag) === 0 ? "" : value > 0 ? "+" : "-";
+  return `${sign}${mag}%`;
 }
 
 export type Tone = "pos" | "neg" | "neutral";

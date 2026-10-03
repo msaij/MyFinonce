@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 
 import { DateRangePicker } from "./DateRangePicker";
+import { KeyboardShortcuts } from "./KeyboardShortcuts";
 import { Sidebar } from "./Sidebar";
 
 /**
@@ -36,6 +37,7 @@ export function AppShell({
   return (
     <div className="flex min-h-screen" style={{ background: "var(--mf-bg)", color: "var(--mf-fg)" }}>
       <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
+      <KeyboardShortcuts />
       {menuOpen && <div className="fixed inset-0 z-30 bg-black/40 lg:hidden" onClick={() => setMenuOpen(false)} aria-hidden />}
 
       <div className="min-w-0 flex-1 overflow-x-hidden lg:ml-64">

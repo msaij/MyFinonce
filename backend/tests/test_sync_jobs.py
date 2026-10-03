@@ -79,3 +79,18 @@ def test_catch_up_does_only_navs_when_the_refresh_is_current(pg_db, monkeypatch)
     monkeypatch.setattr(amfi_sync, "sync_daily_nav", lambda _trigger="manual": (True, "NAVs in"))
     assert amfi_sync.catch_up("heartbeat") == "catchup"
     assert amfi_sync.get_sync_job_status()["last"]["catchup"]["message"] == "NAVs in"
+
+
+def test_tonights_nav_gap_is_pending_until_the_evening_sync_has_had_its_slot(monkeypatch):
+    """1 Oct 2026, 23:01: AMFI had published the day's NAVs and the top bar told the owner
+    to catch up in Data Management -- half an hour before the scheduled 23:30 sync would."""
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "enable_sync_daemon", True)
+    at = lambda day, h, m: datetime.datetime(2026, 10, day, h, m)
+    pending = amfi_sync.evening_sync_pending
+    assert not pending(at(1, 22, 59))        # nothing published yet: not stale at all
+    assert pending(at(1, 23, 1)) and pending(at(1, 23, 49))
+    assert not pending(at(1, 23, 51))        # slot + grace gone: behind means overdue
+    assert not pending(at(3, 23, 10))        # Saturday: nothing new is expected tonight
+    monkeypatch.setattr(settings, "enable_sync_daemon", False)
+    assert not pending(at(1, 23, 10))        # no daemon, no scheduled sync to wait for

@@ -110,6 +110,36 @@ def test_risk_contributions_sum_to_100_and_clones_are_flagged(client):
     assert h["effective_bets"] < h["effective_funds"]             # two clones are one bet
 
 
+def test_twin_liquid_funds_correlate_as_twins_whatever_days_they_publish_and_however_amfi_labels_them(client):
+    """The owner's case: Motilal Liquid skips days Axis and Mirae Liquid publish, and AMFI
+    files it as "Debt Scheme - Liquid Fund" where they are "Income/Debt Oriented Schemes -
+    Liquid Fund". Carrying its NAV forward over the gaps made zero-return days and lumps
+    (a 0.50 correlation), and the raw labels kept the pair from ever being flagged."""
+    _seed_daily_liquid()
+    con = connection.get_connection()
+    try:
+        rows = con.execute("SELECT nav_date, nav FROM nav_history WHERE scheme_code = %s ORDER BY nav_date", (DAILY,)).fetchall()
+    finally:
+        con.close()
+    # Same NAVs, but no Saturdays -- and AMFI's legacy label.
+    seed([(2006, "Gamma Liquid Fund", "AMC", "Income/Debt Oriented Schemes - Liquid Fund", "Direct", "Growth")],
+         {2006: [(day, float(nav)) for day, nav in rows if day.weekday() != 5]})
+    pid = _portfolio(client, [(DAILY, "2024-06-03", 50000), (2006, "2024-06-03", 50000)])
+    h = client.get(f"/api/holdings/portfolios/{pid}/risk").json()["holdings"]
+    assert h["available"]
+    assert np.array(h["correlation"])[0, 1] > 0.99
+    assert [p["category"] for p in h["redundant_pairs"]] == ["Liquid Fund"]
+
+
+def test_goal_projections_step_through_a_whole_month_of_a_calendar_day_series():
+    """21 steps covered ~70% of a month for a liquid portfolio that ticks every day: a
+    year's median growth came out at 4.7% against 6.9% realised."""
+    from app.services import holdings_planning as hp
+    rets = np.full(800, 0.00018) + np.random.default_rng(3).normal(0, 1e-6, 800)
+    G, _ = hp._simulate(rets, 12, 500, 0.0, obs_per_year=365)
+    assert np.median(G[:, -1]) == pytest.approx(np.exp(0.00018 * 365), rel=1e-3)
+
+
 def test_young_portfolio_gets_risk_from_its_funds_history_labelled_as_such(client):
     """Bought 2 weeks before the data ends, in a fund with 4 years of NAVs: the
     statistics come from today's mix replayed over that history, and say so."""
@@ -219,11 +249,14 @@ def test_a_trading_day_portfolio_still_annualises_near_252(client):
 
 def test_risk_contributions_are_unchanged_by_the_annualisation_base(client):
     """Percentage risk contributions are scale-invariant: the covariance scaling cancels.
-    The reported portfolio volatility does move -- to the truth."""
+    The reported portfolio volatility does move -- to the truth. The funds are compared on
+    the dates BOTH published (a weekday equity fund and a calendar-day liquid fund share
+    weekdays only), so the base is weekdays a year, not the liquid fund's 365: the 365 came
+    from carrying the equity fund's Friday NAV through every weekend."""
     _seed_daily_liquid()
     pid = _portfolio(client, [(FUND, "2021-02-01", 50000), (DAILY, "2021-02-01", 50000)])
     h = client.get(f"/api/holdings/portfolios/{pid}/risk").json()["holdings"]
-    assert h["available"] and h["obs_per_year"] == pytest.approx(365.25, abs=1.0)
+    assert h["available"] and h["obs_per_year"] == pytest.approx(261.0, abs=2.0)
     assert sum(x["risk_pct"] for x in h["risk_contributions"]) == pytest.approx(100.0, abs=0.01)
 
 

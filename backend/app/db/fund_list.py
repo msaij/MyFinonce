@@ -1,7 +1,7 @@
 """Read-only SQL for the Overview's "All Funds" tab: every scheme, one row each.
 
 Its own module, not more of db/queries.py, because that file is under a product freeze
-until the maintainability refactor splits it by domain (docs/maintainability-refactor.md).
+until the maintainability refactor splits it by domain.
 The plan/option predicate and the display label are reused from there, so "Unspecified"
 and the "Name (Plan - Option) [AMFI code]" format mean the same thing as everywhere else.
 

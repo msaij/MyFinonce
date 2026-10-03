@@ -19,7 +19,7 @@ const BASELINE = "#94A3B8";
 const rupees = (v: number) => `Rs ${Math.round(v).toLocaleString("en-IN")}`;
 
 /** "25,00,000" -> "25 lakh"; "1,50,00,000" -> "1.5 crore". */
-export function inWords(v: number): string {
+function inWords(v: number): string {
   if (v >= 1e7) return `${+(v / 1e7).toFixed(2)} crore`;
   if (v >= 1e5) return `${+(v / 1e5).toFixed(2)} lakh`;
   if (v >= 1e3) return `${+(v / 1e3).toFixed(2)} thousand`;
@@ -92,27 +92,144 @@ function Tile({ label, value, sub, tone }: { label: string; value: string; sub?:
 
 let nextId = 1;
 
+// What the calculator remembers across a refresh, in this browser only.
+const STORE_KEY = "mf.calculator.emi.v1";
+const DEFAULTS = {
+  amount: 2_500_000,
+  rate: 8.5,
+  tenure: 20,
+  unit: "years" as "years" | "months",
+  prepayOn: false,
+  prepayFrom: "",
+  monthly: 0,
+  yearly: 0,
+  yearlyMonth: 3,
+  stepUp: 0,
+  effect: "tenure" as "tenure" | "emi",
+  basis: "calendar" as "calendar" | "financial",
+  view: "balance" as "balance" | "yearly",
+};
+const YM = /^\d{4}-\d{2}$/;
+
+type Saved = typeof DEFAULTS & { start: string; oneTime: { month: string; amount: number }[] };
+
+/** The saved inputs, each checked: anything missing or malformed (an older version, a
+ *  hand-edited value) falls back to its default rather than breaking the page. */
+function loadSaved(): Partial<Saved> | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(localStorage.getItem(STORE_KEY) ?? "null");
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const s = raw as Record<string, unknown>;
+  const num = (k: string) => (typeof s[k] === "number" && Number.isFinite(s[k]) ? (s[k] as number) : undefined);
+  const pick = <T extends string>(k: string, allowed: readonly T[]) => (allowed.includes(s[k] as T) ? (s[k] as T) : undefined);
+  const out: Partial<Saved> = {
+    amount: num("amount"),
+    rate: num("rate"),
+    tenure: num("tenure"),
+    unit: pick("unit", ["years", "months"] as const),
+    start: typeof s.start === "string" && YM.test(s.start) ? s.start : undefined,
+    prepayOn: typeof s.prepayOn === "boolean" ? s.prepayOn : undefined,
+    prepayFrom: typeof s.prepayFrom === "string" && (s.prepayFrom === "" || YM.test(s.prepayFrom)) ? s.prepayFrom : undefined,
+    monthly: num("monthly"),
+    yearly: num("yearly"),
+    yearlyMonth: num("yearlyMonth"),
+    stepUp: num("stepUp"),
+    effect: pick("effect", ["tenure", "emi"] as const),
+    basis: pick("basis", ["calendar", "financial"] as const),
+    view: pick("view", ["balance", "yearly"] as const),
+    oneTime: Array.isArray(s.oneTime)
+      ? (s.oneTime as unknown[]).flatMap((p) => {
+          const q = p as { month?: unknown; amount?: unknown };
+          return typeof q?.month === "string" && YM.test(q.month) && typeof q.amount === "number" && Number.isFinite(q.amount)
+            ? [{ month: q.month, amount: q.amount }]
+            : [];
+        })
+      : undefined,
+  };
+  return out;
+}
+
 /** Home, car or personal loan: the monthly EMI, total interest, the full repayment schedule,
- *  and what prepaying does to it. Nothing entered here is saved. */
+ *  and what prepaying does to it. The inputs are remembered in this browser (localStorage)
+ *  so a refresh keeps them; nothing is sent anywhere. */
 export function EmiCalculator() {
-  const [amount, setAmount] = useState(2_500_000);
-  const [rate, setRate] = useState(8.5);
-  const [tenure, setTenure] = useState(20);
-  const [unit, setUnit] = useState<"years" | "months">("years");
+  const [amount, setAmount] = useState(DEFAULTS.amount);
+  const [rate, setRate] = useState(DEFAULTS.rate);
+  const [tenure, setTenure] = useState(DEFAULTS.tenure);
+  const [unit, setUnit] = useState<"years" | "months">(DEFAULTS.unit);
   const [start, setStart] = useState(thisMonth);
 
-  const [prepayOn, setPrepayOn] = useState(false);
-  const [monthly, setMonthly] = useState(0);
-  const [yearly, setYearly] = useState(0);
-  const [yearlyMonth, setYearlyMonth] = useState(3);
-  const [stepUp, setStepUp] = useState(0);
+  const [prepayOn, setPrepayOn] = useState(DEFAULTS.prepayOn);
+  // "" = from the first EMI. Kept separate so moving the first EMI month carries it along.
+  const [prepayFrom, setPrepayFrom] = useState(DEFAULTS.prepayFrom);
+  const [monthly, setMonthly] = useState(DEFAULTS.monthly);
+  const [yearly, setYearly] = useState(DEFAULTS.yearly);
+  const [yearlyMonth, setYearlyMonth] = useState(DEFAULTS.yearlyMonth);
+  const [stepUp, setStepUp] = useState(DEFAULTS.stepUp);
   const [oneTime, setOneTime] = useState<{ id: number; month: string; amount: number }[]>([]);
-  const [effect, setEffect] = useState<"tenure" | "emi">("tenure");
+  const [effect, setEffect] = useState<"tenure" | "emi">(DEFAULTS.effect);
 
-  const [basis, setBasis] = useState<"calendar" | "financial">("calendar");
-  const [view, setView] = useState<"balance" | "yearly">("balance");
+  const [basis, setBasis] = useState<"calendar" | "financial">(DEFAULTS.basis);
+  const [view, setView] = useState<"balance" | "yearly">(DEFAULTS.view);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [dark, setDark] = useState(false);
+
+  // Restore after mount, not during render: the server renders the defaults, and reading
+  // storage in the first render would make the client's HTML disagree with it.
+  const [restored, setRestored] = useState(false);
+  useEffect(() => {
+    const s = loadSaved();
+    if (s) {
+      if (s.amount !== undefined) setAmount(s.amount);
+      if (s.rate !== undefined) setRate(s.rate);
+      if (s.tenure !== undefined) setTenure(s.tenure);
+      if (s.unit) setUnit(s.unit);
+      if (s.start) setStart(s.start);
+      if (s.prepayOn !== undefined) setPrepayOn(s.prepayOn);
+      if (s.prepayFrom !== undefined) setPrepayFrom(s.prepayFrom);
+      if (s.monthly !== undefined) setMonthly(s.monthly);
+      if (s.yearly !== undefined) setYearly(s.yearly);
+      if (s.yearlyMonth !== undefined && s.yearlyMonth >= 1 && s.yearlyMonth <= 12) setYearlyMonth(s.yearlyMonth);
+      if (s.stepUp !== undefined) setStepUp(s.stepUp);
+      if (s.effect) setEffect(s.effect);
+      if (s.basis) setBasis(s.basis);
+      if (s.view) setView(s.view);
+      if (s.oneTime) setOneTime(s.oneTime.map((p) => ({ id: nextId++, ...p })));
+    }
+    setRestored(true);
+  }, []);
+  useEffect(() => {
+    if (!restored) return; // never overwrite the saved inputs with the defaults before they load
+    const saved: Saved = {
+      amount, rate, tenure, unit, start, prepayOn, prepayFrom, monthly, yearly, yearlyMonth, stepUp, effect, basis, view,
+      oneTime: oneTime.map(({ month, amount: a }) => ({ month, amount: a })),
+    };
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(saved));
+    } catch {
+      // Private window or storage blocked: the calculator still works, it just won't remember.
+    }
+  }, [restored, amount, rate, tenure, unit, start, prepayOn, prepayFrom, monthly, yearly, yearlyMonth, stepUp, oneTime, effect, basis, view]);
+
+  const resetAll = () => {
+    setAmount(DEFAULTS.amount);
+    setRate(DEFAULTS.rate);
+    setTenure(DEFAULTS.tenure);
+    setUnit(DEFAULTS.unit);
+    setStart(thisMonth());
+    setPrepayOn(DEFAULTS.prepayOn);
+    setPrepayFrom(DEFAULTS.prepayFrom);
+    setMonthly(DEFAULTS.monthly);
+    setYearly(DEFAULTS.yearly);
+    setYearlyMonth(DEFAULTS.yearlyMonth);
+    setStepUp(DEFAULTS.stepUp);
+    setOneTime([]);
+    setEffect(DEFAULTS.effect);
+  };
 
   useEffect(() => {
     const el = document.documentElement;
@@ -134,10 +251,15 @@ export function EmiCalculator() {
           ? null
           : "Pick the first EMI month.";
 
+  // A start month at or before the first EMI is simply "from the first EMI".
+  const prepayStart = /^\d{4}-\d{2}$/.test(prepayFrom) && prepayFrom > start ? prepayFrom : start;
+  const prepayDelay = /^\d{4}-\d{2}$/.test(start) ? monthsBetween(start, prepayStart) : 0;
+
   const plan: Prepayments = useMemo(
     () =>
       prepayOn
         ? {
+            startMonth: prepayStart,
             monthly: Number.isFinite(monthly) ? monthly : 0,
             yearly: Number.isFinite(yearly) ? yearly : 0,
             yearlyMonth,
@@ -146,7 +268,7 @@ export function EmiCalculator() {
             effect,
           }
         : {},
-    [prepayOn, monthly, yearly, yearlyMonth, stepUp, oneTime, effect]
+    [prepayOn, prepayStart, monthly, yearly, yearlyMonth, stepUp, oneTime, effect]
   );
   const hasPrepay = prepayOn && (!!plan.monthly || !!plan.yearly || !!plan.stepUpPct || (plan.oneTime?.length ?? 0) > 0);
 
@@ -299,6 +421,29 @@ export function EmiCalculator() {
 
             {prepayOn && (
               <div className="mt-3 space-y-3 text-sm">
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex items-center text-xs font-semibold" style={{ color: "var(--mf-muted)" }} htmlFor="emi-prepay-from">
+                      Prepayments start from
+                      <FormulaTooltip
+                        label="Prepayments start from"
+                        description="The first month the monthly extra, the yearly extra and the EMI step-up apply, e.g. once your lender's lock-in period ends. One-time prepayments keep their own months."
+                      />
+                    </label>
+                    <input
+                      id="emi-prepay-from"
+                      type="month"
+                      value={prepayStart}
+                      min={start}
+                      onChange={(e) => setPrepayFrom(e.target.value)}
+                      className="rounded-lg border px-2 py-1 text-sm"
+                      style={inputStyle}
+                    />
+                  </div>
+                  <div className="text-[0.72rem]" style={{ color: "var(--mf-muted)" }}>
+                    {prepayDelay > 0 ? `${durationLabel(prepayDelay)} after the first EMI` : "From the first EMI"}
+                  </div>
+                </div>
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-semibold" style={{ color: "var(--mf-muted)" }}>Extra every month</span>
                   <NumInput label="Extra every month" value={monthly} onChange={setMonthly} />
@@ -342,7 +487,7 @@ export function EmiCalculator() {
                   ))}
                   <button
                     type="button"
-                    onClick={() => setOneTime((l) => [...l, { id: nextId++, month: start, amount: 100_000 }])}
+                    onClick={() => setOneTime((l) => [...l, { id: nextId++, month: prepayStart, amount: 100_000 }])}
                     className="mt-1.5 text-xs font-semibold"
                     style={{ color: "var(--mf-accent)" }}
                   >
@@ -368,6 +513,13 @@ export function EmiCalculator() {
                 </div>
               </div>
             )}
+          </div>
+
+          <div className="flex items-center justify-between border-t pt-3 text-[0.72rem]" style={{ borderColor: "var(--mf-border)", color: "var(--mf-muted)" }}>
+            <span>Kept in this browser, so a refresh keeps them.</span>
+            <button type="button" onClick={resetAll} className="font-semibold" style={{ color: "var(--mf-accent)" }}>
+              Reset all inputs
+            </button>
           </div>
         </div>
 

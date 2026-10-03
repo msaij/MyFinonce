@@ -154,8 +154,10 @@ export function PerformancePanel({ pid }: { pid: PortfolioKey }) {
             />
           </h3>
           <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
-            Both lines are indexed to 100 on your first investment date. The benchmark starts at exactly 100; your line starts a
-            hair under it, because day one already carries the stamp duty and unit rounding on that first purchase.
+            Both lines are indexed to 100 on your first investment date. The benchmark is handed your money exactly as you
+            invested it: the same amounts on the same days, the same stamp duty, and a liquid fund&apos;s previous-day NAV. Each
+            purchase grows at its own fund&apos;s benchmark until it joins the rest. So both lines start a hair from 100, and a
+            purchase day moves neither in its favour.
             {blend && (
               <>
                 {" "}Benchmark: each fund against the average of its SEBI category, weighted like your portfolio (

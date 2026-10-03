@@ -10,6 +10,7 @@ fixture comment for the concrete incident that class of mistake caused.
 import pytest
 
 from app import amfi_sync
+from app.amfi_ter_client import AmfiTerClient
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +84,10 @@ class TestTerBackfillRowAccounting:
         return recorded
 
     def test_rows_written_reaches_the_state_and_the_checkpoints(self, monkeypatch, marks):
-        per_month = {"09-2026": 1000, "08-2026": 2500}
+        # The two months the worker will actually walk, taken from the same source it uses --
+        # hard-coding "09-2026"/"08-2026" broke the day the calendar rolled into October.
+        latest, previous = AmfiTerClient.recent_months(2)
+        per_month = {latest: 1000, previous: 2500}
 
         def fake_sync(_trigger="manual", months=None, stats=None):
             if stats is not None:
@@ -94,7 +98,7 @@ class TestTerBackfillRowAccounting:
         amfi_sync._ter_backfill_worker(2, resume=True)
 
         assert amfi_sync.get_ter_backfill_status()["records_added"] == 3500
-        assert {m["unit"]: m["rows_written"] for m in marks} == {"09-2026": 1000, "08-2026": 2500}
+        assert {m["unit"]: m["rows_written"] for m in marks} == per_month
         assert all(m["state"] == "done" for m in marks)
 
     def test_a_month_that_wrote_nothing_is_still_checkpointed_at_zero(self, monkeypatch, marks):

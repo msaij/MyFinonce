@@ -67,13 +67,6 @@ export interface SchemeProfile {
   riskometer_as_of?: string | null;
 }
 
-export interface SchemeDetail {
-  profile: SchemeProfile;
-  nav_history: NavHistoryPoint[];
-}
-
-export const getScheme = (code: number) => apiGet<SchemeDetail>(`/api/schemes/${code}`);
-
 export const getSchemeProfile = (code: number) => apiGet<SchemeProfile>(`/api/schemes/${code}/profile`);
 
 export const getSchemeTerHistory = (code: number) =>

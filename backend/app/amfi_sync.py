@@ -1719,6 +1719,30 @@ def get_latest_expected_trading_date() -> datetime.date:
             return today
 
 
+#: The evening NAV pass. AMFI's file carries the day's NAVs from about 23:00 (when
+#: get_latest_expected_trading_date starts expecting them); the sync waits half an hour so
+#: the late AMCs are in it.
+EVENING_SYNC = datetime.time(23, 30)
+#: How long that pass may take after its slot before "behind" means overdue.
+EVENING_SYNC_GRACE = datetime.timedelta(minutes=20)
+PUBLISH_FROM = datetime.time(23, 0)
+
+
+def evening_sync_pending(now_ist: Optional[datetime.datetime] = None) -> bool:
+    """True from 23:00 on a weekday until the evening sync's slot (plus grace) has passed,
+    while the background daemon is on: the database is a day behind AMFI then, but only
+    because the scheduled sync has not had its turn -- nothing for the owner to do. The
+    top bar used to tell them to "catch up in Data Management" every weekday night from
+    23:00 to 23:30."""
+    if not settings.enable_sync_daemon:
+        return False
+    now = now_ist or _now_ist()
+    if now.weekday() >= 5:
+        return False
+    deadline = datetime.datetime.combine(now.date(), EVENING_SYNC) + EVENING_SYNC_GRACE
+    return now.time() >= PUBLISH_FROM and now < deadline
+
+
 def is_database_stale() -> Tuple[bool, Optional[datetime.date], Optional[datetime.date]]:
     """
     Checks whether the local DuckDB database is behind the latest expected AMFI publication date.
@@ -1800,7 +1824,7 @@ def run_scheduled_sync_daemon():
     # NAVs only: TER is a monthly disclosure and plans do not change intraday. Both go
     # through the job tracker, so they show on the page and never overlap another sync.
     schedule.every().day.at("00:05").do(run_sync_job, "full", "scheduled_00:05", _full_body)
-    schedule.every().day.at("23:30").do(run_sync_job, "nav", "scheduled_23:30", _nav_body)
+    schedule.every().day.at(EVENING_SYNC.strftime("%H:%M")).do(run_sync_job, "nav", "scheduled_23:30", _nav_body)
 
     # 3. Hourly heartbeat: a missed or failed full refresh, or NAVs that have fallen behind.
     schedule.every(1).hours.do(catch_up, "heartbeat")

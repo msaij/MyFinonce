@@ -4,6 +4,7 @@
  */
 
 import type { PortfolioKey, Position, Transaction, TransactionDraft, TxnType } from "./api/holdings";
+import { formatSignedPct } from "./format";
 
 export const TXN_TYPE_LABELS: Record<TxnType, string> = {
   BUY: "Purchase (lump sum)",
@@ -154,6 +155,13 @@ export function excessTone(pp: number | null | undefined): "pos" | "neg" | "neut
 }
 
 /** "Shows from 15 Oct 2026" for an XIRR withheld as too short, else the plain reason. */
+/** A day's or a few days' move: three decimals below 0.1%, where a liquid portfolio's
+ *  daily moves live and two decimals would print most of them as 0.00% or 0.01%. */
+export function formatMovePct(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  return formatSignedPct(value, Math.abs(value) < 0.1 ? 3 : 2);
+}
+
 export function xirrPendingText(note: string | null | undefined, availableOn: string | null | undefined): string {
   if (note === "too_short" && availableOn) {
     const d = new Date(`${availableOn}T00:00:00`);

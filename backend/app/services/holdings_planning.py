@@ -143,12 +143,19 @@ def _contributions(months: int, step_up_pct: float) -> np.ndarray:
     return (1.0 + step_up_pct / 100.0) ** (np.arange(months) // 12)
 
 
-def _simulate(daily_returns: np.ndarray, months: int, sims: int, step_up_pct: float, seed: int = 42):
-    """Monthly GBM with the daily drift/vol aggregated over 21 trading days.
+def _simulate(daily_returns: np.ndarray, months: int, sims: int, step_up_pct: float, seed: int = 42,
+              obs_per_year: float = TRADING_DAYS_PER_MONTH * 12):
+    """Monthly GBM with the per-observation drift/vol aggregated over a month's worth of
+    observations -- obs_per_year / 12, measured from the series itself.
     Returns (G, B): G[i, t] = growth of Re 1 held from month 0 to t on path i;
-    B[i, t] = value at t of a Re 1/month SIP (with annual step-up) on path i."""
+    B[i, t] = value at t of a Re 1/month SIP (with annual step-up) on path i.
+
+    A fixed 21 was right only for a trading-day series. A portfolio holding a liquid fund
+    ticks every calendar day (~30 a month), so 21 steps covered ~70% of each month: on the
+    owner's portfolio the projected year's median growth was 4.73% against 6.92% realised,
+    goal odds too low and the required SIP too high."""
     mu, sigma = float(np.mean(daily_returns)), float(np.std(daily_returns, ddof=1))
-    n = TRADING_DAYS_PER_MONTH
+    n = obs_per_year / 12.0
     f = np.exp((mu - 0.5 * sigma ** 2) * n + sigma * np.sqrt(n) * np.random.default_rng(seed).normal(0, 1, size=(sims, months)))
     c = _contributions(months, step_up_pct)
     G = np.ones((sims, months + 1))
@@ -188,7 +195,7 @@ def goal_status(goal: Dict[str, Any], sip_override: Optional[float] = None) -> D
     if len(rets) < risk_svc.MIN_TRADING_DAYS:
         return {**out, "state": "insufficient_history"}
     months = max(1, int(round(years * 12)))
-    G, B = _simulate(rets, months, GOAL_SIMS, step_up)
+    G, B = _simulate(rets, months, GOAL_SIMS, step_up, obs_per_year=bc["obs_per_year"])
     A_T, B_T = value * G[:, -1], B[:, -1]
     terminal = A_T + sip * B_T
     need = np.maximum(0.0, (target_future - A_T) / np.where(B_T > 0, B_T, np.nan))

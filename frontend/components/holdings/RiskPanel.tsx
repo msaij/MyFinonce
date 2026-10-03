@@ -615,11 +615,18 @@ function StressSection({ pid }: { pid: PortfolioKey }) {
             </div>
             {s.available ? (
               <>
-                <div className="metric-value mf-neg">{formatSignedInr(s.rupee_impact)}</div>
+                {/* Coloured by what it is: a ₹0 "impact" in red read as a loss. */}
+                <div className={`metric-value ${toneOf(s.rupee_impact) === "neg" ? "mf-neg" : ""}`}>
+                  {s.rupee_impact !== null && Math.abs(s.rupee_impact) < 0.005 ? "No fall" : formatSignedInr(s.rupee_impact)}
+                </div>
                 <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
-                  Fall {pct(s.drawdown_pct)} vs benchmark {pct(s.benchmark_drawdown_pct)}
+                  Fall {pct(s.drawdown_pct)} vs benchmark {s.benchmark_drawdown_pct !== null ? pct(s.benchmark_drawdown_pct) : "(no data)"}
                   <br />
-                  {s.recovered ? `Recovered in ${s.recovery_days} days` : "Did not recover within the scan window"}
+                  {s.drawdown_pct !== null && Math.abs(s.drawdown_pct) < 1e-4
+                    ? "Never below its previous peak in this window"
+                    : s.recovered
+                      ? `Recovered in ${s.recovery_days} days`
+                      : "Did not recover within the scan window"}
                   {s.coverage_pct < 99.5 && (
                     <>
                       <br />
@@ -783,7 +790,10 @@ function MonteCarloSection({ pid }: { pid: PortfolioKey }) {
             <StatCard
               title="Bad case (5th pct)"
               value={formatInr(data.p5![data.p5!.length - 1])}
-              tone="neg"
+              // Red only when it is below today's value: a liquid portfolio's bad case is
+              // usually still a gain, and red read as a loss that isn't there.
+              tone={data.p5![data.p5!.length - 1] < (data.initial_value ?? 0) ? "neg" : ""}
+              sub={`${formatSignedInr(data.p5![data.p5!.length - 1] - (data.initial_value ?? 0))} vs today`}
               tooltip={<FormulaTooltip label="5th percentile" description="Only 1 simulated path in 20 ends below this. Past volatility does not cap future losses, so a real bad case can be worse than any simulation of it." />}
             />
             <StatCard

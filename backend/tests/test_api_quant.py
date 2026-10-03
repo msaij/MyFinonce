@@ -76,7 +76,7 @@ def test_monte_carlo_endpoint_happy_path(client):
 
 
 # --- /factors window contract (ported from the retired adversarial suites) -----------
-# docs/maintainability-refactor.md (PR 7) relies on these exact 422 messages.
+# Callers rely on these exact 422 messages.
 
 @pytest.mark.parametrize("start,end,message", [
     ("2025-01-01", "2025-01-07", "Insufficient trading days"),   # 7 days of NAVs, 60 required

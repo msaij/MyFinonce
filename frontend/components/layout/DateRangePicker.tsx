@@ -187,10 +187,18 @@ export function DateRangePicker() {
 
       {/* Status row: how current the data is, and -- beside it -- whether it is updating now. */}
       <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-[0.72rem]">
-        <span style={{ color: isBeforeMin || status?.is_stale ? "var(--mf-warning)" : "var(--mf-muted)" }}>
+        <span style={{ color: isBeforeMin || (status?.is_stale && !status.sync_scheduled) ? "var(--mf-warning)" : "var(--mf-muted)" }}>
           {isBeforeMin ? (
             <>
               ⚠️ Selected: {formatDate(start)} to {formatDate(end)} ({span}D) | Local data begins: {formatDate(status?.min_date)}
+            </>
+          ) : status?.is_stale && status.sync_scheduled ? (
+            // AMFI publishes around 23:00; the evening sync runs at 23:30. Between the two the
+            // data is a day behind with nothing for anyone to do, so say what will happen
+            // rather than send the reader to Data Management.
+            <>
+              🕚 AMFI has published {status.expected_date ? formatDate(status.expected_date) : "today's NAVs"}; tonight&apos;s 23:30
+              sync adds it | Active: {formatDate(start)} to {formatDate(end)} ({span}D)
             </>
           ) : status?.is_stale ? (
             // The app's one NAV-freshness signal: it says so when AMFI has published newer NAVs.

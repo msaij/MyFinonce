@@ -531,8 +531,21 @@ export function ScenarioStressSimulator({
                   const scenarioTitle = s.scenario_name || s.name || s.scenario || s.scenario_id || s.id || `Scenario ${idx + 1}`;
                   const winStart = s.window_start || s.window?.start || "N/A";
                   const winEnd = s.window_end || s.window?.end || "N/A";
+                  // A crisis the fund did not live through has no drawdown at all -- not a
+                  // perfect one. It used to fall through to a green "0.00% (Zero DD)".
+                  if (s.available === false || s.max_drawdown_pct === null || s.max_drawdown_pct === undefined) {
+                    return (
+                      <tr key={s.id || s.scenario_id || idx} className="border-b last:border-b-0" style={{ borderColor: "var(--mf-border)" }}>
+                        <td className="py-2.5 px-3 font-semibold" style={{ color: "var(--mf-fg)" }}>{scenarioTitle}</td>
+                        <td className="py-2.5 px-3 font-mono" style={{ color: "var(--mf-muted)" }}>{winStart} to {winEnd}</td>
+                        <td colSpan={4} className="py-2.5 px-3 text-right text-xs" style={{ color: "var(--mf-muted)" }}>
+                          No data{s.reason ? `: ${s.reason}` : ""}
+                        </td>
+                      </tr>
+                    );
+                  }
                   const isZeroDrawdown = Math.abs(s.max_drawdown_pct) < 1e-4;
-                  const isOutperforming = s.excess_drawdown_pct >= 0;
+                  const isOutperforming = s.excess_drawdown_pct !== null && s.excess_drawdown_pct >= 0;
                   const isRecovered = s.is_recovered ?? s.recovered ?? isZeroDrawdown;
 
                   return (

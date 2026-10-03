@@ -132,7 +132,7 @@ def peer_ranking(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "bottom_quartile", "warning",
                 f"{p['display_name']} is in the bottom quarter of its category",
                 f"Its {horizon} return of {r['value']:+.2f}% ranks at the {r['percentile']:.0f}th percentile among {r['peers']} active "
-                f"{p.get('plan_type') or ''} {p.get('category') or ''} schemes. One period says little about skill; worth a look, not a verdict.",
+                f"{p.get('plan_type') or ''} {svc.sebi_category(p.get('category')) or ''} schemes. One period says little about skill; worth a look, not a verdict.",
                 [p["scheme_code"]], percentile=r["percentile"], peers=r["peers"], horizon=horizon,
             ))
     return out
@@ -205,7 +205,7 @@ def risk_signals(pid: str) -> List[Dict[str, Any]]:
     for pair in (r.get("holdings") or {}).get("redundant_pairs") or []:
         out.append(_insight(
             "overlap", "info", f"{pair['a_name']} and {pair['b_name']} move almost identically",
-            f"Both are {pair['category']} funds with a daily-return correlation of {pair['correlation']:.2f}. "
+            f"Both are in the {pair['category']} category, with a daily-return correlation of {pair['correlation']:.2f}. "
             "Holding both adds paperwork, not diversification.",
             [pair["a"], pair["b"]], correlation=pair["correlation"],
         ))

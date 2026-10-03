@@ -107,6 +107,10 @@ export interface Position {
   total_redeemed: number;
   /** Rupee move on the units held at the previous close; units bought on the latest NAV date earn nothing yet. */
   day_change: number;
+  /** What those units were worth at the previous close: the base of the 1-day %. */
+  day_base?: number;
+  /** The NAV date the 1D move starts from: the day before latest_date, or earlier after a gap. */
+  prev_nav_date?: string | null;
   xirr_pct: number | null;
   xirr_note: "too_short" | "no_flows" | "no_solution" | null;
   /** ISO date a withheld XIRR will start to show. */
@@ -153,6 +157,12 @@ export interface HoldingsKpis {
   benchmark_since_start_pct: number | null;
   excess_since_start_pp: number | null;
   benchmark_name: string | null;
+  /** Your gain minus what the same cash, on the same dates, would have made in the peers. */
+  gain_vs_peers?: number | null;
+  peer_gain?: number | null;
+  /** The oldest latest-NAV date among funds held (non-stale); below as_of while some funds
+   *  have not published the newest date yet. */
+  oldest_nav_date?: string | null;
   day_change: number;
   day_change_pct: number | null;
   day_benchmark_pct: number | null;
@@ -292,12 +302,6 @@ export interface Allocation {
   targets: Record<string, number> | null;
   drift: DriftRow[] | null;
   drift_band_pct: number;
-}
-
-export interface RebalanceResult {
-  new_money: number;
-  note: string;
-  rows: { asset_class: string; amount: number; before_pct: number; after_pct: number; target_pct: number; suggested_scheme_code: number | null; suggested_scheme_name: string | null }[];
 }
 
 export interface RiskMetrics {
@@ -579,10 +583,6 @@ export const getMonteCarlo = (pid: PortfolioKey, horizonDays: number) =>
 
 export const getPerformance = (pid: PortfolioKey) => apiGet<Performance>(`${base}/portfolios/${pid}/performance`);
 export const getAllocation = (pid: PortfolioKey) => apiGet<Allocation>(`${base}/portfolios/${pid}/allocation`);
-export const putTargets = (id: number, targets: Record<string, number>) =>
-  apiPut<{ targets: Record<string, number>; asset_classes: string[] }>(`${base}/portfolios/${id}/targets`, { targets });
-export const getRebalance = (id: number, newMoney: number) =>
-  apiGet<RebalanceResult>(`${base}/portfolios/${id}/rebalance`, { new_money: newMoney });
 
 export const listPortfolios = (includeArchived = false) =>
   apiGet<Portfolio[]>(`${base}/portfolios`, { include_archived: includeArchived || undefined });
@@ -618,6 +618,10 @@ export interface RecentChanges {
   as_of?: string;
   benchmark_name?: string | null;
   windows: RecentChangeWindow[];
+  /** The newest NAV date of any held fund, and the funds (and share of money) not at it yet. */
+  latest_nav_date?: string;
+  awaiting_funds?: number;
+  awaiting_value_pct?: number;
 }
 
 export const getRecentChanges = (pid: PortfolioKey) =>

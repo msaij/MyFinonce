@@ -41,6 +41,7 @@ import {
   excessText,
   excessTone,
   formatSignedInr,
+  formatMovePct,
   formatTer,
   formatUnits,
   groupTransactionsByFund,
@@ -209,8 +210,14 @@ function HoldingsContent() {
         tooltip: "Invested ÷ units: the average NAV you paid for the units you still hold (first in, first out, so redeemed lots no longer count).",
       },
       {
-        key: "latest_nav", label: "NAV", render: (r, v) => (v == null ? "-" : <span title={`as of ${formatDate(r.latest_date as string)}`}>{Number(v).toFixed(4)}</span>),
-        tooltip: "AMFI's latest published NAV for the fund. Hover a value for the date it is from.",
+        key: "latest_date", label: "NAV date",
+        sortValue: (r) => (r.latest_date ? String(r.latest_date) : ""),
+        render: (_r, v) => (v ? formatDate(v as string) : "-"),
+        tooltip: "The date of the NAV this row is valued at: the fund's latest on AMFI. Funds publish on different days (most skip weekends and holidays; liquid funds publish every day), so the dates can differ between rows.",
+      },
+      {
+        key: "latest_nav", label: "NAV", render: (_r, v) => (v == null ? "-" : Number(v).toFixed(4)),
+        tooltip: "AMFI's latest published NAV for the fund, as of the NAV date beside it.",
       },
       {
         key: "cost_basis", label: "Invested", format: "inr",
@@ -232,9 +239,30 @@ function HoldingsContent() {
       {
         key: "day_change",
         label: "1D gain",
-        tooltip: "Rupees gained on the latest NAV move: units held at the previous close × (latest NAV − previous NAV). Units bought on the latest NAV date were bought at it and have not moved yet, so they add nothing. The total matches the 1-day change tile.",
+        tooltip: "Rupees gained on the fund's latest NAV move: units held at the previous close × (latest NAV − previous NAV). Units allotted at the latest NAV have not moved yet, so they add nothing; a liquid fund bought on the latest date is allotted at the previous day's NAV and has earned the day. The % underneath is that move on what those units were worth before it, so funds of different sizes compare directly. The total matches the 1-day change tile.",
         sortValue: (r) => r.day_change,
-        render: (_r, v) => <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>{formatSignedInr(v as number)}</span>,
+        render: (r, v) => {
+          const base = r.day_base as number | undefined;
+          const from = r.prev_nav_date as string | null | undefined;
+          const to = r.latest_date as string | null | undefined;
+          // A fund that skipped publishing (a holiday, or a late NAV) moves over several days at
+          // once; saying so keeps a three-day move from being compared as one day's.
+          const span = from && to ? Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000) : 1;
+          return (
+            <span
+              className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}
+              title={from && to ? `NAV move from ${formatDate(from)} to ${formatDate(to)}` : undefined}
+            >
+              {formatSignedInr(v as number)}
+              {base ? (
+                <span className="block text-[0.7rem]">
+                  {formatMovePct(((v as number) / base) * 100)}
+                  {span > 1 && <span style={{ color: "var(--mf-muted)" }}> · {span} days</span>}
+                </span>
+              ) : null}
+            </span>
+          );
+        },
       },
       {
         key: "xirr_pct",
@@ -250,17 +278,8 @@ function HoldingsContent() {
             formatSignedPct(v as number, 2)
           ),
       },
-      {
-        key: "realised_gain",
-        label: "Realised",
-        tooltip: "Gain or loss already booked on units you redeemed or switched out, first in first out. Dividends paid out are listed underneath when there are any.",
-        render: (r, v) => (
-          <span>
-            {formatSignedInr(v as number)}
-            {(r.dividend_income as number) > 0 && <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>+ {formatInr(r.dividend_income as number)} dividends</span>}
-          </span>
-        ),
-      },
+      // No Realised column: the owner does not record redemptions -- a fund sold is simply
+      // removed from the ledger -- so it would only ever read zero.
       {
         key: "weight_pct", label: "Weight", render: (_r, v) => (v == null ? "-" : `${(v as number).toFixed(1)}%`),
         tooltip: "This fund's share of the portfolio's value today.",
@@ -288,6 +307,7 @@ function HoldingsContent() {
     [pid, pfName]
   );
   const totals = useMemo(() => holdingsTotals(positions), [positions]);
+  const dayBase = useMemo(() => positions.reduce((s, p) => s + (p.day_base ?? 0), 0), [positions]);
   const holdingsFooter: Record<string, React.ReactNode> | undefined = k
     ? {
         scheme_name: `Total (${positions.length} fund${positions.length === 1 ? "" : "s"})`,
@@ -299,14 +319,18 @@ function HoldingsContent() {
             <span className="block text-[0.7rem]">{formatSignedPct(totals.unrealisedPct, 2)}</span>
           </span>
         ),
-        day_change: <span className={toneOf(totals.day) === "pos" ? "mf-pos" : toneOf(totals.day) === "neg" ? "mf-neg" : ""}>{formatSignedInr(totals.day)}</span>,
+        day_change: (
+          <span className={toneOf(totals.day) === "pos" ? "mf-pos" : toneOf(totals.day) === "neg" ? "mf-neg" : ""}>
+            {formatSignedInr(totals.day)}
+            {dayBase > 0 && <span className="block text-[0.7rem]">{formatMovePct((totals.day / dayBase) * 100)}</span>}
+          </span>
+        ),
         xirr_pct:
           k.xirr_pct !== null ? (
             <span title="The whole portfolio's XIRR, closed funds included">{formatSignedPct(k.xirr_pct, 2)}</span>
           ) : (
             <span className="text-xs font-medium" style={{ color: "var(--mf-muted)" }}>{xirrPendingText(k.xirr_note, k.xirr_available_on)}</span>
           ),
-        realised_gain: formatSignedInr(totals.realised),
         weight_pct: `${totals.weight.toFixed(1)}%`,
         expense_ratio:
           k.weighted_ter_pct !== null ? (
@@ -343,11 +367,23 @@ function HoldingsContent() {
 
           {k && !emptyLedger && (
             <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-              <StatCard title="Current value" value={formatInr(k.current_value)} sub={summary?.as_of ? `NAVs as of ${formatDate(summary.as_of)}` : ""} />
+              {/* Each fund is valued at its own latest NAV. On a day AMFI has priced only some
+                  of them, say so rather than claim one date for all. */}
+              <StatCard
+                title="Current value"
+                value={formatInr(k.current_value)}
+                sub={
+                  !summary?.as_of
+                    ? ""
+                    : k.oldest_nav_date && k.oldest_nav_date < summary.as_of
+                      ? `Latest NAVs, ${formatDate(k.oldest_nav_date)} to ${formatDate(summary.as_of)}`
+                      : `NAVs as of ${formatDate(summary.as_of)}`
+                }
+              />
               <StatCard
                 title="Invested"
                 value={formatInr(k.invested)}
-                sub={`Across ${k.open_positions} fund${k.open_positions === 1 ? "" : "s"}`}
+                sub={`Across ${k.open_positions} fund${k.open_positions === 1 ? "" : "s"}${k.stamp_duty > 0 ? ` · + ${formatInr(k.stamp_duty)} stamp duty` : ""}`}
                 tooltip={
                   <FormulaTooltip
                     label="Invested"
@@ -363,7 +399,9 @@ function HoldingsContent() {
                 title="Total gain"
                 value={formatSignedInr(k.total_gain)}
                 tone={toneOf(k.total_gain)}
-                sub={`${k.total_gain_pct !== null ? `${formatSignedPct(k.total_gain_pct, 2)}${k.avg_days_invested != null ? ` in ${investedForText(k.avg_days_invested)}` : ""} · ` : ""}unrealised ${formatSignedInr(k.unrealised_gain)}`}
+                // Current value − Invested is before stamp duty; this tile is after it. Saying
+                // so is what makes the three tiles add up (to AMC unit-rounding paise).
+                sub={`${k.total_gain_pct !== null ? `${formatSignedPct(k.total_gain_pct, 2)}${k.avg_days_invested != null ? ` in ${investedForText(k.avg_days_invested)}` : ""}` : ""}${k.stamp_duty > 0 ? `${k.total_gain_pct !== null ? " · " : ""}after stamp duty` : ""}`}
                 subTone={toneOf(k.total_gain_pct ?? k.total_gain)}
                 tooltip={
                   <FormulaTooltip
@@ -385,16 +423,23 @@ function HoldingsContent() {
                 title="Return since start"
                 value={k.twr_since_start_pct !== null ? formatSignedPct(k.twr_since_start_pct, 2) : "—"}
                 tone={toneOf(k.twr_since_start_pct)}
+                // Percentage points alone scored the Rs 1,500 opening fortnight like the Rs 53
+                // lakh since; the rupee figure weighs each day by the money actually at work.
                 sub={
-                  excessText(k.excess_since_start_pp) ||
-                  (k.first_investment_date ? `Time-weighted, since ${formatDate(k.first_investment_date)}` : "")
+                  [excessText(k.excess_since_start_pp), k.gain_vs_peers != null ? `${formatSignedInr(k.gain_vs_peers)} in rupees` : ""]
+                    .filter(Boolean)
+                    .join(" · ") || (k.first_investment_date ? `Time-weighted, since ${formatDate(k.first_investment_date)}` : "")
                 }
-                subTone={excessTone(k.excess_since_start_pp)}
+                subTone={k.gain_vs_peers != null ? toneOf(k.gain_vs_peers) : excessTone(k.excess_since_start_pp)}
                 tooltip={
                   <FormulaTooltip
                     label="Return since start"
                     formula={"Π (1 + rₜ) − 1,  rₜ = (Vₜ − Fₜ) / Vₜ₋₁ − 1"}
-                    description={`How your funds have done since ${k.first_investment_date ? formatDate(k.first_investment_date) : "your first investment"}, with the timing of your deposits taken out, so it is directly comparable with a benchmark and is not annualised.${k.benchmark_since_start_pct !== null ? ` Over the same days your funds' peer groups returned ${formatSignedPct(k.benchmark_since_start_pct, 2)}` + (k.benchmark_name ? ` (${k.benchmark_name}).` : ".") : ""} XIRR, beside it, is how your money did given when you invested it.`}
+                    description={`How your funds have done since ${k.first_investment_date ? formatDate(k.first_investment_date) : "your first investment"}, with the timing of your deposits taken out, so it is directly comparable with a benchmark and is not annualised. Every day counts equally, however little was invested that day.${k.benchmark_since_start_pct !== null ? ` Over the same days your funds' peer groups returned ${formatSignedPct(k.benchmark_since_start_pct, 2)}` + (k.benchmark_name ? ` (${k.benchmark_name}).` : ".") : ""}${
+                      k.gain_vs_peers != null && k.peer_gain != null
+                        ? ` In rupees, where each day counts by the money invested: the same cash, paid in on the same dates (allotted at the same NAV date, stamp duty included), would have made ${formatSignedInr(k.peer_gain)} in the peers; you made ${formatSignedInr(k.peer_gain + k.gain_vs_peers)}.`
+                        : ""
+                    } XIRR, beside it, is how your money did given when you invested it.`}
                   />
                 }
               />
@@ -407,7 +452,7 @@ function HoldingsContent() {
                   <FormulaTooltip
                     label="XIRR"
                     formula="Σ CFᵢ / (1 + r)^(tᵢ / 365.25) = 0"
-                    description="The annual rate that makes every rupee you put in and took out, plus today's value, net to zero. Switches between your own funds are internal and excluded. Withheld for the first 30 days, because annualising a few days' return turns small moves into absurd yearly rates."
+                    description="The annual rate that makes every rupee you put in and took out, plus today's value, net to zero. Switches between your own funds are internal and excluded. Withheld until your money has been invested for 30 days on average (weighted by amount, not counted from your first rupee), because annualising a few days' return turns small moves into absurd yearly rates. A new purchase pushes the date back."
                   />
                 }
               />
@@ -415,13 +460,13 @@ function HoldingsContent() {
                 title="1-day change"
                 value={formatSignedInr(k.day_change)}
                 tone={toneOf(k.day_change)}
-                sub={`${formatSignedPct(k.day_change_pct, 2)}${k.day_benchmark_pct !== null ? ` · peers ${formatSignedPct(k.day_benchmark_pct, 2)}` : ""}`}
+                sub={`${formatMovePct(k.day_change_pct)}${k.day_benchmark_pct !== null ? ` · peers ${formatMovePct(k.day_benchmark_pct)}` : ""}`}
                 subTone={toneOf(k.day_change_pct)}
                 tooltip={
                   <FormulaTooltip
                     label="1-day change"
                     formula="Vₜ − Vₜ₋₁ − Fₜ"
-                    description="The last NAV day on the same time-weighted basis as the windows below, so anything you bought or sold that day is taken out first and is never counted as a gain. The 1D ₹ column in the table is each fund's own NAV move on the units held now, so the two need not add up."
+                    description="The total of the 1D gain column in the Holdings table: each fund's own latest NAV move, on the units you held before it (units bought at the latest NAV have not moved yet). When AMFI has priced only some funds for the newest date, the others count their own latest move, so nothing already published is left out and no fund is counted as unchanged. The percentage is on what those units were worth before the move; peers are each fund's SEBI category over that same fund's move, weighted the same way."
                   />
                 }
               />
@@ -435,7 +480,7 @@ function HoldingsContent() {
                   <StatCard
                     key={w.days}
                     title={`Last ${w.days} days`}
-                    value={w.available ? formatSignedPct(w.change_pct, 2) : "—"}
+                    value={w.available ? formatMovePct(w.change_pct) : "—"}
                     tone={w.available ? toneOf(w.change_pct) : ""}
                     // The peers' figure sits beside the rupees so the two percentages can be
                     // read against each other at a glance; the sub keeps the rupee gain's
@@ -443,7 +488,7 @@ function HoldingsContent() {
                     // benchmark would contradict its own sign.
                     sub={
                       w.available
-                        ? `${formatSignedInr(w.gain)}${w.benchmark_change_pct !== null ? ` · peers ${formatSignedPct(w.benchmark_change_pct, 2)}` : ""}`
+                        ? `${formatSignedInr(w.gain)}${w.benchmark_change_pct !== null ? ` · peers ${formatMovePct(w.benchmark_change_pct)}` : ""}`
                         : windowPendingText(w.days_needed)
                     }
                     subTone={w.available ? toneOf(w.gain) : "neutral"}
@@ -460,11 +505,14 @@ function HoldingsContent() {
               </div>
               <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
                 Movement of the holdings over the last few NAV days, time-weighted — money paid in during a window is not counted as a
-                gain.{" "}
+                gain, though its stamp duty counts against the window, as it does against Total gain; the peers pay the same.{" "}
                 {recentQ.data?.benchmark_name && !recentQ.data.benchmark_name.startsWith("Category blend")
                   ? `“Peers” is your chosen benchmark, ${recentQ.data.benchmark_name}, over the same window.`
                   : "“Peers” is the same window for the average fund in each of your funds’ SEBI categories, weighted like your portfolio."}
                 {recentQ.data?.as_of ? ` NAVs as of ${formatDate(recentQ.data.as_of)}.` : ""}
+                {recentQ.data?.awaiting_funds && recentQ.data.latest_nav_date
+                  ? ` ${recentQ.data.awaiting_funds} of your funds (${Math.round(recentQ.data.awaiting_value_pct ?? 0)}% of the money) have not published ${formatDate(recentQ.data.latest_nav_date)} yet; their move for it is added when AMFI does, and their peers skip it until then.`
+                  : ""}
               </p>
             </div>
           )}

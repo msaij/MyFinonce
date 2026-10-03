@@ -2,7 +2,9 @@
 
 import datetime
 import functools
+import math
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -149,6 +151,145 @@ def test_a_withheld_xirr_says_when_it_will_appear(client):
     assert k["xirr_available_on"] == "2025-01-19", "30 calendar days after the first cash flow"
 
 
+def test_xirr_waits_for_the_money_not_the_first_rupee(client):
+    """The owner's real case: a Rs 1,500 opening purchase, then the real money weeks later.
+    Counting 30 days from the first rupee would annualise ~11 days of the money's life."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-10-01", amount=1500)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-12-20", amount=1000000)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+
+    assert k["days_since_first_investment"] > 30 and k["avg_days_invested"] < 12
+    assert k["xirr_pct"] is None and k["xirr_note"] == "too_short"
+    wait = math.ceil(30 - k["avg_days_invested"])
+    assert k["xirr_available_on"] == (d(2024, 12, 31) + datetime.timedelta(days=wait)).isoformat()
+
+
+def _seed_extra(code, name, last_day):
+    days = list(business_days(d(2023, 1, 2), last_day))
+    seed([(code, name, "Delta MF", "Equity Scheme - Flexi Cap Fund", "Direct", "Growth")],
+         {code: [(day, 50.0 * 1.0003 ** i) for i, day in enumerate(days)]})
+
+
+def test_a_fund_still_to_publish_counts_its_own_latest_move_in_the_day_tile(client):
+    """29 Sep 2026: AMFI had priced three of six funds. Counting the other three as
+    unchanged showed -Rs 1,491.84; stopping everything at the 28th showed +Rs 432.52 for a
+    portfolio whose table added to -Rs 38.64, because it dropped an arbitrage fund's
+    published -Rs 434. The tile is the table: each fund's own latest move."""
+    _seed_extra(1004, "Late Publisher Fund - Direct Plan - Growth", d(2024, 12, 30))
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-06-03", amount=100000)
+    _add(client, portfolio_id=pid, scheme_code=1004, txn_type="BUY", trade_date="2024-06-03", amount=100000)
+
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    units = {p["scheme_code"]: p["units"] for p in body["positions"]}
+    own_latest_moves = (units[1001] * (nav_on(1001, d(2024, 12, 31)) - nav_on(1001, d(2024, 12, 30)))
+                        + units[1004] * (nav_on(1004, d(2024, 12, 30)) - nav_on(1004, d(2024, 12, 27))))
+    k = body["kpis"]
+    assert k["day_change"] == pytest.approx(own_latest_moves, abs=0.01)
+    assert k["day_change"] == pytest.approx(sum(p["day_change"] for p in body["positions"]), abs=1e-6)
+    assert k["oldest_nav_date"] == "2024-12-30"
+
+    # The windows run to the newest NAV and say which fund has yet to publish it.
+    rc = client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()
+    assert rc["as_of"] == "2024-12-31" and rc["latest_nav_date"] == "2024-12-31"
+    assert rc["awaiting_funds"] == 1 and 40 < rc["awaiting_value_pct"] < 60
+
+
+def test_peers_skip_the_days_a_fund_has_not_published_yet(monkeypatch):
+    """The portfolio carries a pending fund unchanged until AMFI prices it; crediting its
+    peers that day would put the portfolio behind for a move it simply has not seen yet."""
+    idx = pd.to_datetime(["2024-12-27", "2024-12-30", "2024-12-31"])
+    cats = pd.DataFrame({"A": [0.0, 0.01, 0.01], "B": [0.0, 0.02, 0.02]}, index=idx)
+    monkeypatch.setattr(ha, "category_daily_returns", lambda *a, **k: cats)
+    weights = pd.DataFrame({1: [1.0, 1.0, 1.0], 2: [1.0, 1.0, 1.0]}, index=idx)
+    level = ha.blend_index(weights, {1: "A", 2: "B"}, idx, last_priced={1: idx[2], 2: idx[1]})
+    # 30th: both funds priced -> half of each category; 31st: fund 2 pending -> only fund 1's half.
+    assert level.iloc[1] / level.iloc[0] - 1 == pytest.approx(0.5 * 0.01 + 0.5 * 0.02)
+    assert level.iloc[2] / level.iloc[1] - 1 == pytest.approx(0.5 * 0.01)
+
+
+def test_a_fund_silent_for_over_a_week_does_not_hold_the_date_back(client):
+    _seed_extra(1005, "Wound Up Fund - Direct Plan - Growth", d(2024, 12, 16))
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-06-03", amount=100000)
+    _add(client, portfolio_id=pid, scheme_code=1005, txn_type="BUY", trade_date="2024-06-03", amount=100000)
+    body = client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()
+    assert body["as_of"] == "2024-12-31" and body["awaiting_funds"] == 0
+
+
+def test_holding_the_benchmark_itself_is_level_with_peers_in_rupees(client):
+    """The rupee comparison buys the benchmark with the same cash on the same dates, stamp
+    duty included -- so a portfolio that IS the benchmark is exactly level with it, however
+    uneven its purchases (the case the time-weighted pp figure gets wrong in spirit)."""
+    pid = _pf(client)      # explicit benchmark 1003
+    add_ok(client, portfolio_id=pid, scheme_code=BENCHMARK, txn_type="BUY", trade_date="2023-03-01", amount=1500)
+    add_ok(client, portfolio_id=pid, scheme_code=BENCHMARK, txn_type="BUY", trade_date="2024-11-04", amount=5000000)
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    assert k["stamp_duty"] > 0
+    # Paise of AMC unit rounding (3-decimal units) are all that may separate them.
+    assert k["gain_vs_peers"] == pytest.approx(0.0, abs=0.05)
+
+
+def test_a_fund_that_is_its_own_category_is_level_with_peers_on_every_figure(client):
+    """1002 is the only liquid fund here, so its category average IS the fund. Bought
+    unevenly, at the previous day's NAV (as liquid funds are), with stamp duty, it must be
+    level with its peers on every tile -- since start in pp and rupees, and in a window
+    that contains a purchase. Before the peers took new money like-for-like, each purchase
+    day flattered the portfolio by the day's accrual and charged it stamp duty the peers
+    never paid; and the rupee peers grew new money at the mix already held."""
+    pid = new_portfolio(client)            # no benchmark: the category blend
+    for trade, prev, amount in ((d(2024, 6, 4), d(2024, 6, 3), 100000),
+                                (d(2024, 11, 5), d(2024, 11, 4), 500000),
+                                (d(2024, 12, 27), d(2024, 12, 26), 300000)):
+        add_ok(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date=trade.isoformat(),
+               amount=amount, nav=nav_on(1002, prev))
+    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    assert k["stamp_duty"] > 0
+    # AMC-style 3-decimal units on a ~Rs 1,000 NAV leave up to Rs 0.50 per purchase.
+    assert k["excess_since_start_pp"] == pytest.approx(0.0, abs=1e-3)
+    assert k["gain_vs_peers"] == pytest.approx(0.0, abs=1.5)
+    five = next(w for w in client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["windows"] if w["days"] == 5)
+    assert five["start"] < "2024-12-27"      # the window contains the 27 Dec purchase
+    assert five["change_pct"] == pytest.approx(five["benchmark_change_pct"], abs=1e-3)
+
+
+def test_the_day_column_follows_the_allotment_nav_not_the_trade_date(client):
+    """A liquid fund bought on the latest date is allotted at the previous day's NAV and
+    has earned the day; an order allotted at the latest NAV (placed before it) has not."""
+    pid = _pf(client)
+    last, prev = d(2024, 12, 31), d(2024, 12, 30)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date=last.isoformat(), units=100, nav=nav_on(1002, prev))
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-06-03", units=50)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date=prev.isoformat(), units=70, nav=nav_on(1001, last))
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    day = {p["scheme_code"]: p["day_change"] for p in body["positions"]}
+    assert day[1002] == pytest.approx(100 * (nav_on(1002, last) - nav_on(1002, prev)), abs=0.01)
+    assert day[1001] == pytest.approx(50 * (nav_on(1001, last) - nav_on(1001, prev)), abs=0.01)
+    assert body["kpis"]["day_change"] == pytest.approx(day[1001] + day[1002], abs=1e-6)
+
+
+def test_the_blend_names_one_category_once_whatever_label_amfi_filed_it_under():
+    """AMFI files liquid funds under two labels; the legend printed "Liquid Fund 77% ·
+    Liquid Fund 13%" for one 90% sleeve."""
+    parts = ha.blend_components({1: 77.0, 2: 13.0, 3: 10.0}, {
+        1: "Income/Debt Oriented Schemes - Liquid Fund",
+        2: "Debt Scheme - Liquid Fund",
+        3: "Hybrid Scheme - Arbitrage Fund"})
+    assert parts == [{"category": "Liquid Fund", "weight_pct": 90.0}, {"category": "Arbitrage Fund", "weight_pct": 10.0}]
+
+
+def test_a_liquid_purchase_is_matched_to_the_previous_days_nav():
+    """Liquid funds allot at the previous day's NAV; the peers must buy on that date too."""
+    raw = pd.Series([3163.0315, 3163.2604], index=pd.to_datetime(["2026-09-14", "2026-09-15"]))
+    assert ha._allotment_date(raw, d(2026, 9, 15), "3163.0315") == pd.Timestamp("2026-09-14")
+    # An app that printed the NAV a tenth of a paisa off still matches.
+    assert ha._allotment_date(raw, d(2026, 9, 15), 3163.0316) == pd.Timestamp("2026-09-14")
+    assert ha._allotment_date(raw, d(2026, 9, 15), "3163.2604") == pd.Timestamp("2026-09-15")
+    assert ha._allotment_date(raw, d(2026, 9, 15), "3170.0") == pd.Timestamp("2026-09-15")
+    assert ha._allotment_date(raw, d(2026, 9, 15), None) == pd.Timestamp("2026-09-15")
+
+
 def test_an_empty_portfolio_reports_no_windows(client):
     pid = _pf(client)
     assert client.get(f"/api/holdings/portfolios/{pid}/recent-changes").json()["empty"] is True
@@ -201,18 +342,22 @@ def test_a_large_deposit_into_a_tiny_portfolio_does_not_swamp_the_window(client)
 
 # --- The 1-day KPI tile ----------------------------------------------------------------
 
-def test_the_kpi_day_change_and_the_window_tiles_come_from_one_engine(client):
-    """The tile used to have its own arithmetic. It is now the shortest trailing window,
-    so it carries the same convention as the tiles printed underneath it: the day's own
-    flow is taken out of the day's change in value."""
+def test_the_kpi_day_change_is_the_tables_column_total(client):
+    """One engine for the day: the tile is the sum of the per-fund 1D column, and its
+    percentage is on what those units were worth before the move. With every fund priced
+    on the same day it is also exactly the last day of the value series."""
     pid = _pf(client)
     _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2023-03-01", units=100)
-    k = client.get(f"/api/holdings/portfolios/{pid}/summary").json()["kpis"]
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2023-03-01", units=10)
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    k, positions = body["kpis"], body["positions"]
     series = client.get(f"/api/holdings/portfolios/{pid}/performance").json()["series"]
 
+    assert k["day_change"] == pytest.approx(sum(p["day_change"] for p in positions), abs=1e-6)
     last_day = (series["value"][-1] - series["value"][-2]) - (series["invested"][-1] - series["invested"][-2])
     assert k["day_change"] == pytest.approx(last_day, abs=0.02)
-    assert k["day_change_pct"] == pytest.approx(ha.day_change(str(pid))["change_pct"])
+    base = sum(p["day_base"] for p in positions)
+    assert k["day_change_pct"] == pytest.approx(k["day_change"] / base * 100.0)
 
 
 def test_units_bought_today_are_not_credited_with_todays_nav_move(client):
@@ -246,6 +391,17 @@ def test_the_per_fund_day_column_adds_up_to_the_tile_across_buys_and_sells_today
         1002: 40 * (nav_on(1002, last) - nav_on(1002, prev)),
     }, abs=0.01)
     assert sum(p["day_change"] for p in body["positions"]) == pytest.approx(body["kpis"]["day_change"], abs=0.02)
+
+
+def test_each_position_says_where_its_one_day_move_starts(client):
+    """A Monday NAV's move starts on Friday: three days, which the 1D column now says."""
+    _seed_extra(1004, "Late Publisher Fund - Direct Plan - Growth", d(2024, 12, 30))   # a Monday
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-06-03", units=10)
+    _add(client, portfolio_id=pid, scheme_code=1004, txn_type="BUY", trade_date="2024-06-03", units=10)
+    prev = {p["scheme_code"]: (p["prev_nav_date"], p["latest_date"]) for p in client.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"]}
+    assert prev[1001] == ("2024-12-30", "2024-12-31")
+    assert prev[1004] == ("2024-12-27", "2024-12-30")
 
 
 def test_a_portfolio_with_one_nav_day_reports_no_day_change(client):
@@ -320,7 +476,7 @@ def test_default_benchmark_is_each_funds_category_not_an_equity_index(client):
     perf = client.get(f"/api/holdings/portfolios/{pid}/performance").json()
     b = perf["benchmark"]
     assert b["kind"] == "category_blend" and b["scheme_code"] is None
-    assert b["components"] == [{"category": "Equity Scheme - Flexi Cap Fund", "weight_pct": 100.0}]
+    assert b["components"] == [{"category": "Flexi Cap Fund", "weight_pct": 100.0}]
     twr, bench = perf["series"]["twr_index"], perf["series"]["benchmark_index"]
     assert bench[0] == pytest.approx(100.0) and bench[-1] == pytest.approx(twr[-1], rel=1e-3)
 

@@ -18,6 +18,8 @@ export interface MetaStatus {
   sync_activity?: { kind: string; label: string; trigger: string; step: string; started_at: number } | null;
   /** A historical NAV or TER backfill is running. */
   backfill_running?: boolean;
+  /** Behind AMFI only because tonight's scheduled 23:30 sync has not had its slot yet. */
+  sync_scheduled?: boolean;
 }
 
 export interface ProductFlags {

@@ -36,7 +36,11 @@ export interface EmiResult {
 }
 
 export interface Prepayments {
-  /** Extra paid every month, from the first EMI. */
+  /** "YYYY-MM" from which the recurring prepayments (monthly, yearly, EMI step-up) begin,
+   *  e.g. once a lender's lock-in ends. Unset: from the first EMI. One-time prepayments
+   *  carry their own month and are not affected. */
+  startMonth?: string;
+  /** Extra paid every month, from `startMonth`. */
   monthly?: number;
   /** Extra paid once a year, in `yearlyMonth` (1-12), e.g. from an annual bonus. */
   yearly?: number;
@@ -86,7 +90,10 @@ export function emiSchedule(principal: number, annualRatePct: number, months: nu
 
   for (let n = 1; balance > EPS && n <= 1200; n++) {
     const month = addMonths(startMonth, n - 1);
-    if (effect === "tenure" && prepay.stepUpPct && n > 1 && (n - 1) % 12 === 0) emi *= 1 + prepay.stepUpPct / 100;
+    // "YYYY-MM" strings compare correctly as text.
+    const recurring = !prepay.startMonth || month >= prepay.startMonth;
+    // A step-up still lands on a loan anniversary, the first one on or after the start month.
+    if (effect === "tenure" && prepay.stepUpPct && recurring && n > 1 && (n - 1) % 12 === 0) emi *= 1 + prepay.stepUpPct / 100;
 
     const interest = balance * r;
     let pay = emi;
@@ -100,8 +107,8 @@ export function emiSchedule(principal: number, annualRatePct: number, months: nu
 
     let extra = 0;
     if (balance > EPS) {
-      extra = (prepay.monthly ?? 0) + (oneTime.get(month) ?? 0);
-      if (prepay.yearly && Number(month.slice(5)) === (prepay.yearlyMonth ?? 3)) extra += prepay.yearly;
+      extra = (recurring ? prepay.monthly ?? 0 : 0) + (oneTime.get(month) ?? 0);
+      if (recurring && prepay.yearly && Number(month.slice(5)) === (prepay.yearlyMonth ?? 3)) extra += prepay.yearly;
       extra = Math.min(Math.max(0, extra), balance);
       balance -= extra;
       // Same end date, smaller EMI: re-spread what is left over the months that remain.

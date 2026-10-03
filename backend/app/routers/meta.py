@@ -26,6 +26,8 @@ def status() -> MetaStatus:
         db_path=stats["db_path"],
         is_stale=is_stale,
         expected_date=expected,
+        # Behind only because tonight's scheduled sync has not had its slot yet.
+        sync_scheduled=is_stale and amfi_sync.evening_sync_pending(),
         ter_records_count=stats.get("ter_count", 0),
         ter_official_schemes=stats.get("ter_official_schemes", 0),
         flags=product_flags(),

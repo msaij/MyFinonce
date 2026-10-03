@@ -89,5 +89,4 @@ backend/tests/       pytest suite (runs against a separate test database)
 frontend/app/        Next.js pages, one folder per route
 frontend/components/ page components (holdings/, calculator/, nse-ipo/, overview/, shared/ ...)
 frontend/lib/        API clients and pure logic, with vitest tests beside them
-docs/                design notes
 ```

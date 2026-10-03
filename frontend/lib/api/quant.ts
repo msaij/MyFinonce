@@ -272,9 +272,11 @@ export interface ScenarioReplayResult {
   window_end?: string;
   peak_date: string;
   trough_date: string;
-  max_drawdown_pct: number;
-  benchmark_drawdown_pct: number;
-  excess_drawdown_pct: number;
+  /** null when the fund has no data for the window (see `available` / `reason`). */
+  max_drawdown_pct: number | null;
+  /** null when the benchmark has no data for the window. */
+  benchmark_drawdown_pct: number | null;
+  excess_drawdown_pct: number | null;
   downside_beta: number;
   recovery_days: number;
   recovered?: boolean;
@@ -282,6 +284,7 @@ export interface ScenarioReplayResult {
   recovery_date?: string | null;
   available?: boolean;
   has_data?: boolean;
+  reason?: string;
 }
 
 export interface ParametricSimulationResult {
