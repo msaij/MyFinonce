@@ -57,7 +57,7 @@ NAV_DEVIATION_WARN = 0.005
 # XIRR annualises; over a few days it turns a 1% move into a three-digit rate.
 MIN_XIRR_DAYS = 30
 
-from app.classification import sebi_category  # noqa: E402  (re-exported: svc.sebi_category)
+from app.classification import is_equity_oriented, is_exchange_traded, sebi_category  # noqa: E402  (sebi_category re-exported: svc.sebi_category)
 
 
 def _as_date(value: Any) -> Optional[datetime.date]:
@@ -548,6 +548,112 @@ def _position_row(pos: ledger.Position, info: Dict[str, Any], portfolio_ids: Lis
     }
 
 
+#: "Earning now": each fund's NAV growth over this many calendar days, annualised. Long
+#: enough to smooth a liquid fund's day-to-day noise and about one F&O expiry cycle for an
+#: arbitrage fund; short enough to follow a change in interest rates within weeks (a 90-day
+#: window still showed Axis Liquid at 6.50% a year when it had slipped to 5.73%).
+EARNING_NOW_DAYS = 30
+#: Funds whose recent rate is a meaningful income rate. A month of an equity fund scaled to
+#: a year is noise (+3% in a month reads as 40% a year), so equity is shown as "-".
+EARNING_NOW_CLASSES = ("Cash & Liquid", "Debt")
+#: A fund earning this much less (percentage points a year) than another one held in the
+#: same SEBI category is flagged.
+EARNING_NOW_GAP_PP = 0.25
+
+
+def _attach_earning_now(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per fund: what it is earning at today's rates -- its last EARNING_NOW_DAYS of NAV
+    growth, annualised (the NAV is already net of the fund's expenses) -- and that rate on
+    today's value per day. Flags a fund trailing another held in the same SEBI category.
+    Returns the portfolio-level figures for the KPIs: the value-weighted rate over the funds
+    that have one, rupees a day, and the share of the money it covers.
+
+    A recent rate, not a forecast: liquid yields follow RBI rates, arbitrage returns move
+    with the monthly expiry cycle."""
+    for p in positions:
+        p.update(earning_now_pct=None, earning_now_per_day=None, earning_now_from=None, earning_now_behind=None)
+    eligible = [p for p in positions if not p["is_closed"] and p.get("asset_class") in EARNING_NOW_CLASSES
+                and p.get("latest_nav") and _as_date(p.get("latest_date"))]
+    starts = hdb.navs_on_or_before({p["scheme_code"]: _as_date(p["latest_date"]) - datetime.timedelta(days=EARNING_NOW_DAYS)
+                                    for p in eligible})
+    for p in eligible:
+        start = starts.get(p["scheme_code"])
+        if not start:
+            continue    # younger than the window: no rate rather than a guess
+        start_date, start_nav = start
+        days = (_as_date(p["latest_date"]) - start_date).days
+        if days <= 0 or start_nav <= 0:
+            continue
+        rate = ((p["latest_nav"] / start_nav) ** (365.0 / days) - 1.0) * 100.0
+        p["earning_now_pct"] = rate
+        p["earning_now_per_day"] = p["current_value"] * rate / 100.0 / 365.0
+        p["earning_now_from"] = start_date.isoformat()
+
+    by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for p in eligible:
+        if p["earning_now_pct"] is not None and p.get("sebi_category"):
+            by_category[p["sebi_category"]].append(p)
+    for peers in by_category.values():
+        best = max(peers, key=lambda q: q["earning_now_pct"])
+        for p in peers:
+            gap = best["earning_now_pct"] - p["earning_now_pct"]
+            if p is not best and gap >= EARNING_NOW_GAP_PP:
+                p["earning_now_behind"] = {"pp": gap, "than": best["display_name"],
+                                           "rupees_per_year": p["current_value"] * gap / 100.0}
+
+    rated = [p for p in eligible if p["earning_now_pct"] is not None]
+    rated_value = sum(p["current_value"] for p in rated)
+    total = sum(p["current_value"] for p in positions if not p["is_closed"])
+    return {
+        "earning_now_pct": sum(p["current_value"] * p["earning_now_pct"] for p in rated) / rated_value if rated_value > 0 else None,
+        "earning_now_per_day": sum(p["earning_now_per_day"] for p in rated) if rated else None,
+        "earning_now_coverage_pct": rated_value / total * 100.0 if total > 0 else None,
+        "earning_now_days": EARNING_NOW_DAYS,
+    }
+
+
+#: STT on redeeming units of an equity-oriented fund, paid by the seller: 0.001%.
+SELL_STT_RATE = 0.001 / 100.0
+
+
+def _attach_sell_now(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per fund: what selling the whole holding at its latest NAV would give.
+
+    you get = units x latest NAV - STT (0.001%, equity-oriented funds only); profit = what
+    you get + any money already taken out - the cash paid in (stamp duty included), i.e. the
+    rupees you would be up after selling. Assumes no exit load (the owner sells only once it
+    has lapsed) and leaves income tax out; nothing else is deducted on a redemption -- no
+    cess on STT, no stamp duty, GST or TDS, and no charge on Zerodha Coin. The estimate is at
+    the latest NAV: a redemption is paid at the NAV of the day it is placed.
+
+    ETFs and closed-ended schemes are sold on the exchange at market price with trading
+    charges, so they get no estimate and are left out of the totals."""
+    you_get = stt_total = profit_total = 0.0
+    excluded = 0
+    for p in positions:
+        p.update(sell_now_value=None, sell_now_stt=None, sell_now_profit=None, sell_now_note=None)
+        if p["is_closed"]:
+            continue
+        if is_exchange_traded(p.get("category"), p.get("scheme_name")):
+            p["sell_now_note"] = "exchange_traded"
+            excluded += 1
+            continue
+        stt = p["current_value"] * SELL_STT_RATE if is_equity_oriented(p.get("category"), p.get("broad_category"), p.get("scheme_name")) else 0.0
+        get = p["current_value"] - stt
+        profit = get + p["total_redeemed"] + p["dividend_income"] - p["total_invested"]
+        p.update(sell_now_value=get, sell_now_stt=stt, sell_now_profit=profit)
+        you_get += get
+        stt_total += stt
+        profit_total += profit
+    estimated = any(p["sell_now_value"] is not None for p in positions)
+    return {
+        "sell_now_value": you_get if estimated else None,
+        "sell_now_stt": stt_total if estimated else None,
+        "sell_now_profit": profit_total if estimated else None,
+        "sell_now_excluded": excluded,
+    }
+
+
 TER_MIN_PEERS = 10
 TER_HIGH_VS_P90 = 1.25      # > 1.25 x the category's 90th percentile
 TER_LOW_VS_P10 = 0.5        # < half the category's 10th percentile
@@ -657,6 +763,8 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
     for p in positions:
         p["weight_pct"] = p["current_value"] / total_value * 100.0 if total_value > 0 else None
     positions.sort(key=lambda p: (p["is_closed"], -p["current_value"]))
+    earning = _attach_earning_now(positions)
+    selling = _attach_sell_now(positions)
 
     pf_flows = [f for res in results.values() for f in res.portfolio_cash_flows]
     as_of = max((p["latest_date"] for p in open_pos if p["latest_date"]), default=None)
@@ -727,6 +835,10 @@ def _summary_cached(key: str, _ledger_v: int, _data_v: int) -> Dict[str, Any]:
             "oldest_nav_date": min((p["latest_date"] for p in open_pos if p["latest_date"] and not p["flags"]["stale_nav"]),
                                    default=None),
             "first_investment_date": first_flow.isoformat() if first_flow is not None else None,
+            # What the money is earning at today's rates (see _attach_earning_now).
+            **earning,
+            # What selling everything at the latest NAVs would give (see _attach_sell_now).
+            **selling,
             # How long the money behind Total gain has been invested: each rupee put in counts
             # from its purchase to the valuation date (or to the redemption that took it out,
             # oldest first), averaged by amount. For a SIP about half the time since the first
@@ -825,14 +937,25 @@ def restore(payload: Dict[str, Any]) -> Dict[str, int]:
         if not hdb.ledger_is_empty():
             raise LedgerRejected("Restore only runs into an empty holdings ledger, so nothing is ever overwritten.")
         # Tables absent from an older backup (taken before a feature existed) are skipped.
-        return hdb.restore_all({t: [_parse_row(r) for r in payload.get(t) or []] for t, _ in hdb.BACKUP_TABLES})
+        tables = {t: [_parse_row(r) for r in payload.get(t) or []] for t, _ in hdb.BACKUP_TABLES}
+        # Backups from before goals carried amount_as_of / mandates carried pauses: the same
+        # defaults the schema migration gave the live tables.
+        for g in tables["goals"]:
+            if "amount_as_of" not in g:
+                g["amount_as_of"] = g["created_at"].date() if g.get("created_at") else datetime.date.today()
+        if "sip_mandate_pauses" not in payload:
+            tables["sip_mandate_pauses"] = [
+                {"mandate_id": m["id"], "paused_from": m["updated_at"].date() if m.get("updated_at") else datetime.date.today()}
+                for m in tables["sip_mandates"] if not m.get("active", True)
+            ]
+        return hdb.restore_all(tables)
 
 
 # Backup JSON carries NUMERIC as exact strings and dates as ISO strings; types
 # come back by column-name convention, which every holdings table follows.
 _DECIMAL_COLS = {"amount", "units", "nav", "stamp_duty", "target_pct", "target_amount",
                  "inflation_pct", "step_up_pct", "threshold"}
-_DATE_COLS = {"trade_date", "start_date", "end_date", "target_date"}
+_DATE_COLS = {"trade_date", "start_date", "end_date", "target_date", "amount_as_of", "paused_from", "resumed_on"}
 
 
 def _parse_row(r: Dict[str, Any]) -> Dict[str, Any]:

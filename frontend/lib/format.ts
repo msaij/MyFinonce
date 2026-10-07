@@ -56,6 +56,24 @@ export function formatInr(value: number | null | undefined): string {
   return inr.format(value);
 }
 
+const inrWhole = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+
+/** Whole rupees, for estimates where paise would be false precision: "₹913", not "₹913.00". */
+export function formatInrWhole(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  return inrWhole.format(value);
+}
+
+/** Lakh/crore shorthand for a tile that has no room for every digit: "₹15.5L", "₹1.2Cr". */
+export function formatInrShort(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  if (abs >= 1e7) return `${sign}₹${(abs / 1e7).toFixed(1)}Cr`;
+  if (abs >= 1e5) return `${sign}₹${(abs / 1e5).toFixed(1)}L`;
+  return `${sign}${inrWhole.format(abs)}`;
+}
+
 export function formatDate(value: string | Date | null | undefined): string {
   if (!value) return "-";
   const d = typeof value === "string" ? new Date(value) : value;

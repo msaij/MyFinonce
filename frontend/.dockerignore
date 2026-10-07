@@ -1,3 +1,9 @@
+# Build output and dependencies are produced inside the image; sending the host's copies
+# would only slow the context transfer and could leak a stale build into it.
 node_modules
 .next
+*.tsbuildinfo
 npm-debug.log*
+# Not needed to build or test, and editing them shouldn't invalidate the build cache.
+Dockerfile
+.dockerignore

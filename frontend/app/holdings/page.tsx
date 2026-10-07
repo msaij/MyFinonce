@@ -35,12 +35,15 @@ import {
   type Position,
   type Transaction,
 } from "@/lib/api/holdings";
-import { formatDate, formatInr, formatSignedPct, toneOf } from "@/lib/format";
+import { formatDate, formatInr, formatInrWhole, formatSignedPct, toneOf } from "@/lib/format";
 import { useUrlSync } from "@/lib/hooks";
 import {
   excessText,
   excessTone,
   formatSignedInr,
+  EARNING_NOW_FULL_AT_PP,
+  EARNING_NOW_REFERENCE_PCT,
+  earningNowShade,
   formatMovePct,
   formatTer,
   formatUnits,
@@ -51,6 +54,7 @@ import {
   investedForText,
   parsePortfolioKey,
   positionBadges,
+  sellNowBreakdown,
   windowPendingText,
   xirrPendingText,
   xirrReason,
@@ -223,11 +227,12 @@ function HoldingsContent() {
         key: "cost_basis", label: "Invested", format: "inr",
         tooltip: "What the units you still hold cost, first in first out, net of stamp duty. Money from units already redeemed is in Realised, not here.",
       },
-      { key: "current_value", label: "Value", format: "inr", tooltip: "Units × latest NAV." },
+      // No Value column: "If sold now" already shows what each holding is worth (what you would
+      // get), and the Current value tile has the total.
       {
         key: "unrealised_gain",
         label: "Unrealised",
-        tooltip: "Value − Invested, on the units you still hold. The % is on Invested. It is a paper gain until you redeem.",
+        tooltip: "Today's value (units × latest NAV) − Invested, on the units you still hold. The % is on Invested. It is a paper gain until you redeem.",
         sortValue: (r) => r.unrealised_gain,
         render: (r, v) => (
           <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>
@@ -265,6 +270,37 @@ function HoldingsContent() {
         },
       },
       {
+        key: "earning_now_pct",
+        label: "Earning now",
+        tooltip: "What this fund is earning at today's rates: its NAV growth over the last 30 days, scaled to a year (the NAV is already net of its expenses), and that rate on your value in rupees a day. The shade is measured against your 7% a year reference: grey at it, red below and green above, deeper the further away (full at 4% and 10%). A recent rate, not a forecast. ⚠ marks a fund earning noticeably less than another one you hold in the same category. Equity funds show — because a month's move scaled to a year is noise; so do funds with under 30 days of NAVs.",
+        sortValue: (r) => (r.earning_now_pct as number | null) ?? null,
+        render: (r) => {
+          const p = r as unknown as Position;
+          if (p.earning_now_pct == null) return <span style={{ color: "var(--mf-muted)" }}>—</span>;
+          const behind = p.earning_now_behind;
+          return (
+            <span title={p.earning_now_from && p.latest_date ? `NAV growth from ${formatDate(p.earning_now_from)} to ${formatDate(p.latest_date)}, annualised` : undefined}>
+              <span className="rounded px-1 tabular-nums" style={{ background: earningNowShade(p.earning_now_pct) ?? undefined }}>{p.earning_now_pct.toFixed(2)}%</span>
+              {behind && (
+                <span
+                  className="ml-1 cursor-help"
+                  style={{ color: "var(--mf-warning)" }}
+                  title={`Earning ${behind.pp.toFixed(2)}% a year less than ${behind.than} in the same category: about ${formatInrWhole((behind.rupees_per_year))} a year on your ${formatInrWhole((p.current_value))}.`}
+                  aria-label={`Earning ${behind.pp.toFixed(2)}% a year less than ${behind.than}`}
+                >
+                  ⚠
+                </span>
+              )}
+              {p.earning_now_per_day != null && (
+                <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                  {formatInrWhole((p.earning_now_per_day))}/day
+                </span>
+              )}
+            </span>
+          );
+        },
+      },
+      {
         key: "xirr_pct",
         label: "XIRR",
         tooltip: "Your annualised return in this fund, counting when each rupee went in and came out. Withheld for the first 30 days, because annualising a few days' move exaggerates it; the date it will show is given instead.",
@@ -291,8 +327,33 @@ function HoldingsContent() {
       },
       {
         key: "annual_fee", label: "Yearly fee",
-        tooltip: "Value × TER: roughly what the expense ratio costs you over a year at today's value. It is taken out of the NAV daily, so it is already inside every return shown here. It is not a separate bill.",
+        tooltip: "Today's value (units × latest NAV) × TER: roughly what the expense ratio costs you over a year. It is taken out of the NAV daily, so it is already inside every return shown here. It is not a separate bill.",
         render: (_r, v) => (v == null ? "-" : formatInr(v as number)),
+      },
+      {
+        key: "sell_now_profit",
+        label: "If sold now",
+        tooltip: "What selling the whole holding today would give you, at the fund's latest NAV. Top: the profit, against the cash you paid (stamp duty included). Below: the amount you would receive. Assumes no exit load and leaves out income tax. The only deduction is STT, 0.001% on equity-oriented funds; there is no cess, stamp duty, GST or TDS on selling, and no charge on Zerodha Coin. You are paid the NAV of the day you sell, so the actual amount can differ slightly: usually a little higher for liquid funds, which earn about a day's interest more. ETFs and closed-ended funds are sold on the exchange at market price, so they show —.",
+        sortValue: (r) => (r.sell_now_profit as number | null) ?? null,
+        render: (r) => {
+          const p = r as unknown as Position;
+          if (p.sell_now_note === "exchange_traded") {
+            return <span style={{ color: "var(--mf-muted)" }} title="Sold on the stock exchange at the market price, with brokerage and exchange charges, so a NAV-based estimate would not match.">—</span>;
+          }
+          if (p.sell_now_profit == null || p.sell_now_value == null) return "-";
+          const stt = p.sell_now_stt ?? 0;
+          return (
+            <span title={sellNowBreakdown({ ...p, latest_date: p.latest_date ? formatDate(p.latest_date) : p.latest_date }) ?? undefined}>
+              <span className={toneOf(p.sell_now_profit) === "pos" ? "mf-pos" : toneOf(p.sell_now_profit) === "neg" ? "mf-neg" : ""}>
+                {formatSignedInr(p.sell_now_profit)}
+              </span>
+              <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                you get {formatInr(p.sell_now_value)}
+                {stt > 0 && ` · STT ${formatInr(stt)}`}
+              </span>
+            </span>
+          );
+        },
       },
       {
         key: "first_date", label: "Held for",
@@ -312,7 +373,6 @@ function HoldingsContent() {
     ? {
         scheme_name: `Total (${positions.length} fund${positions.length === 1 ? "" : "s"})`,
         cost_basis: formatInr(totals.invested),
-        current_value: formatInr(totals.value),
         unrealised_gain: (
           <span className={toneOf(totals.unrealised) === "pos" ? "mf-pos" : toneOf(totals.unrealised) === "neg" ? "mf-neg" : ""}>
             {formatSignedInr(totals.unrealised)}
@@ -325,6 +385,17 @@ function HoldingsContent() {
             {dayBase > 0 && <span className="block text-[0.7rem]">{formatMovePct((totals.day / dayBase) * 100)}</span>}
           </span>
         ),
+        earning_now_pct:
+          k.earning_now_pct != null ? (
+            <span title="Weighted by value across the funds with a rate (cash-like and debt funds)">
+              <span className="rounded px-1 tabular-nums" style={{ background: earningNowShade(k.earning_now_pct) ?? undefined }}>{k.earning_now_pct.toFixed(2)}%</span>
+              {k.earning_now_per_day != null && (
+                <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                  {formatInrWhole((k.earning_now_per_day))}/day
+                </span>
+              )}
+            </span>
+          ) : "—",
         xirr_pct:
           k.xirr_pct !== null ? (
             <span title="The whole portfolio's XIRR, closed funds included">{formatSignedPct(k.xirr_pct, 2)}</span>
@@ -337,6 +408,22 @@ function HoldingsContent() {
             <span title={`Value-weighted over ${k.ter_coverage_pct?.toFixed(1)}% of the portfolio's value (the funds with a TER on record)`}>{formatTer(k.weighted_ter_pct)}</span>
           ) : "-",
         annual_fee: totals.annualFee !== null ? formatInr(totals.annualFee) : "-",
+        sell_now_profit:
+          k.sell_now_profit != null && k.sell_now_value != null ? (
+            <span
+              title={`Selling everything at the latest NAVs: you would receive ${formatInr(k.sell_now_value)} after ${formatInr(k.sell_now_stt ?? 0)} of STT.${
+                k.sell_now_excluded ? ` ${k.sell_now_excluded} exchange-traded fund${k.sell_now_excluded === 1 ? " is" : "s are"} left out.` : ""
+              }`}
+            >
+              <span className={toneOf(k.sell_now_profit) === "pos" ? "mf-pos" : toneOf(k.sell_now_profit) === "neg" ? "mf-neg" : ""}>
+                {formatSignedInr(k.sell_now_profit)}
+              </span>
+              <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                you get {formatInr(k.sell_now_value)}
+                {(k.sell_now_stt ?? 0) > 0 && ` · STT ${formatInr(k.sell_now_stt ?? 0)}`}
+              </span>
+            </span>
+          ) : "-",
       }
     : undefined;
 
@@ -415,31 +502,44 @@ function HoldingsContent() {
                               : ""
                           }`
                         : ""
+                    }${
+                      // Ties this tile to the table's "If sold now": the two differ only by the
+                      // STT a sale would cost, which Total gain (valued at the NAV) leaves out.
+                      k.sell_now_profit != null
+                        ? ` If you sold everything today you'd net ${formatSignedInr(k.sell_now_profit)}${
+                            (k.sell_now_stt ?? 0) > 0 ? ` after ${formatInr(k.sell_now_stt ?? 0)} of STT` : " (no STT applies to your funds)"
+                          }${k.sell_now_excluded ? `, leaving out ${k.sell_now_excluded} exchange-traded fund${k.sell_now_excluded === 1 ? "" : "s"}` : ""} (see If sold now in the Holdings table).`
+                        : ""
                     }`}
                   />
                 }
               />
+              {/* Replaced "Return since start" (a time-weighted return from the first rupee,
+                  which answered how ₹100 kept in these funds since day one would have grown --
+                  not a question the owner asks of a cash-like portfolio). */}
               <StatCard
-                title="Return since start"
-                value={k.twr_since_start_pct !== null ? formatSignedPct(k.twr_since_start_pct, 2) : "—"}
-                tone={toneOf(k.twr_since_start_pct)}
-                // Percentage points alone scored the Rs 1,500 opening fortnight like the Rs 53
-                // lakh since; the rupee figure weighs each day by the money actually at work.
-                sub={
-                  [excessText(k.excess_since_start_pp), k.gain_vs_peers != null ? `${formatSignedInr(k.gain_vs_peers)} in rupees` : ""]
-                    .filter(Boolean)
-                    .join(" · ") || (k.first_investment_date ? `Time-weighted, since ${formatDate(k.first_investment_date)}` : "")
-                }
-                subTone={k.gain_vs_peers != null ? toneOf(k.gain_vs_peers) : excessTone(k.excess_since_start_pp)}
+                title="Earning now"
+                value={k.earning_now_pct != null ? `${k.earning_now_pct.toFixed(2)}% a year` : "—"}
+                // Shaded against the owner's 7% reference: grey at it, deeper red below, deeper
+                // green above. The number itself stays in normal ink.
+                valueBackground={earningNowShade(k.earning_now_pct)}
+                sub={[
+                  k.earning_now_per_day != null ? `≈ ${formatInrWhole((k.earning_now_per_day))} a day` : "",
+                  k.gain_vs_peers != null ? `${formatSignedInr(k.gain_vs_peers)} vs avg funds` : "",
+                  k.earning_now_coverage_pct != null && k.earning_now_coverage_pct < 99.5 ? `on ${Math.round(k.earning_now_coverage_pct)}% of your money` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+                subTone={k.gain_vs_peers != null ? toneOf(k.gain_vs_peers) : "neutral"}
                 tooltip={
                   <FormulaTooltip
-                    label="Return since start"
-                    formula={"Π (1 + rₜ) − 1,  rₜ = (Vₜ − Fₜ) / Vₜ₋₁ − 1"}
-                    description={`How your funds have done since ${k.first_investment_date ? formatDate(k.first_investment_date) : "your first investment"}, with the timing of your deposits taken out, so it is directly comparable with a benchmark and is not annualised. Every day counts equally, however little was invested that day.${k.benchmark_since_start_pct !== null ? ` Over the same days your funds' peer groups returned ${formatSignedPct(k.benchmark_since_start_pct, 2)}` + (k.benchmark_name ? ` (${k.benchmark_name}).` : ".") : ""}${
+                    label="Earning now"
+                    formula={"(NAV today ÷ NAV 30 days ago)^(365 ÷ days) − 1, weighted by value"}
+                    description={`What your money is earning at today's rates: each fund's NAV growth over its last ${k.earning_now_days ?? 30} days, scaled to a year and weighted by how much you hold in it. The shade is measured against your ${EARNING_NOW_REFERENCE_PCT}% a year reference: grey at it, red below and green above, deeper the further away (full at ${EARNING_NOW_REFERENCE_PCT - EARNING_NOW_FULL_AT_PP}% and ${EARNING_NOW_REFERENCE_PCT + EARNING_NOW_FULL_AT_PP}%). The NAV is already net of the fund's expenses, so this is what you actually earn. The rupees a day are that rate on today's value. It is a recent rate, not a forecast: liquid fund yields follow RBI rates, and arbitrage funds move with the monthly F&O expiry. Equity funds are left out, because a month's move scaled to a year is noise.${
                       k.gain_vs_peers != null && k.peer_gain != null
-                        ? ` In rupees, where each day counts by the money invested: the same cash, paid in on the same dates (allotted at the same NAV date, stamp duty included), would have made ${formatSignedInr(k.peer_gain)} in the peers; you made ${formatSignedInr(k.peer_gain + k.gain_vs_peers)}.`
+                        ? ` "vs avg funds": you made ${formatSignedInr(k.peer_gain + k.gain_vs_peers)}; the same money, paid in on the same dates (same allotment NAV date and stamp duty) into each fund's category average, would have made ${formatSignedInr(k.peer_gain)}.`
                         : ""
-                    } XIRR, beside it, is how your money did given when you invested it.`}
+                    }`}
                   />
                 }
               />

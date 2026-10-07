@@ -111,6 +111,45 @@ def classify(category: Optional[str], broad_category: Optional[str], scheme_name
     return "Other"
 
 
+# --- Selling: STT and where a fund is sold ------------------------------------------------
+#
+# STT on a redemption (0.001%, paid by the seller) applies only to units of an
+# "equity-oriented" fund -- one with at least 65% in domestic equity. The SEBI category
+# decides it for nearly every scheme: equity schemes always are; of the hybrids, the ones
+# whose mandate keeps them above 65% (arbitrage, aggressive hybrid, balanced advantage,
+# equity savings) are; a balanced or conservative hybrid is not. Multi-asset and solution-
+# oriented funds depend on the scheme's own allocation and are treated as not equity-oriented
+# -- an approximation worth at most 0.001% of the value. An index fund or ETF is equity-
+# oriented only when it tracks a domestic equity index.
+
+_EQUITY_ORIENTED_HYBRID = re.compile(r"arbitrage|aggressive hybrid|balanced advantage|dynamic asset allocation|equity savings", re.I)
+
+
+def is_equity_oriented(category: Optional[str], broad_category: Optional[str], scheme_name: Optional[str]) -> bool:
+    cat = (category or "").strip()
+    low = cat.lower()
+    if low.startswith("equity scheme"):
+        return True
+    if low.startswith("hybrid scheme"):
+        return bool(_EQUITY_ORIENTED_HYBRID.search(cat))
+    if "Index Funds" in cat or "ETF" in cat:
+        return classify(category, broad_category, scheme_name) == "Equity"
+    return False
+
+
+# ETFs and closed-ended schemes (FMPs, interval funds) are sold on the stock exchange at the
+# market price, with brokerage and exchange charges -- not redeemed with the fund at its NAV,
+# so a NAV-based "if sold now" would not be what the owner receives. Matched on the category
+# where AMFI gives one ("Gold ETF", "Other ETFs", "Fixed Term Plan"), else on the name. Not a
+# bare "ETF" in the name: "... ETF Fund of Fund" schemes are ordinary funds redeemed at NAV.
+_EXCHANGE_TRADED_NAME = re.compile(r"fixed maturity|\bfmp\b|interval (fund|plan|scheme)|close[d]?[- ]ended|capital protection", re.I)
+
+
+def is_exchange_traded(category: Optional[str], scheme_name: Optional[str]) -> bool:
+    cat = category or ""
+    return "ETF" in cat or "Fixed Term Plan" in cat or bool(_EXCHANGE_TRADED_NAME.search(scheme_name or ""))
+
+
 # --- IDCW ---------------------------------------------------------------------------
 
 _IDCW_NAME = re.compile(r"idcw|dividend(?!\s*yield)", re.I)

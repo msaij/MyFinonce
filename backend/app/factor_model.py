@@ -627,4 +627,6 @@ def _warmup_factor_model() -> None:
         pass
 
 
-_warmup_factor_model()
+# In the background, like plan_matcher's warm-up: run inline it held up every process start
+# (and every test session's import) by ~1s of queries and a full factor attribution.
+threading.Thread(target=_warmup_factor_model, daemon=True, name="factor_model_warmup").start()

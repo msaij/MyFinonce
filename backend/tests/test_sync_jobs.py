@@ -35,6 +35,18 @@ def test_before_five_past_midnight_yesterdays_slot_counts():
     assert amfi_sync.full_refresh_due({"ok": True, "finished_at": yesterday_slot + 10}, now_epoch, now_ist) is False
 
 
+def test_a_restart_refetches_ter_only_when_the_last_fetch_is_hours_old():
+    now = 1_800_000_000.0
+    hour = 3600
+    assert amfi_sync.startup_ter_due({}, now) is True
+    assert amfi_sync.startup_ter_due({"ter": {"ok": True, "finished_at": now - hour}}, now) is False
+    # The nightly full refresh ends with a TER fetch, so it counts too.
+    assert amfi_sync.startup_ter_due({"full": {"ok": True, "finished_at": now - 2 * hour}}, now) is False
+    assert amfi_sync.startup_ter_due({"ter": {"ok": True, "finished_at": now - 7 * hour}}, now) is True
+    # A failed fetch is no reason to skip one.
+    assert amfi_sync.startup_ter_due({"ter": {"ok": False, "finished_at": now - 60}}, now) is True
+
+
 def test_only_one_job_runs_and_its_outcome_is_kept(pg_db):
     seen = {}
 

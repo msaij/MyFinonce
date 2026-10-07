@@ -111,8 +111,7 @@ services:
       - ADMIN_TOKEN_OPTIONAL=false
       - AMFI_SSL_INSECURE=false
       # Backend --reload: DEV_RELOAD=true docker compose up -d backend
-      # Frontend remains a production image — after UI copy changes:
-      #   docker compose up -d --build frontend
+      # (a reload kills a running sync; scripts\dev.ps1 backend restarts safely).
       - DEV_RELOAD=${DEV_RELOAD:-false}
     command:
       - /bin/sh
@@ -154,8 +153,9 @@ services:
   # Next.js production build (next build + next start), not the dev server --
   # see frontend/Dockerfile's comment for why (next dev's per-request overhead
   # measured ~1s+ per API call vs ~25-50ms in production). No source bind mount:
-  # this container runs what was baked into the image; rebuild
-  # (docker compose up -d --build frontend) after a frontend code change.
+  # this container runs what was baked into the image; rebuild with
+  # scripts\dev.ps1 frontend after a frontend code change (the build runs the
+  # type-check, lint and unit tests and fails if they do).
   frontend:
     build:
       context: ./frontend
@@ -181,6 +181,5 @@ volumes:
   # and re-downloadable from AMFI, but this volume also holds the holdings
   # ledger (portfolios, holding_transactions, goals, SIP mandates) -- data the
   # owner typed in by hand that exists nowhere else. Take a backup first:
-  #   scripts\backup_holdings.ps1        (pg_dump of the holdings tables)
-  # or GET /api/holdings/backup.json from the running app.
+  # Holdings page -> Download backup (GET /api/holdings/backup.json).
   pgdata:

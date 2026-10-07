@@ -52,8 +52,9 @@ Write-Host "========================================================" -Foregroun
 Write-Host "App URL       : http://localhost:3000" -ForegroundColor White
 Write-Host "API           : http://localhost:8000 (FastAPI, /api/health)" -ForegroundColor Gray
 Write-Host "Database      : PostgreSQL 16 (compose project indian-mutual-funds)" -ForegroundColor Gray
-Write-Host "Frontend rebuild after UI changes: docker compose up -d --build frontend" -ForegroundColor Gray
-Write-Host "Backend reload: `$env:DEV_RELOAD='true'; docker compose up -d backend" -ForegroundColor Gray
+Write-Host "After UI changes     : .\scripts\dev.ps1 frontend" -ForegroundColor Gray
+Write-Host "After backend changes: .\scripts\dev.ps1 backend" -ForegroundColor Gray
+Write-Host "Tests                : .\scripts\dev.ps1 check" -ForegroundColor Gray
 Write-Host "AMFI Schemes  : growing daily via official AMFI sync" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Helpful Commands:" -ForegroundColor Cyan

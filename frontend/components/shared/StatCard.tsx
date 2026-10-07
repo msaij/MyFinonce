@@ -13,13 +13,16 @@ import { Tone } from "@/lib/format";
 export interface StatCardProps {
   title: string;
   value: string;
-  sub?: string;
+  /** A string, or two short lines of mixed tone (the box clamps at two lines). */
+  sub?: React.ReactNode;
   tone?: Tone | "warn" | "accent" | "";
   subTone?: "pos" | "neg" | "neutral";
   tooltip?: React.ReactNode;
+  /** A tint behind the value (e.g. a diverging scale), keeping the value in normal ink. */
+  valueBackground?: string | null;
 }
 
-export function StatCard({ title, value, sub = "", tone = "", subTone = "neutral", tooltip }: StatCardProps) {
+export function StatCard({ title, value, sub = "", tone = "", subTone = "neutral", tooltip, valueBackground }: StatCardProps) {
   const toneClass =
     tone === "pos" ? "mf-pos" : tone === "neg" ? "mf-neg" : tone === "warn" ? "mf-warn" : tone === "accent" ? "mf-accent" : "";
   const subClass =
@@ -32,9 +35,15 @@ export function StatCard({ title, value, sub = "", tone = "", subTone = "neutral
         {tooltip}
       </div>
       <div className={`metric-value ${toneClass}`} title={value}>
-        {value}
+        {valueBackground ? (
+          <span className="rounded-md px-1.5" style={{ background: valueBackground }}>
+            {value}
+          </span>
+        ) : (
+          value
+        )}
       </div>
-      <div className={`metric-sub ${subClass}`} title={sub}>
+      <div className={`metric-sub ${subClass}`} title={typeof sub === "string" ? sub : undefined}>
         {sub}
       </div>
     </div>

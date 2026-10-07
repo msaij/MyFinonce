@@ -14,9 +14,13 @@ import {
   monthsToDays,
   excessTone,
   formFromTransaction,
+  EARNING_NOW_REFERENCE_PCT,
+  earningNowShade,
   formatMovePct,
   formatSignedInr,
   formatTer,
+  goalSpanText,
+  medianOutcomeText,
   windowPendingText,
   xirrPendingText,
   groupTransactionsByFund,
@@ -27,6 +31,7 @@ import {
   parseNumber,
   parsePortfolioKey,
   positionBadges,
+  sellNowBreakdown,
   xirrReason,
   type TxnFormState,
 } from "./holdings";
@@ -36,6 +41,78 @@ const base = (over: Partial<TxnFormState> = {}): TxnFormState => ({
   schemeCode: 1001,
   value: "10000",
   ...over,
+});
+
+describe("goal median outcome", () => {
+  it("states the time left in months, then years and months", () => {
+    expect(goalSpanText(4.76)).toBe("4.8 months");
+    expect(goalSpanText(1)).toBe("1.0 month");
+    expect(goalSpanText(27.2)).toBe("2 yrs 3 months");
+    expect(goalSpanText(12.1)).toBe("1 yr");
+    expect(goalSpanText(23.8)).toBe("2 yrs");
+  });
+
+  it("reads as a gain from today, a yearly rate and the gap to the target", () => {
+    const t = medianOutcomeText(
+      { money_in: 5490031, still_to_invest: 0, gain: 147323, gain_pct: 2.683, rate_pct: 6.9, vs_target: -1554544 },
+      4.76,
+    );
+    expect(t.gain).toBe("+₹1,47,323 (+2.7%) in 4.8 months");
+    expect(t.rate).toBe("≈ 6.9% a year");
+    expect(t.target).toBe("₹15.5L short");
+    expect([t.gainTone, t.targetTone]).toEqual(["pos", "neg"]);
+  });
+
+  it("shows the gain on everything invested when SIPs are still to come", () => {
+    const t = medianOutcomeText(
+      { money_in: 6290031, still_to_invest: 800000, gain: 412800, gain_pct: 6.56, rate_pct: 7.1, vs_target: 230000 },
+      27.2,
+    );
+    expect(t.gain).toBe("+₹4,12,800 on ₹62.9L invested (+6.6%) in 2 yrs 3 months");
+    expect(t.target).toBe("₹2.3L above");
+    expect(t.targetTone).toBe("pos");
+  });
+});
+
+describe("if sold now", () => {
+  const base = { current_value: 654503.77, latest_date: "05 Oct 2026", total_invested: 651500 };
+  it("spells out STT, what you get and the profit for an equity-oriented fund", () => {
+    const text = sellNowBreakdown({ ...base, sell_now_stt: 6.55, sell_now_value: 654497.22, sell_now_profit: 2997.22 })!;
+    expect(text).toContain("STT 0.001%: ₹6.55");
+    expect(text).toContain("you get ₹6,54,497.22");
+    expect(text).toContain("You paid ₹6,51,500");
+    expect(text).toContain("profit if sold: +₹2,997.22");
+  });
+  it("says why there is no STT for other funds", () => {
+    expect(sellNowBreakdown({ ...base, sell_now_stt: 0, sell_now_value: 654503.77, sell_now_profit: 3003.77 })).toContain("no STT: not an equity-oriented fund");
+  });
+  it("gives nothing for a fund with no estimate (exchange-traded)", () => {
+    expect(sellNowBreakdown({ ...base, sell_now_stt: null, sell_now_value: null, sell_now_profit: null })).toBeNull();
+  });
+});
+
+describe("earning now shaded around the 7% reference", () => {
+  const rgb = (s: string | null) => (s ?? "").match(/\d+/g)!.map(Number);
+  it("is grey at 7% and reaches full red at 4% and full green at 10%", () => {
+    expect(EARNING_NOW_REFERENCE_PCT).toBe(7);
+    expect(earningNowShade(7)).toBe("rgb(240, 239, 236)");
+    expect(earningNowShade(4)).toBe("rgb(240, 145, 137)");
+    expect(earningNowShade(2)).toBe(earningNowShade(4)); // capped beyond 3 points
+    expect(earningNowShade(10)).toBe("rgb(134, 209, 162)");
+    expect(earningNowShade(14)).toBe(earningNowShade(10));
+    expect(earningNowShade(null)).toBeNull();
+  });
+  it("deepens steadily with distance on each side", () => {
+    // Red arm: green and blue channels fall as the rate drops further below 7%.
+    const [r1, g1] = rgb(earningNowShade(6.5)), [r2, g2] = rgb(earningNowShade(5.5)), [, g3] = rgb(earningNowShade(4.5));
+    expect(g1).toBeGreaterThan(g2);
+    expect(g2).toBeGreaterThan(g3);
+    expect(r1).toBe(240);
+    expect(r2).toBe(240);
+    // Green arm: red channel falls as the rate rises further above 7%.
+    const [ra] = rgb(earningNowShade(7.5)), [rb] = rgb(earningNowShade(9));
+    expect(ra).toBeGreaterThan(rb);
+  });
 });
 
 describe("day and window percentages", () => {

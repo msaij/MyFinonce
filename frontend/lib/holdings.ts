@@ -3,8 +3,8 @@
  * small labelling rules the tables share. No React here so Vitest can cover it.
  */
 
-import type { PortfolioKey, Position, Transaction, TransactionDraft, TxnType } from "./api/holdings";
-import { formatSignedPct } from "./format";
+import type { MedianOutcome, PortfolioKey, Position, Transaction, TransactionDraft, TxnType } from "./api/holdings";
+import { formatInrShort, formatInrWhole, formatSignedPct } from "./format";
 
 export const TXN_TYPE_LABELS: Record<TxnType, string> = {
   BUY: "Purchase (lump sum)",
@@ -155,6 +155,45 @@ export function excessTone(pp: number | null | undefined): "pos" | "neg" | "neut
 }
 
 /** "Shows from 15 Oct 2026" for an XIRR withheld as too short, else the plain reason. */
+/** The hover breakdown for one fund's "If sold now": value, STT, what you get, what you
+ *  paid, profit. null when there is no estimate (exchange-traded, or nothing held). */
+export function sellNowBreakdown(p: Pick<Position, "current_value" | "latest_date" | "sell_now_value" | "sell_now_stt" | "sell_now_profit" | "total_invested">): string | null {
+  if (p.sell_now_value == null || p.sell_now_profit == null) return null;
+  const stt = p.sell_now_stt ?? 0;
+  const inr = (v: number) => v.toLocaleString("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 });
+  const asOf = p.latest_date ? ` (${p.latest_date})` : "";
+  return (
+    `Value at the latest NAV${asOf}: ${inr(p.current_value)}` +
+    (stt > 0 ? ` − STT 0.001%: ${inr(stt)}` : " (no STT: not an equity-oriented fund)") +
+    ` = you get ${inr(p.sell_now_value)}. You paid ${inr(p.total_invested)} (stamp duty included), so profit if sold: ${formatSignedInr(p.sell_now_profit)}.`
+  );
+}
+
+/** The owner's reference rate for "Earning now", in % a year: at or above it reads green,
+ *  below it red. */
+export const EARNING_NOW_REFERENCE_PCT = 7;
+
+/** How far from the reference (percentage points) the shade reaches full strength. */
+export const EARNING_NOW_FULL_AT_PP = 3;
+
+// A diverging scale: grey at the reference, red below, green above, deeper the further away.
+// Light tints behind dark ink (the number keeps the text colour; the tint carries the
+// position): ink contrast stays above 7:1 even at the poles.
+const SHADE_NEUTRAL = [0xf0, 0xef, 0xec];
+const SHADE_BELOW = [0xf0, 0x91, 0x89];
+const SHADE_ABOVE = [0x86, 0xd1, 0xa2];
+
+/** The background tint for an "Earning now" rate: grey at 7% a year, shading to full red
+ *  at 4% or below and full green at 10% or above. null without a rate. */
+export function earningNowShade(ratePct: number | null | undefined): string | null {
+  if (ratePct === null || ratePct === undefined || Number.isNaN(ratePct)) return null;
+  const gap = ratePct - EARNING_NOW_REFERENCE_PCT;
+  const t = Math.min(Math.abs(gap) / EARNING_NOW_FULL_AT_PP, 1);
+  const pole = gap >= 0 ? SHADE_ABOVE : SHADE_BELOW;
+  const mix = SHADE_NEUTRAL.map((c, i) => Math.round(c + (pole[i] - c) * t));
+  return `rgb(${mix.join(", ")})`;
+}
+
 /** A day's or a few days' move: three decimals below 0.1%, where a liquid portfolio's
  *  daily moves live and two decimals would print most of them as 0.00% or 0.01%. */
 export function formatMovePct(value: number | null | undefined): string {
@@ -283,6 +322,37 @@ export function holdingsTotals(rows: Pick<Position, "cost_basis" | "current_valu
 }
 
 /** Signed rupee string that never relies on colour alone (WCAG): "+₹1,234.00" / "−₹56.10". */
+/** A goal's time left: "4.8 months" under a year, else "2 yrs 3 months". */
+export function goalSpanText(months: number): string {
+  if (months < 12) return `${months.toFixed(1)} month${months.toFixed(1) === "1.0" ? "" : "s"}`;
+  let years = Math.floor(months / 12);
+  let rest = Math.round(months - years * 12);
+  if (rest === 12) {
+    years += 1;
+    rest = 0;
+  }
+  return `${years} yr${years === 1 ? "" : "s"}${rest ? ` ${rest} month${rest === 1 ? "" : "s"}` : ""}`;
+}
+
+/** The Median outcome tile's two lines: the gain from today over the time left, then the
+ *  yearly rate and the gap to the target. With money still to invest, the gain is shown on
+ *  that whole amount ("on ₹62.9L invested"), so SIP instalments never read as profit. */
+export function medianOutcomeText(
+  m: Pick<MedianOutcome, "money_in" | "still_to_invest" | "gain" | "gain_pct" | "rate_pct" | "vs_target">,
+  months: number,
+) {
+  const signed = (v: number) => `${v < 0 ? "−" : "+"}${formatInrWhole(Math.abs(v))}`;
+  const pct = m.gain_pct !== null ? formatSignedPct(m.gain_pct, 1) : null;
+  const base = m.still_to_invest > 0 ? ` on ${formatInrShort(m.money_in)} invested` : "";
+  return {
+    gain: `${signed(m.gain)}${base}${pct ? ` (${pct})` : ""} in ${goalSpanText(months)}`,
+    gainTone: (m.gain < 0 ? "neg" : "pos") as "pos" | "neg",
+    rate: m.rate_pct !== null ? `≈ ${m.rate_pct.toFixed(1)}% a year` : null,
+    target: m.vs_target >= 0 ? `${formatInrShort(m.vs_target)} above` : `${formatInrShort(-m.vs_target)} short`,
+    targetTone: (m.vs_target >= 0 ? "pos" : "neg") as "pos" | "neg",
+  };
+}
+
 export function formatSignedInr(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v)) return "-";
   const abs = Math.abs(v).toLocaleString("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 });

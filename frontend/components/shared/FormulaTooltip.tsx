@@ -22,6 +22,8 @@ export interface FormulaTooltipProps {
    * clipped by the container's overflow and simply never appears.
    */
   fixed?: boolean;
+  /** With `fixed`: roughly how tall the box is, to decide whether it fits below the icon. */
+  estHeight?: number;
 }
 
 const BOX_WIDTH = 320;
@@ -34,6 +36,7 @@ export function FormulaTooltip({
   formula,
   description,
   fixed = false,
+  estHeight = EST_HEIGHT,
 }: FormulaTooltipProps) {
   const [pos, setPos] = useState<React.CSSProperties | undefined>(undefined);
   const alignClass = align === "left" ? "tooltip-align-left" : align === "right" ? "tooltip-align-right" : "";
@@ -43,7 +46,7 @@ export function FormulaTooltip({
         const width = Math.min(BOX_WIDTH, window.innerWidth * 0.9);
         const left = Math.max(8, Math.min(r.left + r.width / 2 - width / 2, window.innerWidth - width - 8));
         // Below the icon unless that would run off the bottom of the screen.
-        const below = r.bottom + 8 + EST_HEIGHT < window.innerHeight;
+        const below = r.bottom + 8 + estHeight < window.innerHeight;
         setPos({
           position: "fixed", left, width, right: "auto", transform: "none",
           ...(below ? { top: r.bottom + 8, bottom: "auto" } : { bottom: window.innerHeight - r.top + 8, top: "auto" }),

@@ -1018,6 +1018,21 @@ def full_refresh_due(last: Optional[Dict[str, Any]], now_epoch: Optional[float] 
     return finished < slot or not last.get("ok")
 
 
+STARTUP_TER_FRESH_SECONDS = 6 * 3600
+
+
+def startup_ter_due(last_jobs: Dict[str, Optional[Dict[str, Any]]], now_epoch: Optional[float] = None) -> bool:
+    """Whether a start should fetch this month's TER: not when a TER sync, or a full refresh
+    (which ends with one), succeeded within STARTUP_TER_FRESH_SECONDS. Fetching it on every
+    start cost ~40s of AMFI downloads per backend restart, and kept the sync job busy -- so
+    the next restart had to wait for it -- with figures fetched hours earlier."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    return not any(
+        job and job.get("ok") and job.get("finished_at") and now_epoch - float(job["finished_at"]) < STARTUP_TER_FRESH_SECONDS
+        for job in (last_jobs.get("ter"), last_jobs.get("full"))
+    )
+
+
 def sync_all(_trigger: str = "manual", progress: Optional[Any] = None) -> Dict[str, Any]:
     """NAVs, then a re-check of recent NAVs, then split normalisation, then plan/option
     resolution, then TER, then one summary rebuild.
@@ -1810,9 +1825,9 @@ def run_scheduled_sync_daemon():
     except Exception as e:
         logger.error(f"Startup catch-up error: {e}")
 
-    # 1b. This month's official TER once per start, unless the catch-up's full refresh
-    # has just fetched it.
-    if ran != "full":
+    # 1b. This month's official TER on start, unless the catch-up's full refresh has just
+    # fetched it or one was fetched in the last few hours (see startup_ter_due).
+    if ran != "full" and startup_ter_due(_load_last_jobs()):
         try:
             run_sync_job("ter", "startup", _ter_body)
         except Exception as e:

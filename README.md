@@ -58,17 +58,17 @@ Docker Desktop must be running.
 docker compose up -d
 ```
 
-After frontend changes, rebuild the frontend image (its source is baked in):
+Day-to-day jobs go through one script:
 
 ```powershell
-docker compose up -d --build frontend
+.\scripts\dev.ps1 frontend       # after frontend changes: check, build, restart (~25s warm)
+.\scripts\dev.ps1 backend        # after backend changes: restart, wait until healthy
+.\scripts\dev.ps1 backend-image  # only when backend/requirements.txt changes
 ```
 
-After backend changes, restart the backend (its source is mounted, without auto-reload):
-
-```powershell
-docker restart mf_backend
-```
+- The frontend's source is baked into its image. The image can't be built unless the type-check, lint and unit tests pass, because they run as a stage of the Docker build, in parallel with the compile. Each stage keeps its cache between builds, so only what changed is redone.
+- The backend's source is mounted into its container, so a code change needs a restart, not a rebuild.
+- `backend` and `backend-image` refuse to restart while a sync job is running, because that would kill it mid-write. Pass `-Force` to override.
 
 **First run:** a fresh clone starts with an empty database. Open **Data Management** (`/admin`) and run the NAV and TER sync, then the historical backfill. Admin actions need the `X-Admin-Token` header; the local default is in `docker-compose.yml`.
 
@@ -77,8 +77,8 @@ docker restart mf_backend
 ## Tests
 
 ```powershell
-docker exec mf_backend python -m pytest tests/ -q
-docker exec mf_frontend npm test
+.\scripts\dev.ps1 check                                   # frontend checks + backend pytest, deploys nothing
+.\scripts\dev.ps1 test tests/test_holdings_planning.py    # some backend tests
 ```
 
 ## Layout

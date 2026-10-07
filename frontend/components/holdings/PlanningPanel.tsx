@@ -20,13 +20,14 @@ import {
   updateSipMandate,
   type GenerateResult,
   type Goal,
+  type GoalStatus,
   type Portfolio,
   type PortfolioKey,
   type SipMandate,
 } from "@/lib/api/holdings";
-import { formatDate, formatInr } from "@/lib/format";
+import { formatDate, formatInr, formatInrWhole, formatSignedPct } from "@/lib/format";
 import { useDebouncedValue } from "@/lib/hooks";
-import { formatUnits, parseNumber, todayIso } from "@/lib/holdings";
+import { formatUnits, goalSpanText, medianOutcomeText, parseNumber, todayIso } from "@/lib/holdings";
 import { AXIS, REFERENCE, SERIES_1 } from "@/lib/holdingsChart";
 
 const inputStyle: React.CSSProperties = { borderColor: "var(--mf-border)", background: "var(--mf-bg)", color: "var(--mf-fg)" };
@@ -79,7 +80,7 @@ function SipSection({ pid, portfolios }: { pid: PortfolioKey; portfolios: Portfo
         <div>
           <h3 className="text-base font-bold">SIP mandates</h3>
           <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
-            Describe a SIP once. We then write each past instalment for you at the real AMFI NAV of its allotment date. You preview them first, and nothing is written until you confirm.
+            Describe a SIP once. We then write each past instalment for you at the real AMFI NAV of its allotment date. You preview them first, and nothing is written until you confirm. Months while a SIP is paused are skipped, and SIP rows you typed in yourself count as recorded.
           </p>
         </div>
         {!adding && (
@@ -102,7 +103,7 @@ function SipSection({ pid, portfolios }: { pid: PortfolioKey; portfolios: Portfo
                 <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
                   {formatInr(m.current_amount)} on day {m.day_of_month} · {pname(m.portfolio_id)}
                   {Number(m.step_up_pct) > 0 ? ` · +${Number(m.step_up_pct)}%/yr` : ""}
-                  {!m.active ? " · paused" : ""}
+                  {!m.active ? (m.paused_since ? ` · paused since ${formatDate(m.paused_since)}` : " · paused") : ""}
                 </div>
                 <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
                   Since {formatDate(m.start_date)}{m.end_date ? ` until ${formatDate(m.end_date)}` : ""} · {m.instalments_recorded} recorded
@@ -225,7 +226,9 @@ function SipForm({ portfolios, defaultPortfolio, onDone }: { portfolios: Portfol
 
 function GoalsSection({ portfolios }: { portfolios: Portfolio[] }) {
   const queryClient = useQueryClient();
-  const { data: goals = [] } = useQuery({ queryKey: ["holdings", "goals"], queryFn: listGoals });
+  const { data: all = [] } = useQuery({ queryKey: ["holdings", "goals"], queryFn: () => listGoals(true) });
+  const goals = all.filter((g) => !g.archived);
+  const archived = all.filter((g) => g.archived);
   const [editing, setEditing] = useState<Goal | "new" | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const remove = useMutation({
@@ -235,6 +238,19 @@ function GoalsSection({ portfolios }: { portfolios: Portfolio[] }) {
       queryClient.invalidateQueries({ queryKey: ["holdings", "goals"] });
       setEditing((e) => (typeof e === "object" && e && e.id === id ? null : e));
     },
+    onError: (e: Error) => setErr(e.message),
+  });
+  const restore = useMutation({
+    mutationFn: (g: Goal) =>
+      saveGoal(g.id, {
+        name: g.name,
+        target_amount: Number(g.target_amount),
+        target_date: g.target_date,
+        inflation_pct: Number(g.inflation_pct),
+        portfolio_ids: g.portfolio_ids,
+        archived: false,
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["holdings"] }),
     onError: (e: Error) => setErr(e.message),
   });
   return (
@@ -265,6 +281,20 @@ function GoalsSection({ portfolios }: { portfolios: Portfolio[] }) {
           deleting={remove.isPending && remove.variables === g.id}
         />
       ))}
+      {archived.length > 0 && (
+        <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
+          Archived:{" "}
+          {archived.map((g, i) => (
+            <span key={g.id}>
+              {i > 0 && " · "}
+              {g.name}{" "}
+              <button type="button" className="font-semibold" style={{ color: "var(--mf-accent)" }} disabled={restore.isPending} onClick={() => restore.mutate(g)}>
+                Restore
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -287,6 +317,8 @@ function GoalForm({ goal, portfolios, onDone }: { goal: Goal | null; portfolios:
     onError: (e: Error) => setErr(e.message),
   });
   const ok = name.trim() && (parseNumber(amount) ?? 0) > 0 && date;
+  // An unchanged amount keeps the day it was stated; a new one is in today's money.
+  const keptAsOf = goal && parseNumber(amount) === Number(goal.target_amount) && goal.amount_as_of !== todayIso() ? goal.amount_as_of : null;
   return (
     <form className="rounded-lg border p-3" style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }} onSubmit={(e) => { e.preventDefault(); if (ok) save.mutate(false); }}>
       <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
@@ -295,7 +327,7 @@ function GoalForm({ goal, portfolios, onDone }: { goal: Goal | null; portfolios:
           <input className="rounded-lg border px-2 py-1.5 text-sm" style={inputStyle} value={name} maxLength={80} onChange={(e) => setName(e.target.value)} placeholder="e.g. Retirement" />
         </label>
         <label className={label} style={{ color: "var(--mf-muted)" }}>
-          Amount needed, in today&apos;s ₹
+          {keptAsOf ? `Amount needed, in ₹ of ${formatDate(keptAsOf)}` : "Amount needed, in today's ₹"}
           <input inputMode="decimal" className="rounded-lg border px-2 py-1.5 text-sm" style={inputStyle} value={amount} onChange={(e) => setAmount(e.target.value)} />
         </label>
         <label className={label} style={{ color: "var(--mf-muted)" }}>
@@ -332,6 +364,53 @@ function GoalForm({ goal, portfolios, onDone }: { goal: Goal | null; portfolios:
   );
 }
 
+function MedianOutcomeTooltip({ s, targetDate }: { s: GoalStatus; targetDate: string }) {
+  const m = s.median_outcome!;
+  const months = s.months ?? 0;
+  const infl = s.inflation_pct ?? 0;
+  const real = m.rate_pct !== null ? ((1 + m.rate_pct / 100) / (1 + infl / 100) - 1) * 100 : null;
+  const signed = (v: number) => `${v < 0 ? "−" : "+"}${formatInrWhole(Math.abs(v))}`;
+  const row = (label: string, ...lines: string[]) => (
+    <span className="mt-1.5 block">
+      <span className="block font-bold text-slate-900">{label}</span>
+      {lines.map((l) => (
+        <span key={l} className="block">{l}</span>
+      ))}
+    </span>
+  );
+  return (
+    // fixed: positioned against the screen, so this tall box opens below the icon when it fits
+    // there and above it otherwise, instead of always above (off the top near the page top).
+    <FormulaTooltip label={`Median outcome on ${formatDate(targetDate)}`} fixed estHeight={360}>
+      Half of the {(s.n_simulations ?? 2000).toLocaleString("en-IN")} simulated paths end above this, half below.
+      {row(
+        "Growth from today",
+        `${formatInrWhole(m.money_in)}${m.still_to_invest > 0 ? ` (today's value + ${formatInrWhole(m.still_to_invest)} still to invest)` : ""} → ${formatInrWhole(s.median_terminal ?? 0)}`,
+        `${signed(m.gain)}${m.gain_pct !== null ? ` (${formatSignedPct(m.gain_pct, 1)})` : ""} over ${goalSpanText(months)}`,
+      )}
+      {m.rate_pct !== null &&
+        row(
+          "Yearly rate",
+          `≈ ${m.rate_pct.toFixed(1)}% a year${real !== null ? ` (≈ ${real < -0.05 ? "−" : ""}${Math.abs(real).toFixed(1)}% a year after ${infl.toFixed(1)}% inflation)` : ""}`,
+          ...(m.still_to_invest > 0 ? ["Money-weighted, like XIRR: each instalment counts only for the time it is invested."] : []),
+        )}
+      {row(
+        "Likely range (10th–90th percentile)",
+        `${formatInrWhole(m.p10)} – ${formatInrWhole(m.p90)}`,
+        `${signed(m.p10 - m.money_in)} to ${signed(m.p90 - m.money_in)}`,
+      )}
+      {row(
+        "Since you started",
+        `${signed(m.gain_since_start)} on the ${formatInrWhole(m.put_in_total)} you put in${m.still_to_invest > 0 ? `, ${formatInrWhole(m.still_to_invest)} of it still to come` : ""}`,
+      )}
+      {row(
+        "Against the goal",
+        `${formatInrWhole(s.target_future ?? 0)} needed · ${formatInrWhole(Math.abs(m.vs_target))} ${m.vs_target >= 0 ? "above" : "short"}`,
+      )}
+    </FormulaTooltip>
+  );
+}
+
 function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal; portfolios: Portfolio[]; onEdit: () => void; onDelete: () => void; deleting: boolean }) {
   const [whatIf, setWhatIf] = useState("");
   const sip = parseNumber(whatIf);
@@ -350,7 +429,7 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
         { type: "scatter", mode: "lines", x, y: p.p10, line: { width: 0 }, hoverinfo: "skip", showlegend: false },
         { type: "scatter", mode: "lines", x, y: p.p90, fill: "tonexty", fillcolor: "rgba(42,120,214,0.15)", line: { width: 0 }, name: "10th–90th percentile", hoverinfo: "skip" },
         { type: "scatter", mode: "lines", name: "Median", x, y: p.p50, line: { color: SERIES_1, width: 2 }, hovertemplate: "Year %{x:.1f}<br>Median ₹%{y:,.0f}<extra></extra>" },
-        { type: "scatter", mode: "lines", name: "Money put in", x, y: p.contributed, line: { color: REFERENCE, width: 2, dash: "dot" }, hovertemplate: "Put in ₹%{y:,.0f}<extra></extra>" },
+        { type: "scatter", mode: "lines", name: "Today's value + money still to invest", x, y: p.contributed, line: { color: REFERENCE, width: 2, dash: "dot" }, hovertemplate: "Value today + invested since ₹%{y:,.0f}<extra></extra>" },
         { type: "scatter", mode: "lines", name: "Target (inflated)", x: [0, x[x.length - 1]], y: [s!.target_future, s!.target_future], line: { color: "#b91c1c", width: 1.5, dash: "dash" }, hoverinfo: "skip" },
       ],
       layout: { height: 280, legend: { orientation: "h", y: 1.18 }, margin: { t: 40, l: 80 }, hovermode: "x", xaxis: { ...AXIS, title: { text: "Years from today" } }, yaxis: { ...AXIS, tickprefix: "₹", tickformat: ",.0f", rangemode: "tozero" } },
@@ -359,6 +438,12 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
 
   const linkedNames = goal.portfolio_ids.map((id) => portfolios.find((p) => p.id === id)?.name ?? `#${id}`).join(", ");
   const prob = s?.probability_pct;
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const hasSips = (s?.current_sip ?? 0) > 0 || (s?.sip_total_to_come ?? 0) > 0;
+  const extra = s?.extra_sip ?? 0;
+  const sipLabel = hasSips ? "Extra SIP" : "SIP";
+  const mo = s?.median_outcome;
+  const mt = mo && s?.months !== undefined ? medianOutcomeText(mo, s.months) : null;
 
   return (
     <article className="rounded-lg border p-4" style={{ borderColor: "var(--mf-border)" }}>
@@ -366,12 +451,23 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
         <div>
           <div className="text-base font-bold">{goal.name}</div>
           <div className="text-xs" style={{ color: "var(--mf-muted)" }}>
-            {formatInr(Number(goal.target_amount))} in today&apos;s money by {formatDate(goal.target_date)} · {linkedNames || "no portfolios linked"}
+            {formatInr(Number(goal.target_amount))} in {goal.amount_as_of === todayIso() ? "today's money" : `money of ${formatDate(goal.amount_as_of)}`} by{" "}
+            {formatDate(goal.target_date)} · {linkedNames || "no portfolios linked"}
           </div>
         </div>
         <div className="flex gap-3 text-xs font-semibold">
-          <button type="button" style={{ color: "var(--mf-accent)" }} onClick={onEdit}>Edit</button>
-          <button type="button" style={{ color: "var(--mf-danger)" }} disabled={deleting} onClick={onDelete}>Delete</button>
+          {confirmDelete ? (
+            <>
+              <span style={{ color: "var(--mf-muted)" }}>Delete this goal?</span>
+              <button type="button" style={{ color: "var(--mf-danger)" }} disabled={deleting} onClick={onDelete}>Yes, delete</button>
+              <button type="button" style={{ color: "var(--mf-muted)" }} onClick={() => setConfirmDelete(false)}>No</button>
+            </>
+          ) : (
+            <>
+              <button type="button" style={{ color: "var(--mf-accent)" }} onClick={onEdit}>Edit</button>
+              <button type="button" style={{ color: "var(--mf-danger)" }} onClick={() => setConfirmDelete(true)}>Delete</button>
+            </>
+          )}
         </div>
       </div>
 
@@ -381,7 +477,7 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
       {(s?.state === "reached" || s?.state === "past_due") && (
         <div className="mt-2">
           <Banner level={s.state === "reached" ? "info" : "warning"}>
-            {s.state === "reached" ? "✓ Target date passed with the goal met" : "Target date passed before the goal was met"}: {formatInr(s.current_value ?? 0)} vs {formatInr(s.target_today ?? 0)}.
+            {s.state === "reached" ? "✓ Target date passed with the goal met" : "Target date passed before the goal was met"}: {formatInr(s.current_value ?? 0)} vs {formatInr(s.target_future ?? 0)} needed by then.
           </Banner>
         </div>
       )}
@@ -391,7 +487,9 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
           <div className="mt-3" aria-label="Progress toward goal">
             <div className="flex justify-between text-xs" style={{ color: "var(--mf-muted)" }}>
               <span>Today {formatInr(s.current_value ?? 0)}</span>
-              <span>Needed then {formatInr(s.target_future ?? 0)} ({s.inflation_pct?.toFixed(1)}% inflation over {s.years_left.toFixed(1)} yrs)</span>
+              <span>
+                Needed by {formatDate(goal.target_date)}: {formatInr(s.target_future ?? 0)} ({s.inflation_pct?.toFixed(1)}% a year from {formatDate(s.amount_as_of ?? goal.amount_as_of)})
+              </span>
             </div>
             <div className="mt-1 h-2 w-full overflow-hidden rounded" style={{ background: "var(--mf-border)" }}>
               <div className="h-2" style={{ width: `${Math.min(100, s.progress_pct ?? 0)}%`, background: SERIES_1 }} />
@@ -402,26 +500,61 @@ function GoalCard({ goal, portfolios, onEdit, onDelete, deleting }: { goal: Goal
               title="Chance of reaching it"
               value={prob !== undefined ? `${prob.toFixed(0)}%` : "-"}
               tone={prob === undefined ? "" : prob >= 75 ? "pos" : prob >= 50 ? "warn" : "neg"}
-              sub={`With ${formatInr(s.sip_used ?? 0)}/month${sip !== null ? " (what-if)" : ""}`}
+              sub={
+                hasSips
+                  ? `With your SIPs${extra > 0 ? ` + ${formatInr(extra)}/month extra` : ""}`
+                  : extra > 0
+                    ? `With ${formatInr(extra)}/month`
+                    : "With no further investment"
+              }
+              tooltip={
+                <FormulaTooltip
+                  label="Chance of reaching it"
+                  description={`The share of ${s.n_simulations?.toLocaleString("en-IN") ?? "2,000"} simulated market paths that end at or above ${formatInr(s.target_future ?? 0)} on ${formatDate(goal.target_date)}. ${
+                    hasSips
+                      ? `Your SIP mandates count as recorded, each with its own start, end and step-up date: ${formatInr(s.sip_total_to_come ?? 0)} still to invest (${formatInr(s.current_sip ?? 0)} a month now). A paused SIP is taken to stay paused.`
+                      : "No SIP mandates are running in the linked portfolios."
+                  }`}
+                />
+              }
             />
-            <StatCard title="Median outcome" value={formatInr(s.median_terminal ?? 0)} />
+            <StatCard
+              title="Median outcome"
+              value={formatInrWhole(s.median_terminal ?? 0)}
+              sub={
+                mt ? (
+                  <>
+                    <span className={mt.gainTone === "pos" ? "metric-sub-pos" : "metric-sub-neg"}>{mt.gain}</span>
+                    <br />
+                    {mt.rate && `${mt.rate} · `}
+                    <span className={mt.targetTone === "pos" ? "metric-sub-pos" : "metric-sub-neg"}>{mt.target}</span>
+                  </>
+                ) : undefined
+              }
+              tooltip={mo && <MedianOutcomeTooltip s={s} targetDate={goal.target_date} />}
+            />
             {s.required_sip && (
               <>
-                <StatCard title="SIP for 50% odds" value={formatInr(s.required_sip.p50)} sub="per month" />
-                <StatCard title="SIP for 75% odds" value={formatInr(s.required_sip.p75)} sub="per month" />
+                <StatCard title={`${sipLabel} for 50% odds`} value={formatInr(s.required_sip.p50)} sub="a month, from today" />
+                <StatCard title={`${sipLabel} for 75% odds`} value={formatInr(s.required_sip.p75)} sub="a month, from today" />
                 <StatCard
-                  title="SIP for 90% odds"
+                  title={`${sipLabel} for 90% odds`}
                   value={formatInr(s.required_sip.p90)}
-                  sub="per month"
-                  tooltip={<FormulaTooltip label="Required SIP" description="On each simulated market path the final value is linear in the monthly SIP, so the SIP that works on 90% of paths is read directly from those paths, not estimated. Includes your step-up rate." />}
+                  sub="a month, from today"
+                  tooltip={
+                    <FormulaTooltip
+                      label={`Required ${sipLabel.toLowerCase()}`}
+                      description={`A flat amount invested today and every month after until ${formatDate(goal.target_date)}${hasSips ? ", on top of your SIP mandates" : ""}. On each simulated market path the final value is linear in that amount, so the amount that works on 90% of paths is read directly from those paths, not estimated.`}
+                    />
+                  }
                 />
               </>
             )}
           </div>
           <label className="mt-3 flex items-center gap-2 text-sm font-semibold">
-            What if I invested
-            <input inputMode="decimal" className="w-32 rounded-lg border px-2 py-1 text-sm" style={inputStyle} value={whatIf} placeholder={String(Math.round(s.current_sip ?? 0))} onChange={(e) => setWhatIf(e.target.value)} />
-            a month?
+            {hasSips ? "What if I added" : "What if I invested"}
+            <input inputMode="decimal" className="w-32 rounded-lg border px-2 py-1 text-sm" style={inputStyle} value={whatIf} placeholder="0" onChange={(e) => setWhatIf(e.target.value)} />
+            {hasSips ? "a month on top of my SIPs?" : "a month?"}
           </label>
           {fig && <PlotlyChart figure={fig} />}
           <p className="text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>

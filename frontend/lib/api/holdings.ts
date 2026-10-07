@@ -111,6 +111,21 @@ export interface Position {
   day_base?: number;
   /** The NAV date the 1D move starts from: the day before latest_date, or earlier after a gap. */
   prev_nav_date?: string | null;
+  /** Last 30 days of NAV growth, annualised; null for equity funds and funds under 30 days old. */
+  earning_now_pct?: number | null;
+  earning_now_per_day?: number | null;
+  /** The NAV date the 30-day window starts at. */
+  earning_now_from?: string | null;
+  /** Set when another fund held in the same SEBI category earns noticeably more. */
+  earning_now_behind?: { pp: number; than: string; rupees_per_year: number } | null;
+  /** Selling the whole holding at the latest NAV: what you would receive (after STT). */
+  sell_now_value?: number | null;
+  /** STT on that sale: 0.001% for equity-oriented funds, else 0. */
+  sell_now_stt?: number | null;
+  /** What you would be up after selling, against the cash paid in (stamp duty included). */
+  sell_now_profit?: number | null;
+  /** "exchange_traded": an ETF or closed-ended scheme, sold at market price; no estimate. */
+  sell_now_note?: string | null;
   xirr_pct: number | null;
   xirr_note: "too_short" | "no_flows" | "no_solution" | null;
   /** ISO date a withheld XIRR will start to show. */
@@ -160,6 +175,20 @@ export interface HoldingsKpis {
   /** Your gain minus what the same cash, on the same dates, would have made in the peers. */
   gain_vs_peers?: number | null;
   peer_gain?: number | null;
+  /** What the money earns at today's rates: the value-weighted last-30-day NAV growth,
+   *  annualised, over cash-like and debt funds (equity has no meaningful monthly rate). */
+  earning_now_pct?: number | null;
+  /** That rate on today's value, in rupees a day. */
+  earning_now_per_day?: number | null;
+  /** Share of the portfolio's value the rate covers. */
+  earning_now_coverage_pct?: number | null;
+  earning_now_days?: number;
+  /** Selling everything at the latest NAVs: received, STT, and profit (estimated funds only). */
+  sell_now_value?: number | null;
+  sell_now_stt?: number | null;
+  sell_now_profit?: number | null;
+  /** Funds left out of those totals because they are sold on the exchange. */
+  sell_now_excluded?: number;
   /** The oldest latest-NAV date among funds held (non-stale); below as_of while some funds
    *  have not published the newest date yet. */
   oldest_nav_date?: string | null;
@@ -476,6 +505,7 @@ export interface SipMandate {
   instalments_recorded: number;
   instalments_pending: number;
   upcoming: { date: string; amount: number }[];
+  paused_since: string | null;
 }
 
 export interface GenerateResult {
@@ -491,6 +521,8 @@ export interface Goal {
   id: number;
   name: string;
   target_amount: string;
+  /** The day target_amount was stated in "today's money"; inflation runs from here. */
+  amount_as_of: string;
   target_date: string;
   inflation_pct: string;
   notes: string | null;
@@ -498,20 +530,48 @@ export interface Goal {
   portfolio_ids: number[];
 }
 
+/** A goal's median outcome as a gain (see holdings_planning.goal_status). */
+export interface MedianOutcome {
+  /** Today's value plus everything still to be invested before the target date. */
+  money_in: number;
+  still_to_invest: number;
+  /** Median outcome minus money_in. */
+  gain: number;
+  gain_pct: number | null;
+  /** Money-weighted yearly rate (XIRR on the projection). */
+  rate_pct: number | null;
+  p10: number;
+  p90: number;
+  /** All cash put in: since the first investment, plus what is still to be invested. */
+  put_in_total: number;
+  gain_since_start: number;
+  /** Median outcome minus the inflated target. */
+  vs_target: number;
+}
+
 export interface GoalStatus {
   goal: Goal;
   state: "projected" | "no_portfolios" | "reached" | "past_due" | "insufficient_history";
   years_left: number;
   current_value?: number;
+  amount_as_of?: string;
+  /** The goal's amount in today's rupees. */
   target_today?: number;
+  /** The goal's amount in rupees of the target date. */
   target_future?: number;
   inflation_pct?: number;
+  /** What the running SIP mandates invest a month now. */
   current_sip?: number;
-  sip_used?: number;
-  step_up_pct?: number;
+  /** The what-if: a flat extra amount a month on top of the mandates. */
+  extra_sip?: number;
+  /** Everything the mandates will still invest before the target date. */
+  sip_total_to_come?: number;
+  months?: number;
+  n_simulations?: number;
   progress_pct?: number | null;
   probability_pct?: number;
   median_terminal?: number;
+  median_outcome?: MedianOutcome;
   required_sip?: { p50: number; p75: number; p90: number };
   projection?: { month: number[]; p10: number[]; p50: number[]; p90: number[]; contributed: number[] };
 }
@@ -552,7 +612,7 @@ export const updateSipMandate = (id: number, body: Partial<{ active: boolean; am
 export const generateInstalments = (id: number, confirm: boolean) =>
   apiPost<GenerateResult>(`${base}/sip-mandates/${id}/generate?confirm=${confirm}`, {});
 
-export const listGoals = () => apiGet<Goal[]>(`${base}/goals`);
+export const listGoals = (includeArchived = false) => apiGet<Goal[]>(`${base}/goals`, { include_archived: includeArchived || undefined });
 export const saveGoal = (id: number | null, body: { name: string; target_amount: number; target_date: string; inflation_pct: number; portfolio_ids: number[]; archived?: boolean }) =>
   id === null ? apiPost<Goal>(`${base}/goals`, body) : apiPut<Goal>(`${base}/goals/${id}`, body);
 export const deleteGoal = (id: number) => apiDelete<{ deleted: number }>(`${base}/goals/${id}`);

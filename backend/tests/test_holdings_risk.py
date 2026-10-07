@@ -136,7 +136,7 @@ def test_goal_projections_step_through_a_whole_month_of_a_calendar_day_series():
     year's median growth came out at 4.7% against 6.9% realised."""
     from app.services import holdings_planning as hp
     rets = np.full(800, 0.00018) + np.random.default_rng(3).normal(0, 1e-6, 800)
-    G, _ = hp._simulate(rets, 12, 500, 0.0, obs_per_year=365)
+    G, _ = hp._simulate(rets, 12, 500, obs_per_year=365)
     assert np.median(G[:, -1]) == pytest.approx(np.exp(0.00018 * 365), rel=1e-3)
 
 

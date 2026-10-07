@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
+# Lets scripts/dev.ps1 prune this project's superseded images without touching any others.
+LABEL org.myfinonce.app=backend
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# Compiled bytecode goes to /tmp/pycache inside the container, not into __pycache__ folders
+# in the bind-mounted source on the Windows host. It survives `docker restart`, so a restart
+# no longer recompiles every module from source read through the bind mount (the old
+# PYTHONDONTWRITEBYTECODE=1 kept the repo clean by caching nothing at all).
+ENV PYTHONPYCACHEPREFIX=/tmp/pycache \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata
 
@@ -19,6 +25,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --timeout 20 --retries 10 -r requirements.txt
 COPY . .
 
+# The image only supplies Python and the dependencies: docker-compose.yml bind-mounts
+# ./backend over /app, so a code change needs `scripts\dev.ps1 backend` (a restart), not a
+# rebuild. Rebuild (`scripts\dev.ps1 backend-image`) only when requirements.txt changes.
 EXPOSE 8000
 
 # --workers 1 is deliberate: in-process caches, WRITE_LOCK, BACKFILL_STATE, and

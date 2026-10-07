@@ -338,6 +338,34 @@ CREATE TABLE IF NOT EXISTS amfi_fund_snapshot (
 CREATE INDEX IF NOT EXISTS idx_amfi_fund_snapshot_codes ON amfi_fund_snapshot USING GIN (scheme_codes);
 """
 
+# goals.amount_as_of: the day the target amount was stated "in today's money". Inflation runs
+# from that day to the target date, so the target in rupees of that date stays fixed. Measured
+# from each day the page is opened instead, the inflated target shrank as the date approached
+# (a Rs 70 lakh goal 146 days out lost ~Rs 1.5 lakh of inflation by its last month). Existing
+# goals take the day they were created.
+#
+# sip_mandate_pauses: when a mandate was paused and resumed. Instalments falling inside a
+# pause were never debited, so they are never offered for the ledger; before this, resuming a
+# mandate offered every month it had been paused. A mandate already paused is taken to have
+# been paused since its last update.
+GOAL_AS_OF_AND_SIP_PAUSES_SQL = """
+ALTER TABLE goals ADD COLUMN IF NOT EXISTS amount_as_of DATE;
+UPDATE goals SET amount_as_of = (created_at AT TIME ZONE 'Asia/Kolkata')::date WHERE amount_as_of IS NULL;
+ALTER TABLE goals ALTER COLUMN amount_as_of SET DEFAULT CURRENT_DATE;
+ALTER TABLE goals ALTER COLUMN amount_as_of SET NOT NULL;
+CREATE TABLE IF NOT EXISTS sip_mandate_pauses (
+    id BIGSERIAL PRIMARY KEY,
+    mandate_id BIGINT NOT NULL REFERENCES sip_mandates(id) ON DELETE CASCADE,
+    paused_from DATE NOT NULL,
+    resumed_on DATE,
+    CHECK (resumed_on IS NULL OR resumed_on >= paused_from)
+);
+CREATE INDEX IF NOT EXISTS idx_sip_mandate_pauses_mandate ON sip_mandate_pauses (mandate_id);
+INSERT INTO sip_mandate_pauses (mandate_id, paused_from)
+SELECT m.id, (m.updated_at AT TIME ZONE 'Asia/Kolkata')::date FROM sip_mandates m
+WHERE NOT m.active AND NOT EXISTS (SELECT 1 FROM sip_mandate_pauses p WHERE p.mandate_id = m.id);
+"""
+
 MIGRATIONS = [
     ("0001_baseline", BASELINE_SQL),
     ("0002_holdings_core", HOLDINGS_CORE_SQL),
@@ -348,6 +376,7 @@ MIGRATIONS = [
     ("0007_scheme_field_provenance", SCHEME_FIELD_PROVENANCE_SQL),
     ("0008_scheme_riskometer", SCHEME_RISKOMETER_SQL),
     ("0009_amfi_fund_snapshot", AMFI_FUND_SNAPSHOT_SQL),
+    ("0010_goal_as_of_sip_pauses", GOAL_AS_OF_AND_SIP_PAUSES_SQL),
 ]
 
 

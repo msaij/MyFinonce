@@ -1,6 +1,7 @@
 """Holdings Phase 4: SIP mandates, goals, insights and alerts."""
 
 import datetime
+import math
 from decimal import Decimal
 
 import numpy as np
@@ -75,6 +76,42 @@ def test_generate_previews_then_writes_once(client):
     assert view["instalments_recorded"] == 5 and view["instalments_pending"] == 1
 
 
+def test_schedule_leaves_out_paused_months_without_moving_the_step_up():
+    m = {"day_of_month": 6, "start_date": d(2024, 1, 1), "end_date": None, "amount": Decimal("1000"), "step_up_pct": Decimal("10")}
+    s = planning.schedule(m, d(2025, 3, 31), pauses=[(d(2024, 3, 1), d(2024, 6, 1)), (d(2025, 2, 1), None)])
+    dates = [x for x, _ in s]
+    assert d(2024, 2, 6) in dates and d(2024, 6, 6) in dates
+    assert not {d(2024, 3, 6), d(2024, 4, 6), d(2024, 5, 6), d(2025, 2, 6), d(2025, 3, 6)} & set(dates)
+    assert dict(s)[d(2025, 1, 6)] == Decimal("1100.00")       # the 13th instalment, pause or not
+
+
+def test_pausing_records_the_pause_and_its_months_are_never_offered(client):
+    pid = new_portfolio(client)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01", "end_date": "2024-12-31"}).json()
+    assert m["instalments_pending"] == 12 and m["paused_since"] is None
+    paused = client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"active": False}).json()
+    assert paused["paused_since"] == datetime.date.today().isoformat()
+    con = connection.get_connection()
+    con.execute("UPDATE sip_mandate_pauses SET paused_from = '2024-03-01' WHERE mandate_id = %s", (m["id"],))
+    con.close()
+    resumed = client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"active": True}).json()
+    assert resumed["paused_since"] is None
+    # Paused from 1 Mar 2024 until today: only January and February were ever debited.
+    preview = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert [r["trade_date"] for r in preview["rows"]] == ["2024-01-08", "2024-02-06"]
+
+
+def test_sip_rows_typed_in_by_hand_count_as_recorded(client):
+    pid = new_portfolio(client)
+    add_ok(client, portfolio_id=pid, scheme_code=DIRECT, txn_type="SIP", trade_date="2024-02-06", amount=5000)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01", "end_date": "2024-03-31"}).json()
+    assert m["instalments_recorded"] == 1 and m["instalments_pending"] == 2
+    preview = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert [r["trade_date"] for r in preview["rows"]] == ["2024-01-08", "2024-03-06"]
+
+
 def test_mandate_cannot_start_before_nav_history(client):
     pid = new_portfolio(client)
     r = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
@@ -102,6 +139,99 @@ def test_goal_probability_and_required_sip_are_consistent(client):
     assert more["probability_pct"] > at75["probability_pct"]
     p = at75["projection"]
     assert p["month"][0] == 0 and len(p["p50"]) == len(p["contributed"]) == len(p["month"])
+
+
+def test_goal_target_is_inflated_from_the_day_its_amount_was_set(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    target = datetime.date.today() + datetime.timedelta(days=400)
+    g = client.post("/api/holdings/goals", json={"name": "House", "target_amount": 1000000, "target_date": target.isoformat(),
+                                                "inflation_pct": 7, "portfolio_ids": [pid]}).json()
+    assert g["amount_as_of"] == datetime.date.today().isoformat()
+    # Set a year ago: inflation runs from then, not from today.
+    set_on = datetime.date.today() - datetime.timedelta(days=365)
+    con = connection.get_connection()
+    con.execute("UPDATE goals SET amount_as_of = %s WHERE id = %s", (set_on, g["id"]))
+    con.close()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    assert s["target_future"] == pytest.approx(1000000 * 1.07 ** ((target - set_on).days / 365.25), rel=1e-9)
+    assert s["target_today"] == pytest.approx(1000000 * 1.07 ** (365 / 365.25), rel=1e-9)
+    body = {"name": "New house", "target_amount": 1000000, "target_date": target.isoformat(), "inflation_pct": 7, "portfolio_ids": [pid]}
+    assert client.put(f"/api/holdings/goals/{g['id']}", json=body).json()["amount_as_of"] == set_on.isoformat()
+    body["target_amount"] = 1200000          # a new amount is in today's money
+    assert client.put(f"/api/holdings/goals/{g['id']}", json=body).json()["amount_as_of"] == datetime.date.today().isoformat()
+
+
+def test_goal_counts_each_mandate_on_its_own_schedule(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    today = datetime.date.today()
+    target = today + datetime.timedelta(days=3 * 365)
+    ends = today + datetime.timedelta(days=200)
+    client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 10000, "day_of_month": 10,
+                                                   "start_date": "2024-01-01", "end_date": ends.isoformat(), "step_up_pct": 10})
+    starts = today + datetime.timedelta(days=90)
+    client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": LIQUID, "amount": 3000, "day_of_month": 20,
+                                                   "start_date": starts.isoformat()})
+    g = client.post("/api/holdings/goals", json={"name": "Car", "target_amount": 2000000, "target_date": target.isoformat(),
+                                                "inflation_pct": 6, "portfolio_ids": [pid]}).json()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    mandates = {m["scheme_code"]: m for m in db_mandates(pid)}
+    expected = sum(float(a) for m in mandates.values() for x, a in planning.schedule(m, target) if x > today)
+    assert s["sip_total_to_come"] == pytest.approx(expected)
+    # Only the running one counts toward "a month now"; the second hasn't started.
+    assert s["current_sip"] == pytest.approx(float(planning.current_instalment(mandates[DIRECT])))
+    # The required amount is extra, on top of the mandates: adding it gives the promised odds.
+    at75 = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": s["required_sip"]["p75"]}).json()
+    assert at75["probability_pct"] == pytest.approx(75.0, abs=0.5)
+    assert at75["projection"]["month"][-1] == pytest.approx(at75["months"])
+
+
+def test_money_weighted_rate_allows_for_late_instalments():
+    # Rs 100 now and Rs 100 in a year, both at 10% a year, are worth 121 + 110 at year two.
+    r = planning._money_weighted_rate(100.0, np.array([0.0, 100.0]), np.array([0.0, 1.0]), 2.0, 231.0)
+    assert r == pytest.approx(0.10, abs=1e-9)
+    # The plain return on the Rs 200 put in (15.5% over two years) would understate it.
+    assert planning._money_weighted_rate(100.0, np.zeros(1), np.zeros(1), 0.5, 103.0) == pytest.approx(1.03 ** 2 - 1)
+
+
+def test_median_outcome_is_explained_as_a_gain_from_today(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    target = datetime.date.today() + datetime.timedelta(days=500)
+    g = client.post("/api/holdings/goals", json={"name": "Bike", "target_amount": 300000, "target_date": target.isoformat(),
+                                                "inflation_pct": 6, "portfolio_ids": [pid]}).json()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    m, value, median = s["median_outcome"], s["current_value"], s["median_terminal"]
+    assert m["money_in"] == pytest.approx(value) and m["still_to_invest"] == 0
+    assert m["gain"] == pytest.approx(median - value)
+    assert m["gain_pct"] == pytest.approx((median / value - 1) * 100)
+    assert m["rate_pct"] == pytest.approx(((median / value) ** (12 / s["months"]) - 1) * 100, rel=1e-6)
+    assert m["p10"] <= median <= m["p90"]
+    assert m["gain_since_start"] == pytest.approx(median - 200000)     # cash put in, stamp duty included
+    assert m["vs_target"] == pytest.approx(median - s["target_future"])
+    # An extra SIP is money put in, not gain.
+    w = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": 5000}).json()["median_outcome"]
+    assert w["still_to_invest"] == pytest.approx(5000 * math.ceil(s["months"]))
+    assert w["money_in"] == pytest.approx(value + w["still_to_invest"])
+
+
+def db_mandates(pid):
+    from app.db import holdings as hdb
+    return hdb.list_sip_mandates([pid])
+
+
+def test_goal_past_its_date_is_judged_against_the_inflated_target(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, LIQUID, "2022-02-01", 1700)          # worth ~Rs 2,050 by the end of the data
+    g = client.post("/api/holdings/goals", json={"name": "Trip", "target_amount": 1000, "target_date": "2023-01-01",
+                                                "inflation_pct": 30, "portfolio_ids": [pid]}).json()
+    con = connection.get_connection()
+    con.execute("UPDATE goals SET amount_as_of = '2020-01-01' WHERE id = %s", (g["id"],))
+    con.close()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    assert 1000 < s["current_value"] < s["target_future"]   # ~Rs 2,197 needed by 2023
+    assert s["state"] == "past_due"
 
 
 def test_goal_edge_states(client):

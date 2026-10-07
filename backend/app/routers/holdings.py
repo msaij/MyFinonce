@@ -262,7 +262,9 @@ def create_sip_mandate(body: SipMandateCreate) -> dict:
 
 @router.patch("/sip-mandates/{mandate_id}")
 def update_sip_mandate(mandate_id: int, body: SipMandateUpdate) -> dict:
+    before = _found(hdb.get_sip_mandate(mandate_id), f"SIP mandate {mandate_id}")
     m = _found(hdb.update_sip_mandate(mandate_id, body.model_dump(exclude_unset=True)), f"SIP mandate {mandate_id}")
+    planning.set_active(before, m)
     return _call(planning.mandate_view, m)
 
 
@@ -274,11 +276,15 @@ def generate_sip_instalments(mandate_id: int, confirm: bool = False) -> dict:
 
 # --- Goals ------------------------------------------------------------------------------
 
-def _save_goal(goal_id: Optional[int], body: GoalSave) -> dict:
+def _save_goal(goal_id: Optional[int], body: GoalSave, before: Optional[dict] = None) -> dict:
     for pid in body.portfolio_ids:
         _portfolio(pid)
     fields = body.model_dump(exclude={"portfolio_ids"})
     fields["name"] = fields["name"].strip()
+    # The amount is in today's money when it is typed; editing anything else keeps the day it
+    # was stated, so inflation keeps running from then.
+    unchanged = before is not None and abs(float(before["target_amount"]) - fields["target_amount"]) < 0.005
+    fields["amount_as_of"] = before["amount_as_of"] if unchanged else datetime.date.today()
     return to_json(hdb.save_goal(goal_id, fields, body.portfolio_ids))
 
 
@@ -294,8 +300,7 @@ def create_goal(body: GoalSave) -> dict:
 
 @router.put("/goals/{goal_id}")
 def update_goal(goal_id: int, body: GoalSave) -> dict:
-    _found(hdb.get_goal(goal_id), f"Goal {goal_id}")
-    return _save_goal(goal_id, body)
+    return _save_goal(goal_id, body, _found(hdb.get_goal(goal_id), f"Goal {goal_id}"))
 
 
 @router.delete("/goals/{goal_id}")
@@ -306,7 +311,7 @@ def delete_goal(goal_id: int) -> dict:
 
 
 @router.get("/goals/{goal_id}/status")
-def goal_status(goal_id: int, sip: Optional[float] = Query(None, ge=0, description="What-if monthly SIP")) -> dict:
+def goal_status(goal_id: int, sip: Optional[float] = Query(None, ge=0, description="What-if: extra monthly SIP on top of the recorded mandates")) -> dict:
     return _call(planning.goal_status, _found(hdb.get_goal(goal_id), f"Goal {goal_id}"), sip)
 
 

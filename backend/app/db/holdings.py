@@ -192,6 +192,28 @@ def navs_on_dates(pairs: Iterable[Tuple[int, datetime.date]]) -> Dict[Tuple[int,
     return {(int(r[0]), r[1]): float(r[2]) for r in rows}
 
 
+def navs_on_or_before(on: Dict[int, datetime.date]) -> Dict[int, Tuple[datetime.date, float]]:
+    """For each scheme, its last published (date, NAV) on or before the given date -- the
+    start of a trailing window that lands on a weekend or holiday."""
+    pairs = [(int(c), d) for c, d in on.items() if d is not None]
+    if not pairs:
+        return {}
+    with get_connection() as con:
+        rows = con.execute(
+            """
+            SELECT q.code, n.nav_date, n.nav
+            FROM unnest(%s::bigint[], %s::date[]) AS q(code, d)
+            CROSS JOIN LATERAL (
+                SELECT nav_date, nav FROM nav_history
+                WHERE scheme_code = q.code AND nav_date <= q.d
+                ORDER BY nav_date DESC LIMIT 1
+            ) n
+            """,
+            ([c for c, _ in pairs], [d for _, d in pairs]),
+        ).fetchall()
+    return {int(r[0]): (r[1], float(r[2])) for r in rows}
+
+
 def previous_nav_dates(latest: Dict[int, datetime.date]) -> Dict[int, datetime.date]:
     """For each scheme, the NAV date just before the given (latest) one: the start of the
     move the 1D column reports. Usually the day before; after a holiday or a fund that
@@ -343,10 +365,34 @@ def update_sip_mandate(mandate_id: int, fields: Dict[str, Any]) -> Optional[Dict
     return _update("sip_mandates", SIP_WRITABLE, SIP_COLUMNS, mandate_id, fields)
 
 
-def mandate_installment_dates(mandate_id: int) -> List[datetime.date]:
-    """Trade dates of this mandate's non-deleted generated instalments."""
-    rows = _select("holding_transactions", ("trade_date",), "sip_mandate_id = %s AND deleted_at IS NULL", [mandate_id], order="trade_date")
+def mandate_installment_dates(m: Dict[str, Any]) -> List[datetime.date]:
+    """Trade dates of non-deleted rows that record this mandate's instalments: the ones it
+    generated, and SIP rows of the same fund in the same portfolio that were entered by hand
+    (no mandate tag) -- so a mandate described after its past instalments were typed in
+    never offers them a second time."""
+    rows = _select(
+        "holding_transactions", ("trade_date",),
+        "deleted_at IS NULL AND (sip_mandate_id = %s OR "
+        "(sip_mandate_id IS NULL AND txn_type = 'SIP' AND portfolio_id = %s AND scheme_code = %s))",
+        [m["id"], m["portfolio_id"], m["scheme_code"]], order="trade_date",
+    )
     return [r["trade_date"] for r in rows]
+
+
+def mandate_pauses(mandate_id: int) -> List[Tuple[datetime.date, Optional[datetime.date]]]:
+    """(paused_from, resumed_on) per pause; resumed_on is None while it is still paused."""
+    rows = _select("sip_mandate_pauses", ("paused_from", "resumed_on"), "mandate_id = %s", [mandate_id], order="paused_from, id")
+    return [(r["paused_from"], r["resumed_on"]) for r in rows]
+
+
+def record_pause(mandate_id: int, paused: bool, on: datetime.date) -> None:
+    """Opens a pause (paused=True) or closes the open one (paused=False)."""
+    with get_connection() as con:
+        if paused:
+            con.execute("INSERT INTO sip_mandate_pauses (mandate_id, paused_from) VALUES (%s, %s)", (mandate_id, on))
+        else:
+            con.execute("UPDATE sip_mandate_pauses SET resumed_on = GREATEST(paused_from, %s) "
+                        "WHERE mandate_id = %s AND resumed_on IS NULL", (on, mandate_id))
 
 
 def nav_on_or_after(scheme_code: int, on: datetime.date) -> Optional[Tuple[datetime.date, float]]:
@@ -361,8 +407,9 @@ def nav_on_or_after(scheme_code: int, on: datetime.date) -> Optional[Tuple[datet
 
 # --- Goals ---------------------------------------------------------------------------
 
-GOAL_COLUMNS = ("id", "name", "target_amount", "target_date", "inflation_pct", "notes", "archived", "created_at", "updated_at")
-GOAL_WRITABLE = ("name", "target_amount", "target_date", "inflation_pct", "notes", "archived")
+GOAL_COLUMNS = ("id", "name", "target_amount", "amount_as_of", "target_date", "inflation_pct", "notes", "archived",
+                "created_at", "updated_at")
+GOAL_WRITABLE = ("name", "target_amount", "amount_as_of", "target_date", "inflation_pct", "notes", "archived")
 
 
 def _goals(where: str = "", params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
@@ -526,6 +573,7 @@ BACKUP_TABLES: List[Tuple[str, Optional[str]]] = [
     ("holding_transactions", "id"),
     ("portfolio_targets", None),
     ("sip_mandates", "id"),
+    ("sip_mandate_pauses", "id"),
     ("goals", "id"),
     ("goal_portfolios", None),
     ("holding_alert_rules", "id"),

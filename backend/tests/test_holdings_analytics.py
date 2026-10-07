@@ -404,6 +404,49 @@ def test_each_position_says_where_its_one_day_move_starts(client):
     assert prev[1004] == ("2024-12-27", "2024-12-30")
 
 
+def test_earning_now_is_the_last_30_days_annualised_for_cash_and_debt_funds_only(client):
+    """What the money earns at today's rates: the NAV is already net of fees, so its last
+    30 days of growth, annualised, is the rate. An equity fund's month scaled to a year is
+    noise, so it gets none and is left out of the portfolio rate."""
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-06-03", units=100)
+    _add(client, portfolio_id=pid, scheme_code=1001, txn_type="BUY", trade_date="2024-06-03", units=100)
+    body = client.get(f"/api/holdings/portfolios/{pid}/summary").json()
+    pos = {p["scheme_code"]: p for p in body["positions"]}
+
+    # 31 Dec 2024 minus 30 days is Sunday 1 Dec: the window starts at Friday 29 Nov's NAV.
+    start, end = d(2024, 11, 29), d(2024, 12, 31)
+    rate = ((nav_on(1002, end) / nav_on(1002, start)) ** (365 / (end - start).days) - 1) * 100
+    liquid = pos[1002]
+    assert liquid["earning_now_from"] == "2024-11-29"
+    assert liquid["earning_now_pct"] == pytest.approx(rate, rel=1e-9)
+    assert liquid["earning_now_per_day"] == pytest.approx(liquid["current_value"] * rate / 100 / 365, rel=1e-9)
+    assert pos[1001]["earning_now_pct"] is None and pos[1001]["earning_now_per_day"] is None
+
+    k = body["kpis"]
+    assert k["earning_now_pct"] == pytest.approx(rate, rel=1e-9)          # the equity fund is not averaged in
+    assert k["earning_now_per_day"] == pytest.approx(liquid["earning_now_per_day"])
+    assert k["earning_now_coverage_pct"] == pytest.approx(liquid["weight_pct"])
+
+
+def test_a_fund_earning_less_than_another_in_its_category_is_flagged(client):
+    seed([(2004, "Slow Liquid Fund - Direct Plan - Growth", "Slow MF", "Income/Debt Oriented Schemes - Liquid Fund", "Direct", "Growth")],
+         {2004: [(day, 1000.0 + 0.10 * i) for i, day in enumerate(business_days(d(2023, 1, 2), d(2024, 12, 31)))]})
+    pid = _pf(client)
+    _add(client, portfolio_id=pid, scheme_code=1002, txn_type="BUY", trade_date="2024-06-03", units=100)
+    _add(client, portfolio_id=pid, scheme_code=2004, txn_type="BUY", trade_date="2024-06-03", units=100)
+    pos = {p["scheme_code"]: p for p in client.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"]}
+
+    fast, slow = pos[1002], pos[2004]
+    assert fast["earning_now_behind"] is None
+    # Same SEBI category although AMFI files them under different labels.
+    gap = fast["earning_now_pct"] - slow["earning_now_pct"]
+    assert gap > 0.25
+    assert slow["earning_now_behind"]["than"] == fast["display_name"]
+    assert slow["earning_now_behind"]["pp"] == pytest.approx(gap)
+    assert slow["earning_now_behind"]["rupees_per_year"] == pytest.approx(slow["current_value"] * gap / 100)
+
+
 def test_a_portfolio_with_one_nav_day_reports_no_day_change(client):
     """Bought today: there is no previous close to have moved from, and inventing one
     from the fund's own NAV history would credit a day the units were not held."""

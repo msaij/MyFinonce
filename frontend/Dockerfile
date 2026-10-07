@@ -1,63 +1,82 @@
 # syntax=docker/dockerfile:1
-FROM node:20-alpine
+#
+# Five stages. `check` and `build` both start from `deps` and BuildKit runs them in
+# parallel (with `prod-deps` alongside); the final `runner` copies a marker out of `check`,
+# so an image can only be produced when the type-check, lint and unit tests pass --
+# `docker compose up -d --build frontend` is the whole release step, and nothing
+# unchecked can be shipped by forgetting to run the tests first.
+#
+# What each stage keeps between builds (BuildKit cache mounts, not image layers):
+#   deps, prod-deps  npm's download cache          -> a lockfile change re-fetches only what changed
+#   check            tsc's .tsbuildinfo + ESLint's  -> only changed files are re-checked
+#   build            .next/cache (webpack/SWC)     -> only changed modules are recompiled
+# and the runner's node_modules layer is reused untouched until the lockfile changes, so a
+# code change exports only the new .next. Measured before this layout: 73s for any
+# one-line change -- 28s compiling from cold, 21s re-running the type-check and lint the
+# test step had just run, 8s of build tracing, 6.5s exporting a 1.14GB image.
 
+FROM node:20-alpine AS deps
 WORKDIR /app
-# .npmrc MUST be copied before package.json/npm install -- it carries the
-# fetch-timeout/fetch-retries tuning this environment needs (see below). It
-# was previously only copied via `COPY . .` AFTER npm install, silently
-# making every timeout/retry setting in it a no-op for the actual install.
-COPY .npmrc package.json ./
-# Cache mount persists npm's download cache across build attempts (keyed by
-# BuildKit, independent of image layers) -- added after this environment hit
-# repeated transient registry-connection stalls during Phase 2's dependency
-# install: some connections to the registry's CDN establish successfully but
-# then go silently dead (0 bytes, no RST/FIN) instead of erroring, so a short
-# fetch-timeout that gives up and retries fast matters more here than a long
-# one. With the cache mount, a retry only re-fetches what didn't complete.
-RUN --mount=type=cache,target=/root/.npm npm install
+ENV NEXT_TELEMETRY_DISABLED=1
+# .npmrc MUST be copied before the install -- it carries the fetch-timeout/fetch-retries
+# tuning this environment needs: some connections to the registry's CDN establish and then
+# go silently dead (0 bytes, no RST/FIN), so a short timeout that gives up and retries fast
+# matters more than a long one. `npm ci` installs exactly what package-lock.json pins (and
+# fails if it disagrees with package.json), so two builds of the same commit get the same
+# dependencies; `npm install` could quietly resolve newer versions within the ^ ranges.
+COPY .npmrc package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+# What the server needs at runtime: no compiler, linter or test runner.
+FROM node:20-alpine AS prod-deps
+WORKDIR /app
+COPY .npmrc package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+FROM deps AS check
 COPY . .
+# NODE_ENV stays unset here: React's production build has no act(), which every component
+# test renders through (vitest.config.ts pins NODE_ENV=test as well).
+RUN --mount=type=cache,target=/app/.next/cache,id=mf-frontend-check \
+    npx tsc --noEmit --tsBuildInfoFile .next/cache/tsconfig.tsbuildinfo \
+    && npx next lint \
+    && npx vitest run \
+    && touch /tmp/checks-passed
 
-# Production build, not the dev server (was `CMD ["npm", "run", "dev"]` for the
-# whole active-migration-development period -- fine while pages were being
-# built and iterated on many times an hour, but next dev's per-request
-# on-demand compilation/Fast-Refresh instrumentation adds massive latency to
-# every request once the app is actually being used: measured ~1.1s for an API
-# call proxied through `next dev`'s rewrite handling that takes ~25-50ms
-# against the backend directly, or through a production `next start`).
-# docker-compose.yml no longer bind-mounts source over this image -- a
-# production container runs what was baked in at build time; rebuild the
-# image after a code change instead of relying on live reload.
+FROM deps AS build
+COPY . .
 ENV NODE_ENV=production
-# BACKEND_URL must be a build-time ENV, not just a docker-compose.yml runtime
-# environment var: `next build` calls next.config.js's rewrites() once to
-# generate .next/routes-manifest.json, and `next start` replays that
-# manifest rather than re-invoking rewrites() -- so a value only set at
-# container-start time (docker-compose.yml's `environment:`) is invisible to
-# the build and silently falls back to next.config.js's localhost default,
-# which inside THIS container resolves to itself, not the backend service.
-# (Confirmed the hard way: every /api/* call 500'd after switching off next
-# dev, which evaluates rewrites() live and so never exposed this.) The
-# Compose network's service name is stable for this project's one deployment
-# shape, so it's hardcoded here rather than threaded through as a build ARG.
+# BACKEND_URL must be a build-time ENV, not a docker-compose.yml runtime var: `next build`
+# calls next.config.js's rewrites() once to write .next/routes-manifest.json, and the
+# server replays that manifest -- a value set only at container start is invisible to the
+# build and falls back to next.config.js's localhost default, which inside this container
+# is the container itself. (Every /api/* call 500'd the one time this was runtime-only.)
 ENV BACKEND_URL=http://backend:8000
-# Separate from BACKEND_URL above, and for a different reason: this one is read
-# IN THE BROWSER (any NEXT_PUBLIC_* var gets inlined into the client JS bundle
-# at this build step), which cannot resolve the Docker-internal hostname
-# `backend` at all -- it needs the same host-mapped port the browser's own
-# machine reaches this stack on (docker-compose.yml maps backend's 8000
-# straight through). Used only for the admin Activity Log's SSE connection,
-# to bypass `next start`'s own gzip compression of the proxied /api/* route --
-# gzip fundamentally breaks Server-Sent Events (each small event needs to
-# flush immediately; a compressor buffers until it has enough data, which for
-# a slow-trickle log stream may never come, so the browser's EventSource
-# receives nothing despite the backend sending real bytes -- confirmed
-# directly: curl against either origin gets every event immediately, but a
-# real browser EventSource against the proxied :3000 route got zero messages
-# with content-encoding: gzip on the response). The backend's CORSMiddleware
-# already allows http://localhost:3000 explicitly, so a direct cross-origin
-# connection from the browser works with no backend change needed.
+# Read IN THE BROWSER (NEXT_PUBLIC_* is inlined into the client bundle here), so it is the
+# host-mapped port, not the Docker-internal name. Used only by the admin Activity Log's SSE
+# stream, to bypass the Next server's gzip of proxied /api/* responses -- gzip buffers
+# small events until it has enough data, so EventSource through :3000 received nothing.
+# The backend's CORS already allows http://localhost:3000.
 ENV NEXT_PUBLIC_BACKEND_ORIGIN=http://localhost:8000
-RUN npm run build
+# The `check` stage has already type-checked and linted this exact source.
+ENV NEXT_SKIP_CHECKS=1
+RUN --mount=type=cache,target=/app/.next/cache,id=mf-frontend-build npm run build
 
+# A production server (`next start`), not `next dev`: dev's per-request compilation
+# measured ~1.1s for an API call that takes 25-50ms through a production server.
+# node_modules comes first so its layer is reused as-is until the lockfile changes.
+FROM node:20-alpine AS runner
+# Lets scripts/dev.ps1 prune this project's superseded images without touching any others.
+LABEL org.myfinonce.app=frontend
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY package.json next.config.js ./
+COPY --from=check /tmp/checks-passed /tmp/checks-passed
+COPY --from=build --chown=node:node /app/.next ./.next
+USER node
 EXPOSE 3000
-CMD ["npm", "run", "start"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --start-interval=1s --retries=3 \
+    CMD wget -qO /dev/null http://127.0.0.1:3000/ || exit 1
+CMD ["node", "node_modules/next/dist/bin/next", "start", "-p", "3000"]
