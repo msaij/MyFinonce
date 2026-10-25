@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Atom: several <link>s per entry. The article is rel="alternate"; enclosure and self
+     must not win just because they come last. -->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>MarketWire</title>
+  <entry>
+    <title>Nifty hits fresh record high above 26,000 led by banking shares</title>
+    <link rel="alternate" href="https://www.livemint.com/market/nifty-record-high-12345.html"/>
+    <link rel="enclosure" href="https://img.example.com/nifty.jpg" type="image/jpeg"/>
+    <link rel="self" href="https://feeds.example.com/entry/12345"/>
+    <id>tag:livemint.com,2026:nifty-record-12345</id>
+    <updated>2026-10-14T09:30:00Z</updated>
+    <summary>Indian benchmark indices surged on heavy FII buying in banking stocks.</summary>
+  </entry>
+  <entry>
+    <title>Rupee slips against the dollar</title>
+    <link href="https://www.livemint.com/market/rupee-slips-67890.html"/>
+    <id>tag:livemint.com,2026:rupee-67890</id>
+    <published>2026-10-14T08:00:00+05:30</published>
+    <updated>2026-10-14T11:00:00+05:30</updated>
+  </entry>
+</feed>

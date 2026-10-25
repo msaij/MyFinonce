@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shape of https://www.sebi.gov.in/sebirss.xml: "14 Oct, 2026 +0530" (a date, no time),
+     the title repeated as the description, and mostly enforcement notices. -->
+<rss version="2.0">
+  <channel>
+    <title>SEBI</title>
+    <item>
+      <title>SEBI issues framework for mutual fund stress testing disclosures</title>
+      <description>SEBI issues framework for mutual fund stress testing disclosures</description>
+      <link>https://www.sebi.gov.in/legal/circulars/oct-2026/sebi-issues-framework-for-mutual-fund-stress-testing_123.html</link>
+      <pubDate>14 Oct, 2026 +0530</pubDate>
+    </item>
+    <item>
+      <title>SEBI Teams win at IOSCO TechSprint 2026</title>
+      <description>SEBI Teams win at IOSCO TechSprint 2026</description>
+      <link>https://www.sebi.gov.in/media-and-notifications/press-releases/oct-2026/sebi-teams-win_124.html</link>
+      <pubDate>13 Oct, 2026 +0530</pubDate>
+    </item>
+    <item>
+      <title>Notice of attachment dated October 13,2026 issued against A Person under RC No. 7709 of 2024</title>
+      <description>Notice of attachment dated October 13,2026 issued against A Person under RC No. 7709 of 2024</description>
+      <link>https://www.sebi.gov.in/enforcement/recovery-proceedings/oct-2026/notice-of-attachment_125.html</link>
+      <pubDate>13 Oct, 2026 +0530</pubDate>
+    </item>
+  </channel>
+</rss>

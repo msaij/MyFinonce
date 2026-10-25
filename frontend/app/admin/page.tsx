@@ -1,0 +1,1072 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { FactorProxyEditor } from "@/components/admin/FactorProxyEditor";
+import { AppShell } from "@/components/layout/AppShell";
+import { StatCard } from "@/components/shared/StatCard";
+import { Banner } from "@/components/shared/Banner";
+import { StatusPill } from "@/components/layout/StatusPill";
+import { formatDate } from "@/lib/format";
+import { useLogStream } from "@/lib/hooks";
+import { ApiError, getAdminToken, setAdminToken } from "@/lib/api/client";
+import { getMetaStatus, getDataQuality } from "@/lib/api/meta";
+import {
+  getAdminStatus,
+  getVerification,
+  runFullRefresh,
+  triggerDailySync,
+  triggerTerSync,
+  recomputeSummary,
+  startTerBackfill,
+  stopTerBackfill,
+  startHistoricalBackfill,
+  stopHistoricalBackfill,
+  getBackfillChunkCount,
+  getTerBackfillMonthCount,
+  getLatestAudit,
+  runAudit,
+  type AuditCheck,
+  type SyncJobKind,
+  type SyncJobRecord,
+  type SyncJobStatus,
+} from "@/lib/api/admin";
+import { durationText, nextScheduledRun, refreshSteps, triggerText, untilText, whenText, type RefreshStep } from "@/lib/syncJobs";
+
+const EARLIEST_BACKFILL_YEAR = 2000;
+
+// Landing on "overview" (status/health at a glance), not the log -- an ops page should
+// answer "is everything OK?" before it shows a scrolling feed of everything that happened.
+const TABS = ["overview", "sync", "monitor", "reference"] as const;
+type Tab = (typeof TABS)[number];
+const TAB_LABELS: Record<Tab, string> = {
+  overview: "Overview",
+  sync: "Sync & Backfill",
+  monitor: "Activity Log",
+  reference: "Reference",
+};
+
+/** "Unauthorized" on its own leaves the reader stuck: the token box is right there at the
+ *  top of this page, and the value lives in the .env file beside docker-compose.yml. Say so. */
+function adminErrorText(error: unknown): string {
+  const err = error as ApiError;
+  if (err?.status === 401) {
+    return "Unauthorized: paste the admin token in the box at the top of this page and click Store token, then try again. It is ADMIN_TOKEN in the .env file beside docker-compose.yml, and it is remembered for this browser tab only.";
+  }
+  return err?.message ?? String(error);
+}
+
+function epochToStr(seconds: number | null): string {
+  if (!seconds) return "-";
+  return new Date(seconds * 1000).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+/** The last run of one sync kind: when, why, how long, and what it said. */
+function LastJobLine({ record }: { record: SyncJobRecord | null }) {
+  if (!record) return null;
+  return (
+    <p className="mt-2 text-xs" style={{ color: record.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>
+      <span style={{ color: "var(--mf-muted)" }}>
+        Last run {whenText(record.finished_at)} · {triggerText(record.trigger)} · {durationText(record.elapsed_seconds)}:{" "}
+      </span>
+      {record.message || (record.ok ? "done" : "failed")}
+    </p>
+  );
+}
+
+const JOB_ROWS: { kind: SyncJobKind; label: string; when: string }[] = [
+  { kind: "full", label: "Full refresh", when: "Nightly 00:05 IST: NAVs, plan/option, riskometer & AUM, TER, rebuild, audit" },
+  { kind: "nav", label: "NAV sync", when: "Evening 23:30 IST: the day's NAVs" },
+  { kind: "ter", label: "TER sync", when: "On startup: this month's official TER" },
+  { kind: "catchup", label: "Catch-up", when: "Hourly, only when a scheduled run was missed" },
+];
+
+/** Each sync kind's last run, from records kept in the database -- so, unlike the in-memory
+ *  counters this replaces, a restart does not wipe it back to "None yet". */
+function SyncHistoryTable({ job }: { job: SyncJobStatus }) {
+  const cell = "px-3 py-2 align-top";
+  return (
+    <div className="mt-3 overflow-x-auto rounded-xl border" style={{ borderColor: "var(--mf-border)" }}>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs" style={{ color: "var(--mf-muted)" }}>
+            <th className={cell}>Job</th>
+            <th className={cell}>Last run</th>
+            <th className={cell}>Took</th>
+            <th className={cell}>Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          {JOB_ROWS.map(({ kind, label, when }) => {
+            const r = job.last[kind];
+            const running = job.is_running && job.kind === kind;
+            return (
+              <tr key={kind} className="border-t" style={{ borderColor: "var(--mf-border)" }}>
+                <td className={cell} style={{ minWidth: 190 }}>
+                  <div className="font-semibold">{label}</div>
+                  <div className="text-xs" style={{ color: "var(--mf-muted)" }}>{when}</div>
+                </td>
+                <td className={`${cell} whitespace-nowrap`}>
+                  {running ? (
+                    <StatusPill label="Running now" level="neutral" />
+                  ) : r ? (
+                    <>
+                      {whenText(r.finished_at)}
+                      <div className="text-xs" style={{ color: "var(--mf-muted)" }}>{triggerText(r.trigger)}</div>
+                    </>
+                  ) : (
+                    <span style={{ color: "var(--mf-muted)" }}>Not run yet</span>
+                  )}
+                </td>
+                <td className={`${cell} whitespace-nowrap`}>{running ? whenText(job.started_at) : r ? durationText(r.elapsed_seconds) : ""}</td>
+                <td className={cell} style={{ minWidth: 260 }}>
+                  {running ? (
+                    <span className="text-xs">{job.step || "Starting"}…</span>
+                  ) : r ? (
+                    <span className="text-xs" style={{ color: r.ok ? "var(--mf-fg)" : "var(--mf-danger)" }}>
+                      {r.ok ? "" : "Failed: "}
+                      {r.message || (r.ok ? "Done" : "no detail")}
+                    </span>
+                  ) : null}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** The last full refresh, step by step. The run counts as a success once its NAVs land, so
+ *  this is the only place a failed enrichment step (riskometer, AUM, plan/option) shows. */
+function RefreshStepList({ steps }: { steps: RefreshStep[] }) {
+  if (!steps.length) return null;
+  return (
+    <ul className="mt-3 flex flex-col gap-1.5">
+      {steps.map((s) => (
+        <li key={s.name} className="flex flex-wrap items-baseline gap-x-3 text-xs">
+          <span className="flex-none" style={{ width: 92 }}>
+            <StatusPill label={s.ok ? "OK" : "Problem"} level={s.ok ? "success" : "danger"} />
+          </span>
+          <span className="flex-none font-semibold" style={{ width: 200 }}>{s.name}</span>
+          <span className="flex-1" style={{ color: s.ok ? "var(--mf-muted)" : "var(--mf-danger)", minWidth: 220 }}>{s.text}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const pct = (part: number, whole: number) => `${((part / Math.max(1, whole)) * 100).toFixed(1)}%`;
+
+function auditPill(check: AuditCheck): { label: string; level: "success" | "warning" | "danger" | "neutral" } {
+  if (check.status === "error") return { label: "Check failed", level: "danger" };
+  if (check.status === "not_run") return { label: "Not run yet", level: "neutral" };
+  if (check.status === "pass") return { label: "Pass", level: "success" };
+  if (check.severity === "error") return { label: "Error", level: "danger" };
+  if (check.severity === "warning") return { label: "Warning", level: "warning" };
+  return { label: "Info", level: "neutral" };
+}
+
+function auditValue(v: unknown): string {
+  if (v === null || v === undefined || v === "") return "—";
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  if (typeof v === "number") return v.toLocaleString("en-IN", { maximumFractionDigits: 4 });
+  return String(v);
+}
+
+/** `detail` carries the check's context (the TER ceiling used, how many segregated
+ *  portfolios were set aside, why a check could not run). Shown as plain text, since the
+ *  keys differ by check. */
+function auditDetailText(detail: Record<string, unknown> | null): string {
+  if (!detail) return "";
+  if (typeof detail.reason === "string") return detail.reason;
+  return Object.entries(detail)
+    .filter(([, v]) => v !== null && typeof v !== "object")
+    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${auditValue(v)}`)
+    .join(" · ");
+}
+
+function AuditCheckRow({ check }: { check: AuditCheck }) {
+  const [open, setOpen] = useState(false);
+  const pill = auditPill(check);
+  // A failing error check, or a check that could not run at all, gets a red band: the
+  // point of the panel is that neither can be scrolled past unnoticed.
+  const loud = (check.severity === "error" && check.status === "flagged") || check.status === "error";
+  const detailText = auditDetailText(check.detail);
+  const shown = check.samples.length;
+  return (
+    <div
+      className="border-b py-2.5"
+      style={{
+        borderColor: "var(--mf-border)",
+        ...(loud ? { background: "var(--mf-danger-bg)", borderLeft: "3px solid var(--mf-danger)", paddingLeft: 10, paddingRight: 10 } : {}),
+      }}
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="flex-none" style={{ width: 118 }}>
+          <StatusPill label={pill.label} level={pill.level} />
+        </span>
+        <span className="flex-1 text-sm font-semibold" style={{ minWidth: 200 }}>
+          {check.title}
+        </span>
+        <span className="flex-none font-mono text-sm font-semibold" style={{ color: loud ? "var(--mf-danger)" : "var(--mf-fg)" }}>
+          {check.count === null ? "—" : check.count.toLocaleString("en-IN")}
+        </span>
+      </div>
+      <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+        {check.description}
+        {detailText && <span className="block mt-0.5">{detailText}</span>}
+      </p>
+      {shown > 0 && (
+        <button type="button" onClick={() => setOpen(!open)} className="mt-1 text-xs font-semibold" style={{ color: "var(--mf-accent)" }}>
+          {open ? "Hide rows" : check.count !== null && check.count > shown ? `Show first ${shown} of ${check.count.toLocaleString("en-IN")} rows` : `Show ${shown} row${shown === 1 ? "" : "s"}`}
+        </button>
+      )}
+      {open && (
+        <ul className="mt-2 flex flex-col gap-1.5">
+          {check.samples.map((s, i) => (
+            <li key={i} className="rounded-lg border px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}>
+              {s.scheme_code !== null && !s.label.startsWith("(no scheme row)") ? (
+                <Link href={`/scheme/${s.scheme_code}`} className="font-semibold" style={{ color: "var(--mf-accent)" }}>
+                  {s.label}
+                </Link>
+              ) : (
+                <span className="font-semibold">{s.label}</span>
+              )}
+              <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5" style={{ color: "var(--mf-muted)" }}>
+                {Object.entries(s.values).map(([k, v]) => (
+                  <span key={k}>
+                    {k.replace(/_/g, " ")}: <span className="font-mono" style={{ color: "var(--mf-fg)" }}>{auditValue(v)}</span>
+                  </span>
+                ))}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function DataAuditPanel() {
+  const queryClient = useQueryClient();
+  const { data: audit, isError, error } = useQuery({ queryKey: ["data-audit"], queryFn: getLatestAudit });
+  const runMut = useMutation({
+    mutationFn: runAudit,
+    onSuccess: (run) => queryClient.setQueryData(["data-audit"], run),
+  });
+  const summary = audit?.summary;
+  const errorChecks = audit?.checks.filter((c) => c.severity === "error").length ?? 0;
+  const failing = (summary?.errors ?? 0) + (summary?.check_failures ?? 0);
+
+  return (
+    <>
+      <div className="mt-8 flex flex-wrap items-end justify-between gap-3 border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+        <div>
+          <h3 className="text-base font-bold">Data audit</h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Row-level checks that name the specific rows which contradict themselves or break a hard rule. Errors must be zero; warnings need a look.
+            {audit && !audit.empty && audit.run_at &&
+              ` Last run ${new Date(audit.run_at).toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}` +
+                ` (${audit.trigger}), ${audit.checks.length} checks in ${((audit.elapsed_ms ?? 0) / 1000).toFixed(1)}s.`}
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={runMut.isPending}
+          onClick={() => runMut.mutate()}
+          className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+          style={{ background: "var(--mf-accent)", color: "white" }}
+        >
+          {runMut.isPending ? "Auditing…" : "Run audit now"}
+        </button>
+      </div>
+      {runMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(runMut.error)}</p>}
+      {isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(error)}</p>}
+      {audit?.empty && (
+        <div className="mt-3">
+          <Banner level="info">No audit has been stored yet. Run one now to see which rows, if any, are contradictory.</Banner>
+        </div>
+      )}
+      {audit && !audit.empty && summary && (
+        <>
+          <div className="mt-3">
+            {failing > 0 ? (
+              <Banner level="danger">
+                <b>
+                  {summary.errors > 0 && `${summary.errors} of ${errorChecks} error check${errorChecks === 1 ? "" : "s"} failed`}
+                  {summary.errors > 0 && summary.check_failures > 0 && " and "}
+                  {summary.check_failures > 0 && `${summary.check_failures} check${summary.check_failures === 1 ? "" : "s"} could not run`}
+                </b>
+                {summary.errors > 0 && ` -- ${summary.error_rows.toLocaleString("en-IN")} row(s) in the database are wrong. Open the red rows below to see which.`}
+              </Banner>
+            ) : (
+              <div className="mf-banner" style={{ background: "var(--mf-success-bg)", borderColor: "var(--mf-success)" }}>
+                <b style={{ color: "var(--mf-success)" }}>All {errorChecks} error checks pass.</b>{" "}
+                {summary.warnings > 0
+                  ? `${summary.warnings} warning check${summary.warnings === 1 ? "" : "s"} flagged rows worth a look.`
+                  : "No warnings either."}
+              </div>
+            )}
+          </div>
+          <div className="mt-3 rounded-xl border px-3" style={{ borderColor: "var(--mf-border)" }}>
+            {audit.checks.map((c) => (
+              <AuditCheckRow key={c.name} check={c} />
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+export default function DataManagementPage() {
+  const queryClient = useQueryClient();
+  const { data: status, isFetching } = useQuery({
+    queryKey: ["admin-status"],
+    queryFn: getAdminStatus,
+    refetchInterval: 5000,
+  });
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["admin-status"] });
+
+  const [activeTab, setActiveTab] = useState<Tab>("overview");
+  const [logLevel, setLogLevel] = useState<"INFO" | "WARNING" | "ERROR">("INFO");
+  const [logFilter, setLogFilter] = useState("");
+  const { entries: logEntries, connected: logConnected } = useLogStream(logLevel, logFilter);
+
+  // Defaults to 2015, not the engine's own 2020 default -- matches what's actually wanted
+  // for the very first backfill after a data reset, without forcing a re-type every time.
+  const [backfillStartYear, setBackfillStartYear] = useState(2015);
+  // TER backfill's "Since [year]" -- mirrors the NAV backfill's flexible start-year input
+  // above instead of only offering fixed 12-months/FY2018-19 presets. Same default (2015)
+  // and floor (EARLIEST_BACKFILL_YEAR, 2000) as the NAV engine now, by request ("same
+  // flexibility as AMFI") -- AMFI's TER-disclosure portal itself only actually has data
+  // back to FY2018-19 (still stated in the copy below), so a year before that just means
+  // the older requested months come back empty, not an error; this input no longer
+  // pretends the portal's own limit is this control's limit too.
+  const [terStartYear, setTerStartYear] = useState(2015);
+  const { data: terMonthCountData } = useQuery({
+    queryKey: ["ter-month-count", terStartYear],
+    queryFn: () => getTerBackfillMonthCount(terStartYear),
+    enabled: terStartYear >= EARLIEST_BACKFILL_YEAR && terStartYear <= new Date().getFullYear(),
+  });
+  const { data: chunkCountData } = useQuery({
+    queryKey: ["backfill-chunk-count", backfillStartYear],
+    queryFn: () => getBackfillChunkCount(backfillStartYear),
+    enabled: backfillStartYear >= EARLIEST_BACKFILL_YEAR && backfillStartYear <= new Date().getFullYear(),
+  });
+
+  const fullRefreshMut = useMutation({ mutationFn: runFullRefresh, onSuccess: invalidate });
+  const dailySyncMut = useMutation({ mutationFn: triggerDailySync, onSuccess: invalidate });
+  const terSyncMut = useMutation({ mutationFn: triggerTerSync, onSuccess: invalidate });
+  const recomputeMut = useMutation({ mutationFn: recomputeSummary, onSuccess: invalidate });
+  const startTerBackfillMut = useMutation({ mutationFn: (n: number) => startTerBackfill(n), onSuccess: invalidate });
+  const stopTerBackfillMut = useMutation({ mutationFn: stopTerBackfill, onSuccess: invalidate });
+  const startHistBackfillMut = useMutation({ mutationFn: (v: { year: number; max?: number; resume?: boolean }) => startHistoricalBackfill(v.year, v.max, v.resume ?? true), onSuccess: invalidate });
+  const stopHistBackfillMut = useMutation({ mutationFn: stopHistoricalBackfill, onSuccess: invalidate });
+
+  const stats = status?.stats;
+  // Every sync -- nightly, catch-up or a button here -- runs as one tracked job at a time.
+  const job = status?.sync_job;
+  const lastFull = job?.last.full ?? null;
+  const busy = !!job?.is_running;
+  const busyText = busy ? `${job?.label} (${triggerText(job?.trigger)}) is running` : "";
+  // The refresh ends by auditing the data it just wrote; re-read the stored audit and the
+  // checks when one finishes rather than polling for them.
+  const refreshFinishedAt = lastFull?.finished_at;
+  useEffect(() => {
+    if (!refreshFinishedAt) return;
+    queryClient.invalidateQueries({ queryKey: ["data-audit"] });
+    queryClient.invalidateQueries({ queryKey: ["verification"] });
+    queryClient.invalidateQueries({ queryKey: ["data-quality"] });
+  }, [refreshFinishedAt, queryClient]);
+  const cov = status?.cost_coverage;
+  const live = status?.live_coverage;
+  const steps = refreshSteps(lastFull?.result);
+  const stepProblems = steps.filter((s) => !s.ok && s.name !== "Data audit").length;
+  // The same query DataAuditPanel reads, so the at-a-glance card and the panel agree.
+  const { data: audit } = useQuery({ queryKey: ["data-audit"], queryFn: getLatestAudit });
+  const auditFailing = audit && !audit.empty ? (audit.summary?.errors ?? 0) + (audit.summary?.check_failures ?? 0) : 0;
+  // For "next run in 3 h"; a minute's resolution is plenty.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, []);
+  const nextRun = nextScheduledRun(now);
+  // Asked of the backend, like NAV's chunk count, rather than estimated here. The estimate
+  // this replaces was wrong twice over: a stray constant made "since 2026" read as 18
+  // months for a nine-month span, and it ignored AMFI's 2018 floor, so "since 2015"
+  // claimed 150 months when only 105 exist.
+  const terMonths = terMonthCountData?.total_months ?? 0;
+  // Durable, unlike backfill_status.records_added, which resets with every run.
+  // Optional-chained because a database created before the checkpoint table existed
+  // returns no progress block until the next /status call after init_db() runs.
+  const completedChunks = status?.backfill_progress?.completed_chunks ?? 0;
+  const { data: meta } = useQuery({ queryKey: ["meta-status"], queryFn: getMetaStatus });
+  const { data: quality } = useQuery({ queryKey: ["data-quality"], queryFn: getDataQuality });
+  const { data: verification } = useQuery({ queryKey: ["verification"], queryFn: getVerification });
+  const [adminTokenInput, setAdminTokenInput] = useState("");
+  const authRequired = meta?.flags?.admin_auth_required === true;
+  const tokenConfigured = meta?.flags?.admin_token_configured === true;
+
+  return (
+    <AppShell>
+      <h1 className="mf-page-title">Data Management & AMFI Synchronization</h1>
+      <p className="mf-page-caption">Monitor sync health, database storage, and official TER coverage -- and trigger on-demand sync from official AMFI portals.</p>
+      {authRequired && !tokenConfigured && (
+        <div className="mt-3">
+          <Banner level="warning">Set ADMIN_TOKEN in .env (see .env.example). Writes fail closed until it is configured.</Banner>
+        </div>
+      )}
+      {authRequired && (
+        <div className="mt-3 flex items-end gap-2">
+          <label className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+            Admin token (session only)
+            <input
+              type="password"
+              value={adminTokenInput || getAdminToken() || ""}
+              onChange={(e) => setAdminTokenInput(e.target.value)}
+              className="rounded-lg border px-2 py-1.5 text-sm"
+              style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+            />
+          </label>
+          <button
+            type="button"
+            className="rounded-lg px-3 py-2 text-xs font-semibold"
+            style={{ background: "var(--mf-accent)", color: "white" }}
+            onClick={() => setAdminToken(adminTokenInput)}
+          >
+            Store token
+          </button>
+        </div>
+      )}
+
+      <div className="mt-6 flex flex-wrap gap-1.5 border-b pb-2" style={{ borderColor: "var(--mf-border)" }}>
+        {TABS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setActiveTab(t)}
+            className="rounded-full px-3 py-1.5 text-xs font-semibold"
+            style={{ background: activeTab === t ? "var(--mf-accent-bg)" : "transparent", color: activeTab === t ? "var(--mf-accent)" : "var(--mf-fg)" }}
+          >
+            {TAB_LABELS[t]}
+          </button>
+        ))}
+        {isFetching && (
+          <span className="ml-auto self-center text-xs" style={{ color: "var(--mf-muted)" }}>
+            Refreshing...
+          </span>
+        )}
+      </div>
+
+      {job?.is_running && (
+        <div className="mt-4">
+          <Banner level="info">
+            <b>{job.label}</b> is running ({triggerText(job.trigger)}), started {whenText(job.started_at)} · {job.step || "Starting"}… It runs in the
+            background; you can leave this page. Other syncs wait until it finishes.
+          </Banner>
+        </div>
+      )}
+
+      {activeTab === "overview" && status && stats && cov && live && job && (
+        <div className="mt-4">
+          <h3 className="text-base font-bold">At a glance</h3>
+          <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {status.staleness.is_stale ? (
+              <StatCard title="NAV data" value="Sync pending" sub={`Have ${formatDate(status.staleness.current_max_date ?? "")}, AMFI has ${formatDate(status.staleness.expected_date ?? "")}`} tone="warn" />
+            ) : (
+              <StatCard title="NAV data" value="Up to date" sub={`Through ${status.staleness.current_max_date ? formatDate(status.staleness.current_max_date) : "-"}, AMFI's latest`} tone="pos" />
+            )}
+            <StatCard
+              title="Last full refresh"
+              value={lastFull ? whenText(lastFull.finished_at) : "Not run yet"}
+              sub={
+                !lastFull
+                  ? "Runs nightly at 00:05 IST"
+                  : !lastFull.ok
+                    ? `Failed (${triggerText(lastFull.trigger)}), see Sync history`
+                    : stepProblems
+                      ? `${stepProblems} step${stepProblems === 1 ? "" : "s"} had a problem, see below`
+                      : `${triggerText(lastFull.trigger)} · took ${durationText(lastFull.elapsed_seconds)}`
+              }
+              tone={!lastFull ? "" : !lastFull.ok ? "neg" : stepProblems ? "warn" : "pos"}
+            />
+            <StatCard
+              title="Data audit"
+              value={!audit || audit.empty ? "Not run yet" : auditFailing ? `${auditFailing} check${auditFailing === 1 ? "" : "s"} failing` : "All clear"}
+              sub={
+                audit && !audit.empty
+                  ? `${auditFailing ? `${(audit.summary?.error_rows ?? 0).toLocaleString("en-IN")} rows · ` : ""}${audit.run_at ? formatDate(audit.run_at) : ""} (${triggerText(audit.trigger)})`
+                  : "Row-level checks, below"
+              }
+              tone={!audit || audit.empty ? "" : auditFailing ? "neg" : "pos"}
+            />
+            <StatCard
+              title="Database"
+              value={`${(Number(stats.file_size_mb) / 1024).toFixed(1)} GB`}
+              sub={`${stats.nav_count.toLocaleString("en-IN")} NAVs since ${stats.min_date ? formatDate(stats.min_date) : "-"}`}
+            />
+          </div>
+          <p className="mt-3 text-xs" style={{ color: status.enable_sync_daemon ? "var(--mf-muted)" : "var(--mf-danger)" }}>
+            {status.enable_sync_daemon
+              ? `Background sync is on. Next: ${nextRun.label} at ${new Date(nextRun.at * 1000).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST (${untilText(nextRun.at, now)}). An hourly check catches up any run that was missed.`
+              : "Background sync is off (ENABLE_SYNC_DAEMON), so the data only changes when you sync from the Sync & Backfill tab."}
+          </p>
+
+          {(status.ter_backfill_status.is_running || status.backfill_status.is_running) && (
+            <div className="mt-4">
+              <Banner level="info">
+                A backfill is running in the background --
+                {status.backfill_status.is_running && ` NAV chunk ${status.backfill_status.current_chunk_idx}/${status.backfill_status.total_chunks}`}
+                {status.backfill_status.is_running && status.ter_backfill_status.is_running && " and"}
+                {status.ter_backfill_status.is_running && ` TER month ${status.ter_backfill_status.current_month_idx}/${status.ter_backfill_status.total_months}`}
+                . See the Sync & Backfill tab for progress and stop controls.
+              </Banner>
+            </div>
+          )}
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Coverage of live schemes
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Counted over the {live.live_schemes.toLocaleString("en-IN")} schemes still publishing NAVs. The other{" "}
+            {(live.listed_schemes - live.live_schemes).toLocaleString("en-IN")} of {live.listed_schemes.toLocaleString("en-IN")} ever listed have matured,
+            merged or wound up and can never carry a current TER or riskometer (over all of them, official TER would read {pct(cov.ter_official, cov.total_schemes)}).
+            {cov.ter_legacy > 0 && ` ${cov.ter_legacy.toLocaleString("en-IN")} schemes still carry an unverified legacy TER.`}
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <StatCard
+              title="Official TER"
+              value={pct(live.ter_official, live.live_schemes)}
+              sub={`${live.ter_official.toLocaleString("en-IN")} of ${live.live_schemes.toLocaleString("en-IN")} · AMFI TER portal`}
+              tone={live.ter_official / Math.max(1, live.live_schemes) >= 0.95 ? "pos" : "warn"}
+            />
+            <StatCard
+              title="Riskometer"
+              value={pct(live.riskometer, live.live_schemes)}
+              sub={`${live.riskometer.toLocaleString("en-IN")} of ${live.live_schemes.toLocaleString("en-IN")}${live.riskometer_as_of ? ` · as of ${formatDate(live.riskometer_as_of)}` : ""}`}
+              tone={live.riskometer / Math.max(1, live.live_schemes) >= 0.9 ? "pos" : "warn"}
+            />
+            {live.unknown_plan != null && (
+              <StatCard
+                title="Plan confirmed"
+                value={pct(live.live_schemes - live.unknown_plan, live.live_schemes)}
+                sub={`${live.unknown_plan.toLocaleString("en-IN")} with no Direct/Regular from AMFI`}
+                tone={live.unknown_plan / Math.max(1, live.live_schemes) <= 0.05 ? "pos" : "warn"}
+              />
+            )}
+            {live.unknown_option != null && (
+              <StatCard
+                title="Option confirmed"
+                value={pct(live.live_schemes - live.unknown_option, live.live_schemes)}
+                sub={`${live.unknown_option.toLocaleString("en-IN")} with no Growth/IDCW from AMFI`}
+                tone={live.unknown_option / Math.max(1, live.live_schemes) <= 0.05 ? "pos" : "warn"}
+              />
+            )}
+          </div>
+          {/* Info findings restate the cards above; only warnings add something. */}
+          {verification && verification.findings.some((f) => f.level === "warning") && (
+            <div className="mt-3 flex flex-col gap-2">
+              {verification.findings
+                .filter((f) => f.level === "warning")
+                .map((f, i) => (
+                  <Banner key={i} level="warning">{f.text}</Banner>
+                ))}
+            </div>
+          )}
+
+          <DataAuditPanel />
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Sync history
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Each job&apos;s last run, whether scheduled, started by you or caught up after a missed run. Kept in the database, so it survives restarts.
+          </p>
+          <SyncHistoryTable job={job} />
+          {lastFull && steps.length > 0 && (
+            <div className="mt-4">
+              <div className="text-sm font-semibold">
+                Last full refresh, step by step{" "}
+                <span className="text-xs font-normal" style={{ color: "var(--mf-muted)" }}>
+                  ({whenText(lastFull.finished_at)}, {triggerText(lastFull.trigger)})
+                </span>
+              </div>
+              <RefreshStepList steps={steps} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === "sync" && status && (
+        <div className="mt-4">
+          <div className="filter-box">
+            <div className="text-sm font-semibold">Full refresh (recommended)</div>
+            <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+              Today&apos;s NAVs, then the plan/option resolution those NAVs make possible, then this month&apos;s official TER, then one
+              rebuild of the performance table. That order matters: TER matching reads a scheme&apos;s plan to decide which of AMFI&apos;s
+              two disclosed expense ratios belongs to it. It runs by itself every night at 00:05; if the machine was off then, it runs at
+              the next start or hourly check.
+            </p>
+            <button
+              type="button"
+              disabled={fullRefreshMut.isPending || busy}
+              title={busy ? busyText : undefined}
+              onClick={() => fullRefreshMut.mutate()}
+              className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+              style={{ background: "var(--mf-accent)", color: "white" }}
+            >
+              {job?.is_running && job.kind === "full" ? "Refreshing…" : "Run full refresh"}
+            </button>
+            {busy && job?.kind !== "full" && <p className="mt-2 text-xs" style={{ color: "var(--mf-muted)" }}>Waiting: {busyText}.</p>}
+            {fullRefreshMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(fullRefreshMut.error)}</p>}
+            {lastFull && !(job?.is_running && job.kind === "full") && (
+              <div className="mt-3 text-xs">
+                <div className="font-semibold">
+                  Last run {whenText(lastFull.finished_at)} · {triggerText(lastFull.trigger)} · took {durationText(lastFull.elapsed_seconds)}
+                  {lastFull.result?.filled ? ` · filled ${lastFull.result.filled.toLocaleString("en-IN")} NAVs for missed days` : ""}
+                </div>
+                <ul className="mt-1 flex flex-col gap-1">
+                  {lastFull.result?.nav ? (
+                    <li style={{ color: lastFull.result.nav.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>NAV: {lastFull.result.nav.message}</li>
+                  ) : (
+                    <li style={{ color: lastFull.ok ? "var(--mf-success)" : "var(--mf-danger)" }}>{lastFull.message}</li>
+                  )}
+                  {lastFull.result?.resolve && (
+                    <li style={{ color: "var(--mf-muted)" }}>
+                      Plans:{" "}
+                      {lastFull.result.resolve.ok
+                        ? `${lastFull.result.resolve.resolved?.toLocaleString("en-IN")} schemes identified, ${lastFull.result.resolve.plan_changed} plan(s) corrected, ${lastFull.result.resolve.option_changed} option(s) filled`
+                        : lastFull.result.resolve.reason}
+                    </li>
+                  )}
+                  {lastFull.result?.ter && (
+                    <li style={{ color: lastFull.result.ter.ok ? "var(--mf-success)" : "var(--mf-warning)" }}>TER: {lastFull.result.ter.message}</li>
+                  )}
+                </ul>
+              </div>
+            )}
+          </div>
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Individual actions
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+            The same steps one at a time, for when only one source needs re-running.
+          </p>
+          <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div className="filter-box">
+              <div className="text-sm font-semibold">Trigger Live AMFI Sync</div>
+              <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Downloads the latest official closing NAV file from AMFI, updates the database, and re-materializes all performance metrics.
+              </p>
+              <button
+                type="button"
+                disabled={dailySyncMut.isPending || busy}
+                title={busy ? busyText : undefined}
+                onClick={() => dailySyncMut.mutate()}
+                className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-accent)", color: "white" }}
+              >
+                {job?.is_running && job.kind === "nav" ? "Syncing…" : "Start Daily NAV Sync Now"}
+              </button>
+              {dailySyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(dailySyncMut.error)}</p>}
+              <LastJobLine record={job?.last.nav ?? null} />
+            </div>
+            <div className="filter-box">
+              <div className="text-sm font-semibold">Trigger Official TER Sync</div>
+              <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Fetches this month&apos;s official TER disclosure from AMFI&apos;s TER portal and promotes matched schemes to &quot;official&quot; status.
+              </p>
+              <button
+                type="button"
+                disabled={terSyncMut.isPending || busy}
+                title={busy ? busyText : undefined}
+                onClick={() => terSyncMut.mutate()}
+                className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-accent)", color: "white" }}
+              >
+                {job?.is_running && job.kind === "ter" ? "Syncing…" : "Sync Official TER Now"}
+              </button>
+              {terSyncMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(terSyncMut.error)}</p>}
+              <LastJobLine record={job?.last.ter ?? null} />
+            </div>
+            <div className="filter-box">
+              <div className="text-sm font-semibold">Re-materialize Performance Table</div>
+              <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Recomputes all 1D/7D/30D/90D/1Y returns, 52-week High/Low, and asset-class summaries across all {(stats?.schemes_count ?? 0).toLocaleString("en-IN")} schemes.
+                This already runs by itself at the end of every sync and every backfill (and every 10th chunk of a long one), so it is here for a manual
+                repair, not routine use.
+                {quality?.summary_table_built_at ? ` Last rebuilt ${formatDate(quality.summary_table_built_at)}.` : ""}
+              </p>
+              <button
+                type="button"
+                disabled={recomputeMut.isPending || busy}
+                title={busy ? busyText : undefined}
+                onClick={() => recomputeMut.mutate()}
+                className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
+              >
+                {recomputeMut.isPending ? "Recomputing..." : "Recompute Summary Table"}
+              </button>
+              {recomputeMut.isSuccess && <p className="mt-2 text-xs" style={{ color: "var(--mf-success)" }}>{recomputeMut.data.message}</p>}
+            </div>
+          </div>
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Historical TER Backfill
+          </h3>
+          <p className="mt-1 text-sm" style={{ color: "var(--mf-muted)" }}>
+            The daily/startup TER sync only ever covers the current calendar month. AMFI&apos;s portal reaches back to FY2018-19 -- use this to pull in
+            older months on demand, in the background. Pages of each month now fetch concurrently, so a busy ~20,000-row month takes roughly a sixth of
+            the time a fully sequential fetch would.
+          </p>
+          {status.ter_backfill_status.is_running ? (
+            <div className="mt-3">
+              <Banner level={status.ter_backfill_status.should_stop ? "warning" : "info"}>
+                {status.ter_backfill_status.should_stop ? (
+                  <>
+                    <b>Stopping</b> -- finishing month {status.ter_backfill_status.current_month_idx} of {status.ter_backfill_status.total_months} (
+                    {status.ter_backfill_status.current_month_str}), then halting. This can take up to a minute or so on a large month.
+                  </>
+                ) : (
+                  <>
+                    TER Backfill In Progress: month {status.ter_backfill_status.current_month_idx} of {status.ter_backfill_status.total_months} (
+                    {status.ter_backfill_status.current_month_str})
+                  </>
+                )}
+              </Banner>
+              {status.ter_backfill_status.last_error && <div className="mt-2"><Banner level="warning">Note: {status.ter_backfill_status.last_error}</Banner></div>}
+              <button
+                type="button"
+                disabled={status.ter_backfill_status.should_stop || stopTerBackfillMut.isPending}
+                onClick={() => stopTerBackfillMut.mutate()}
+                className="mt-2 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-danger)", color: "white" }}
+              >
+                {status.ter_backfill_status.should_stop ? "Stopping..." : "Stop TER Backfill"}
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {status.ter_backfill_status.finished_at && <Banner level="info">TER backfill session completed at {epochToStr(status.ter_backfill_status.finished_at)}.</Banner>}
+              <button
+                type="button"
+                disabled={busy}
+                title={busy ? busyText : undefined}
+                onClick={() => startTerBackfillMut.mutate(12)}
+                className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-accent)", color: "white" }}
+              >
+                Backfill Last 12 Months of TER
+              </button>
+              <div className="flex items-center gap-2 rounded-lg border px-2 py-1" style={{ borderColor: "var(--mf-border)" }}>
+                <label className="text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+                  Since
+                </label>
+                <input
+                  type="number"
+                  min={EARLIEST_BACKFILL_YEAR}
+                  max={new Date().getFullYear()}
+                  value={terStartYear}
+                  onChange={(e) => setTerStartYear(Number(e.target.value))}
+                  className="w-20 rounded border px-2 py-1 text-sm"
+                  style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+                />
+                <button
+                  type="button"
+                  disabled={!terMonths || busy}
+                  title={busy ? busyText : undefined}
+                  onClick={() => startTerBackfillMut.mutate(terMonths)}
+                  className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                  style={{ background: "var(--mf-accent)", color: "white" }}
+                >
+                  Start TER Backfill Since {terStartYear} ({terMonths || "…"} months)
+                </button>
+              </div>
+              {terMonthCountData?.oldest_month && (
+                <p className="w-full text-xs" style={{ color: "var(--mf-muted)" }}>
+                  Covers {terMonthCountData.oldest_month} to {terMonthCountData.newest_month}.
+                  {terStartYear < 2018 && " AMFI's portal holds nothing before 2018, so an earlier year fetches the same months."}
+                </p>
+              )}
+            </div>
+          )}
+          {startTerBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(startTerBackfillMut.error)}</p>}
+
+          <h3 className="mt-8 text-base font-bold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Multi-Year Historical Backfill Engine
+          </h3>
+          <p className="mt-1 text-sm" style={{ color: "var(--mf-muted)" }}>
+            AMFI limits each individual HTTP download to 90 days at a time. This pipeline divides the timeline from a chosen start year to present into
+            89-day chunks, downloads them in reverse-chronological order, and bulk-ingests them in the background -- pick how far back below.
+          </p>
+          {status.backfill_status.is_running ? (
+            <div className="mt-3">
+              <Banner level={status.backfill_status.should_stop ? "warning" : "info"}>
+                {status.backfill_status.should_stop ? (
+                  <>
+                    <b>Stopping</b> -- finishing chunk {status.backfill_status.current_chunk_idx} of {status.backfill_status.total_chunks} (
+                    {status.backfill_status.current_chunk_str}), then halting. {status.backfill_status.records_added.toLocaleString("en-IN")} NAV records
+                    added so far this session.
+                  </>
+                ) : (
+                  <>
+                    Backfill In Progress: chunk {status.backfill_status.current_chunk_idx} of {status.backfill_status.total_chunks} (
+                    {status.backfill_status.current_chunk_str}) -- {status.backfill_status.records_added.toLocaleString("en-IN")} NAV records added this
+                    session.
+                    {(status.backfill_status.skipped_chunks ?? 0) > 0 &&
+                      ` Resumed: ${status.backfill_status.skipped_chunks} range(s) already complete were skipped.`}
+                  </>
+                )}
+              </Banner>
+              {status.backfill_status.last_error && <div className="mt-2"><Banner level="warning">Note: {status.backfill_status.last_error}</Banner></div>}
+              <button
+                type="button"
+                disabled={status.backfill_status.should_stop || stopHistBackfillMut.isPending}
+                onClick={() => stopHistBackfillMut.mutate()}
+                className="mt-2 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-danger)", color: "white" }}
+              >
+                {status.backfill_status.should_stop ? "Stopping..." : "Pause / Stop Backfill"}
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {status.backfill_status.finished_at && (
+                <Banner level="info">
+                  Backfill session completed at {epochToStr(status.backfill_status.finished_at)}! Ingested {status.backfill_status.records_added.toLocaleString("en-IN")} historical NAV records.
+                </Banner>
+              )}
+              <button
+                type="button"
+                disabled={busy}
+                title={busy ? busyText : undefined}
+                onClick={() => startHistBackfillMut.mutate({ year: 2025, max: 4 })}
+                className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
+              >
+                Backfill Past 1 Year (4 Quarters)
+              </button>
+              <div className="flex items-center gap-2 rounded-lg border px-2 py-1" style={{ borderColor: "var(--mf-border)" }}>
+                <label className="text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+                  Since
+                </label>
+                <input
+                  type="number"
+                  min={EARLIEST_BACKFILL_YEAR}
+                  max={new Date().getFullYear()}
+                  value={backfillStartYear}
+                  onChange={(e) => setBackfillStartYear(Number(e.target.value))}
+                  className="w-20 rounded border px-2 py-1 text-sm"
+                  style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+                />
+                <button
+                  type="button"
+                  disabled={!chunkCountData || busy}
+                  title={busy ? busyText : undefined}
+                  onClick={() => startHistBackfillMut.mutate({ year: backfillStartYear })}
+                  className="rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                  style={{ background: "var(--mf-accent)", color: "white" }}
+                >
+                  Start Full Backfill Since {backfillStartYear} ({chunkCountData?.total_chunks ?? "..."} Chunks)
+                </button>
+              </div>
+              {completedChunks > 0 && (
+                <div className="w-full">
+                  <Banner level="info">
+                    {completedChunks.toLocaleString("en-IN")} date range{completedChunks === 1 ? "" : "s"} already ingested and
+                    checkpointed. Starting a backfill resumes from there -- completed ranges are skipped, not re-downloaded.
+                  </Banner>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm(
+                        `Forget all ${completedChunks} completed checkpoints and re-download every date range since ${backfillStartYear} from scratch?\n\n` +
+                        "Only needed if you believe AMFI has restated past NAVs -- a normal backfill already corrects any changed value it finds."
+                      )) {
+                        startHistBackfillMut.mutate({ year: backfillStartYear, resume: false });
+                      }
+                    }}
+                    disabled={busy}
+                    title={busy ? busyText : undefined}
+                    className="mt-2 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                    style={{ background: "var(--mf-card-bg)", color: "var(--mf-fg)", border: "1px solid var(--mf-border)" }}
+                  >
+                    Re-download Everything (Ignore Checkpoints)
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {startHistBackfillMut.isError && <p className="mt-2 text-xs" style={{ color: "var(--mf-danger)" }}>{adminErrorText(startHistBackfillMut.error)}</p>}
+
+        </div>
+      )}
+
+      {activeTab === "monitor" && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-bold">Live Activity Log</h3>
+            <StatusPill label={logConnected ? "Live" : "Connecting..."} level={logConnected ? "success" : "neutral"} />
+          </div>
+          <p className="text-xs" style={{ color: "var(--mf-muted)" }}>
+            A live push (Server-Sent Events) of what this app&apos;s background processes are doing right now -- NAV sync, TER sync, TER backfill, the
+            multi-year NAV backfill, summary recompute, and anything else that logs.
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <label className="flex flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)" }}>
+              Minimum level
+              <select
+                value={logLevel}
+                onChange={(e) => setLogLevel(e.target.value as never)}
+                className="rounded-lg border px-2 py-1 text-sm"
+                style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+              >
+                <option>INFO</option>
+                <option>WARNING</option>
+                <option>ERROR</option>
+              </select>
+            </label>
+            <label className="flex flex-1 flex-col gap-1 text-xs font-medium" style={{ color: "var(--mf-muted)", minWidth: 200 }}>
+              Filter (e.g. &quot;TER&quot;, &quot;backfill&quot;, &quot;nav&quot;)
+              <input
+                type="text"
+                value={logFilter}
+                onChange={(e) => setLogFilter(e.target.value)}
+                className="rounded-lg border px-2 py-1 text-sm"
+                style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)", color: "var(--mf-fg)" }}
+              />
+            </label>
+          </div>
+
+          {logEntries.length === 0 ? (
+            <p className="mt-3 text-sm" style={{ color: "var(--mf-muted)" }}>
+              Nothing captured yet -- trigger a sync/backfill action from the Sync & Backfill tab, or wait for the next scheduled one, and activity will
+              start appearing here.
+            </p>
+          ) : (
+            <div className="mt-3 max-h-[420px] overflow-y-auto rounded-xl border p-2" style={{ borderColor: "var(--mf-border)" }}>
+              {[...logEntries].reverse().map((e, i) => (
+                <div
+                  key={i}
+                  className="flex items-baseline gap-2.5 border-b py-1.5 text-xs"
+                  style={{ borderColor: "var(--mf-border)" }}
+                >
+                  <span className="flex-none font-mono" style={{ width: 64, color: "var(--mf-muted)" }}>
+                    {new Date(e.time).toLocaleTimeString("en-IN", { hour12: false })}
+                  </span>
+                  <span className="flex-none" style={{ width: 74 }}>
+                    <StatusPill label={e.level} level={e.level === "ERROR" || e.level === "CRITICAL" ? "danger" : e.level === "WARNING" ? "warning" : "neutral"} />
+                  </span>
+                  <span className="flex-none truncate" style={{ width: 120, color: "var(--mf-muted)" }} title={e.logger}>
+                    {e.logger}
+                  </span>
+                  <span className="min-w-0 flex-1 break-words">
+                    {e.message}
+                    {e.traceback && (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer text-[0.7rem] font-semibold" style={{ color: "var(--mf-accent)" }}>
+                          Traceback
+                        </summary>
+                        <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded p-2 text-[0.7rem]" style={{ background: "var(--mf-card-bg)" }}>
+                          {e.traceback}
+                        </pre>
+                      </details>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === "reference" && status && stats && (
+        <div className="mt-4">
+          <h3 className="text-base font-bold">Database Storage</h3>
+          <div className="mt-2 grid grid-cols-2 gap-4 md:grid-cols-4">
+            <StatCard title="Database Storage Size" value={`${stats.file_size_mb} MB`} />
+            <StatCard title="Total Mutual Funds" value={stats.schemes_count.toLocaleString("en-IN")} sub={`Across ${stats.amc_count} fund houses`} />
+            <StatCard title="Historical NAV Records" value={stats.nav_count.toLocaleString("en-IN")} />
+            <StatCard title="Historical Data Span" value={stats.max_date ? `${stats.min_date} to ${stats.max_date}` : "N/A"} />
+          </div>
+
+          <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-2">
+            <div>
+              <h4 className="text-sm font-semibold">Data Sources</h4>
+              <ul className="mt-2 flex flex-col gap-1.5 text-sm">
+                <li>
+                  <b>Daily Master NAV Feed</b>
+                  <br />
+                  <code className="text-xs">https://portal.amfiindia.com/spages/NAVAll.txt</code>
+                </li>
+                <li>
+                  <b>90-Day Historical Reports</b>
+                  <br />
+                  <code className="text-xs">https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx</code>
+                </li>
+                <li>
+                  <b>Official TER Disclosure Portal</b>
+                  <br />
+                  <code className="text-xs">{status.ter_portal_url}</code>
+                </li>
+              </ul>
+            </div>
+            <div>
+              <h4 className="text-sm font-semibold">Storage & Scheduler Details</h4>
+              <ul className="mt-2 flex flex-col gap-1.5 text-sm">
+                <li>
+                  <b>Database</b>: PostgreSQL 16 (<code className="text-xs">{stats.db_path}</code>)
+                </li>
+                <li>
+                  <b>Background sync daemon</b>: {status.enable_sync_daemon ? "enabled" : "disabled"}
+                </li>
+                <li>
+                  <b>Automated NAV Schedule</b>: every night at 00:05 IST and 23:30 IST, plus an hourly heartbeat catch-up.
+                </li>
+                <li>
+                  <b>Automated TER Schedule</b>: on every container start, plus every night at 00:20 IST (current month only).
+                </li>
+                <li>
+                  <b>Concurrency</b>: all sync/backfill writes are serialized behind a shared lock so a manual action can never race the
+                  background daemon.
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <h4 className="mt-6 text-sm font-semibold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            Factor proxy funds
+          </h4>
+          <FactorProxyEditor lastNavs={quality ? { factor_market_last_nav: quality.factor_market_last_nav, factor_momentum_last_nav: quality.factor_momentum_last_nav } : undefined} />
+
+          <h4 className="mt-6 text-sm font-semibold border-t pt-4" style={{ borderColor: "var(--mf-border)" }}>
+            What each TER status means
+          </h4>
+          <table className="mt-2 w-full text-sm">
+            <tbody>
+              <tr className="border-b" style={{ borderColor: "var(--mf-border)" }}>
+                <td className="py-1.5"><b>Official -- auto-synced</b></td>
+                <td className="py-1.5" style={{ color: "var(--mf-muted)" }}>Matched by the AMFI TER-portal sync (see Overview tab); dated and sourced.</td>
+              </tr>
+              <tr className="border-b" style={{ borderColor: "var(--mf-border)" }}>
+                <td className="py-1.5"><b>Legacy (unverified name match)</b></td>
+                <td className="py-1.5" style={{ color: "var(--mf-muted)" }}>Historical name match with no source URL or effective date. No longer written for new schemes.</td>
+              </tr>
+              <tr className="border-b" style={{ borderColor: "var(--mf-border)" }}>
+                <td className="py-1.5"><b>Unknown</b></td>
+                <td className="py-1.5" style={{ color: "var(--mf-muted)" }}>No TER record matched by any source yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </AppShell>
+  );
+}

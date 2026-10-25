@@ -1,0 +1,19 @@
+<rss version="2.0">
+    <channel>
+        <title>Broken Channel</title>
+        <item>
+            <title>Valid Article One</title>
+            <link>https://example.com/article-1</link>
+            <pubDate>Wed, 14 Oct 2026 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>Malformed Unclosed Article
+            <link>broken
+        </item>
+        <item>
+            <title>Valid Article Two</title>
+            <link>https://example.com/article-2</link>
+            <pubDate>Wed, 14 Oct 2026 11:00:00 GMT</pubDate>
+        </item>
+    </channel>
+</rss>

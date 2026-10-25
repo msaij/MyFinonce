@@ -1,0 +1,564 @@
+"""Holdings Phase 4: SIP mandates, goals, insights and alerts."""
+
+import datetime
+import math
+from decimal import Decimal
+
+import numpy as np
+import psycopg
+import pytest
+from fastapi.testclient import TestClient
+
+from app.db import connection
+from app.db import queries as db
+from app.main import app
+from app.services import holdings_insights as insights_svc
+from app.services import holdings_planning as planning
+from app.services import plan_matcher
+from tests.holdings_support import add_ok, business_days, new_portfolio, seed
+
+d = datetime.date
+DIRECT, REGULAR, LIQUID, DEAD = 4001, 4002, 4003, 4004
+
+
+@pytest.fixture()
+def client(pg_db):
+    rng = np.random.default_rng(11)
+    days = list(business_days(d(2022, 1, 3), d(2024, 12, 31)))
+    eq = rng.normal(0.0005, 0.009, len(days))
+    nav_path = lambda r: list(zip(days, 50.0 * np.cumprod(1.0 + r)))  # noqa: E731
+    seed(
+        [(DIRECT, "Alpha Flexi Cap Fund - Direct Plan - Growth", "Alpha Mutual Fund", "Equity Scheme - Flexi Cap Fund", "Direct", "Growth", 0.60, "official"),
+         (REGULAR, "Alpha Flexi Cap Fund - Regular Plan - Growth", "Alpha Mutual Fund", "Equity Scheme - Flexi Cap Fund", "Regular", "Growth", 1.60, "official"),
+         (LIQUID, "Beta Liquid Fund - Direct Plan - Growth", "Beta Mutual Fund", "Debt Scheme - Liquid Fund", "Direct", "Growth", 0.20, "official"),
+         (DEAD, "Gamma Old Fund - Direct Plan - Growth", "Gamma Mutual Fund", "Equity Scheme - Large Cap Fund", "Direct", "Growth", 1.00, "official")],
+        {DIRECT: nav_path(eq), REGULAR: nav_path(eq - 0.00004), LIQUID: nav_path(np.full(len(days), 0.00025)),
+         DEAD: [(day, 10.0 + 0.01 * i) for i, day in enumerate(days[: len(days) // 2])]},   # stops publishing mid-2023
+    )
+    plan_matcher._cached_pairs_dict = None
+    yield TestClient(app)
+    plan_matcher._cached_pairs_dict = None
+
+
+def _buy(c, pid, code, date, amount):
+    add_ok(c, portfolio_id=pid, scheme_code=code, txn_type="BUY", trade_date=date, amount=amount)
+
+# --- SIP schedule (pure) ----------------------------------------------------------------
+
+def test_schedule_monthly_with_anniversary_step_up_and_end_date():
+    m = {"day_of_month": 5, "start_date": d(2023, 1, 10), "end_date": d(2024, 3, 31), "amount": Decimal("1000"), "step_up_pct": Decimal("10")}
+    s = planning.schedule(m, d(2030, 1, 1))
+    assert s[0][0] == d(2023, 2, 5)                    # the 5th of January was before the start
+    assert len(s) == 14 and s[-1][0] == d(2024, 3, 5)  # stops at end_date
+    assert s[11][1] == Decimal("1000.00") and s[12][1] == Decimal("1100.00")
+
+
+# --- SIP mandates via the API ------------------------------------------------------------------
+
+def test_generate_previews_then_writes_once(client):
+    pid = new_portfolio(client)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01", "end_date": "2024-06-30"}).json()
+    preview = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert preview["count"] == 6 and preview["written"] is False
+    assert client.get(f"/api/holdings/portfolios/{pid}/transactions").json() == []
+    # 2024-01-06 was a Saturday: allotted at the next business day's NAV (Monday the 8th).
+    assert preview["rows"][0]["trade_date"] == "2024-01-08"
+    written = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True}).json()
+    assert written["written"] and written["count"] == 6
+    txns = client.get(f"/api/holdings/portfolios/{pid}/transactions").json()
+    assert len(txns) == 6 and all(t["sip_mandate_id"] == m["id"] and t["txn_type"] == "SIP" for t in txns)
+    # Idempotent: nothing left to generate.
+    assert client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True}).json()["count"] == 0
+    # Deleting one instalment makes exactly that one due again.
+    client.delete(f"/api/holdings/transactions/{txns[2]['id']}")
+    again = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert again["count"] == 1 and again["rows"][0]["trade_date"] == txns[2]["trade_date"]
+    view = client.get(f"/api/holdings/portfolios/{pid}/sip-mandates").json()[0]
+    assert view["instalments_recorded"] == 5 and view["instalments_pending"] == 1
+
+
+def test_schedule_leaves_out_paused_months_without_moving_the_step_up():
+    m = {"day_of_month": 6, "start_date": d(2024, 1, 1), "end_date": None, "amount": Decimal("1000"), "step_up_pct": Decimal("10")}
+    s = planning.schedule(m, d(2025, 3, 31), pauses=[(d(2024, 3, 1), d(2024, 6, 1)), (d(2025, 2, 1), None)])
+    dates = [x for x, _ in s]
+    assert d(2024, 2, 6) in dates and d(2024, 6, 6) in dates
+    assert not {d(2024, 3, 6), d(2024, 4, 6), d(2024, 5, 6), d(2025, 2, 6), d(2025, 3, 6)} & set(dates)
+    assert dict(s)[d(2025, 1, 6)] == Decimal("1100.00")       # the 13th instalment, pause or not
+
+
+def test_pausing_records_the_pause_and_its_months_are_never_offered(client):
+    pid = new_portfolio(client)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01", "end_date": "2024-12-31"}).json()
+    assert m["instalments_pending"] == 12 and m["paused_since"] is None
+    paused = client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"active": False}).json()
+    assert paused["paused_since"] == datetime.date.today().isoformat()
+    con = connection.get_connection()
+    con.execute("UPDATE sip_mandate_pauses SET paused_from = '2024-03-01' WHERE mandate_id = %s", (m["id"],))
+    con.close()
+    resumed = client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"active": True}).json()
+    assert resumed["paused_since"] is None
+    # Paused from 1 Mar 2024 until today: only January and February were ever debited.
+    preview = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert [r["trade_date"] for r in preview["rows"]] == ["2024-01-08", "2024-02-06"]
+
+
+def test_sip_rows_typed_in_by_hand_count_as_recorded(client):
+    pid = new_portfolio(client)
+    add_ok(client, portfolio_id=pid, scheme_code=DIRECT, txn_type="SIP", trade_date="2024-02-06", amount=5000)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01", "end_date": "2024-03-31"}).json()
+    assert m["instalments_recorded"] == 1 and m["instalments_pending"] == 2
+    preview = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()
+    assert [r["trade_date"] for r in preview["rows"]] == ["2024-01-08", "2024-03-06"]
+
+
+def test_mandate_cannot_start_before_nav_history(client):
+    pid = new_portfolio(client)
+    r = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2019-01-01"})
+    assert r.status_code == 422
+
+
+# --- Goals -------------------------------------------------------------------------------------
+
+def test_goal_probability_and_required_sip_are_consistent(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    target_date = (datetime.date.today() + datetime.timedelta(days=365 * 10)).isoformat()
+    g = client.post("/api/holdings/goals", json={"name": "Retirement", "target_amount": 5000000, "target_date": target_date,
+                                                "inflation_pct": 6, "portfolio_ids": [pid]}).json()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    assert s["state"] == "projected"
+    assert s["target_future"] == pytest.approx(5000000 * 1.06 ** s["years_left"], rel=1e-9)
+    req = s["required_sip"]
+    assert req["p50"] <= req["p75"] <= req["p90"]
+    # Plugging the 75%-odds SIP back in must give ~75% odds: same paths, closed form.
+    at75 = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": req["p75"]}).json()
+    assert at75["probability_pct"] == pytest.approx(75.0, abs=0.5)
+    more = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": req["p75"] * 2}).json()
+    assert more["probability_pct"] > at75["probability_pct"]
+    p = at75["projection"]
+    assert p["month"][0] == 0 and len(p["p50"]) == len(p["contributed"]) == len(p["month"])
+
+
+def test_goal_target_is_inflated_from_the_day_its_amount_was_set(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    target = datetime.date.today() + datetime.timedelta(days=400)
+    g = client.post("/api/holdings/goals", json={"name": "House", "target_amount": 1000000, "target_date": target.isoformat(),
+                                                "inflation_pct": 7, "portfolio_ids": [pid]}).json()
+    assert g["amount_as_of"] == datetime.date.today().isoformat()
+    # Set a year ago: inflation runs from then, not from today.
+    set_on = datetime.date.today() - datetime.timedelta(days=365)
+    con = connection.get_connection()
+    con.execute("UPDATE goals SET amount_as_of = %s WHERE id = %s", (set_on, g["id"]))
+    con.close()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    assert s["target_future"] == pytest.approx(1000000 * 1.07 ** ((target - set_on).days / 365.25), rel=1e-9)
+    assert s["target_today"] == pytest.approx(1000000 * 1.07 ** (365 / 365.25), rel=1e-9)
+    body = {"name": "New house", "target_amount": 1000000, "target_date": target.isoformat(), "inflation_pct": 7, "portfolio_ids": [pid]}
+    assert client.put(f"/api/holdings/goals/{g['id']}", json=body).json()["amount_as_of"] == set_on.isoformat()
+    body["target_amount"] = 1200000          # a new amount is in today's money
+    assert client.put(f"/api/holdings/goals/{g['id']}", json=body).json()["amount_as_of"] == datetime.date.today().isoformat()
+
+
+def test_goal_counts_each_mandate_on_its_own_schedule(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    today = datetime.date.today()
+    target = today + datetime.timedelta(days=3 * 365)
+    ends = today + datetime.timedelta(days=200)
+    client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 10000, "day_of_month": 10,
+                                                   "start_date": "2024-01-01", "end_date": ends.isoformat(), "step_up_pct": 10})
+    starts = today + datetime.timedelta(days=90)
+    client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": LIQUID, "amount": 3000, "day_of_month": 20,
+                                                   "start_date": starts.isoformat()})
+    g = client.post("/api/holdings/goals", json={"name": "Car", "target_amount": 2000000, "target_date": target.isoformat(),
+                                                "inflation_pct": 6, "portfolio_ids": [pid]}).json()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    mandates = {m["scheme_code"]: m for m in db_mandates(pid)}
+    expected = sum(float(a) for m in mandates.values() for x, a in planning.schedule(m, target) if x > today)
+    assert s["sip_total_to_come"] == pytest.approx(expected)
+    # Only the running one counts toward "a month now"; the second hasn't started.
+    assert s["current_sip"] == pytest.approx(float(planning.current_instalment(mandates[DIRECT])))
+    # The required amount is extra, on top of the mandates: adding it gives the promised odds.
+    at75 = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": s["required_sip"]["p75"]}).json()
+    assert at75["probability_pct"] == pytest.approx(75.0, abs=0.5)
+    assert at75["projection"]["month"][-1] == pytest.approx(at75["months"])
+
+
+def test_money_weighted_rate_allows_for_late_instalments():
+    # Rs 100 now and Rs 100 in a year, both at 10% a year, are worth 121 + 110 at year two.
+    r = planning._money_weighted_rate(100.0, np.array([0.0, 100.0]), np.array([0.0, 1.0]), 2.0, 231.0)
+    assert r == pytest.approx(0.10, abs=1e-9)
+    # The plain return on the Rs 200 put in (15.5% over two years) would understate it.
+    assert planning._money_weighted_rate(100.0, np.zeros(1), np.zeros(1), 0.5, 103.0) == pytest.approx(1.03 ** 2 - 1)
+
+
+def test_median_outcome_is_explained_as_a_gain_from_today(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 200000)
+    target = datetime.date.today() + datetime.timedelta(days=500)
+    g = client.post("/api/holdings/goals", json={"name": "Bike", "target_amount": 300000, "target_date": target.isoformat(),
+                                                "inflation_pct": 6, "portfolio_ids": [pid]}).json()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    m, value, median = s["median_outcome"], s["current_value"], s["median_terminal"]
+    assert m["money_in"] == pytest.approx(value) and m["still_to_invest"] == 0
+    assert m["gain"] == pytest.approx(median - value)
+    assert m["gain_pct"] == pytest.approx((median / value - 1) * 100)
+    assert m["rate_pct"] == pytest.approx(((median / value) ** (12 / s["months"]) - 1) * 100, rel=1e-6)
+    assert m["p10"] <= median <= m["p90"]
+    assert m["gain_since_start"] == pytest.approx(median - 200000)     # cash put in, stamp duty included
+    assert m["vs_target"] == pytest.approx(median - s["target_future"])
+    # An extra SIP is money put in, not gain.
+    w = client.get(f"/api/holdings/goals/{g['id']}/status", params={"sip": 5000}).json()["median_outcome"]
+    assert w["still_to_invest"] == pytest.approx(5000 * math.ceil(s["months"]))
+    assert w["money_in"] == pytest.approx(value + w["still_to_invest"])
+
+
+def db_mandates(pid):
+    from app.db import holdings as hdb
+    return hdb.list_sip_mandates([pid])
+
+
+def test_goal_past_its_date_is_judged_against_the_inflated_target(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, LIQUID, "2022-02-01", 1700)          # worth ~Rs 2,050 by the end of the data
+    g = client.post("/api/holdings/goals", json={"name": "Trip", "target_amount": 1000, "target_date": "2023-01-01",
+                                                "inflation_pct": 30, "portfolio_ids": [pid]}).json()
+    con = connection.get_connection()
+    con.execute("UPDATE goals SET amount_as_of = '2020-01-01' WHERE id = %s", (g["id"],))
+    con.close()
+    s = client.get(f"/api/holdings/goals/{g['id']}/status").json()
+    assert 1000 < s["current_value"] < s["target_future"]   # ~Rs 2,197 needed by 2023
+    assert s["state"] == "past_due"
+
+
+def test_goal_edge_states(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 100000)
+    future = (datetime.date.today() + datetime.timedelta(days=900)).isoformat()
+    lonely = client.post("/api/holdings/goals", json={"name": "Car", "target_amount": 800000, "target_date": future}).json()
+    assert client.get(f"/api/holdings/goals/{lonely['id']}/status").json()["state"] == "no_portfolios"
+    past = client.post("/api/holdings/goals", json={"name": "Old", "target_amount": 1000, "target_date": "2023-01-01",
+                                                   "portfolio_ids": [pid]}).json()
+    assert client.get(f"/api/holdings/goals/{past['id']}/status").json()["state"] == "reached"
+
+
+def test_delete_goal_removes_row_and_missing_is_404(client):
+    pid = new_portfolio(client)
+    g = client.post("/api/holdings/goals", json={"name": "House", "target_amount": 900000, "target_date": "2031-01-01",
+                                                "portfolio_ids": [pid]}).json()
+    assert any(x["id"] == g["id"] for x in client.get("/api/holdings/goals").json())
+    r = client.delete(f"/api/holdings/goals/{g['id']}")
+    assert r.status_code == 200 and r.json()["deleted"] == g["id"]
+    assert all(x["id"] != g["id"] for x in client.get("/api/holdings/goals").json())
+    assert client.get(f"/api/holdings/goals/{g['id']}/status").status_code == 404
+    assert client.delete(f"/api/holdings/goals/{g['id']}").status_code == 404
+    assert client.delete("/api/holdings/goals/999999").status_code == 404
+
+
+# --- Insights --------------------------------------------------------------------------------
+
+def test_insights_price_regular_plans_from_official_ter_and_flag_dead_funds(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, REGULAR, "2022-02-01", 100000)
+    _buy(client, pid, LIQUID, "2022-02-01", 50000)
+    _buy(client, pid, DEAD, "2022-02-01", 20000)
+    items = client.get(f"/api/holdings/portfolios/{pid}/insights").json()["insights"]
+    kinds = [i["kind"] for i in items]
+    assert kinds[0] == "stale_nav"                                   # danger sorts first
+    reg = next(i for i in items if i["kind"] == "regular_plan_cost")
+    fund = reg["numbers"]["funds"][0]
+    assert fund["direct_code"] == DIRECT and fund["ter_gap_pct"] == pytest.approx(1.0)
+    value = next(p for p in client.get(f"/api/holdings/portfolios/{pid}/summary").json()["positions"] if p["scheme_code"] == REGULAR)["current_value"]
+    assert reg["numbers"]["annual_cost"] == pytest.approx(value * 0.01)
+    assert "concentration" in kinds
+
+
+def test_bottom_quartile_is_flagged_against_same_category_and_plan_peers(client):
+    days = list(business_days(d(2022, 1, 3), d(2024, 12, 31)))
+    con = connection.get_connection()
+    rows = []
+    for k in range(10):                          # 10 Direct flexi-cap peers, better drift each
+        code = 5000 + k
+        con.execute(
+            "INSERT INTO schemes (scheme_code, scheme_name, fund_house, category, plan_type, option_type) VALUES "
+            "(%s, %s, 'Peer MF', 'Equity Scheme - Flexi Cap Fund', 'Direct', 'Growth')", (code, f"Peer {k} Flexi Cap Fund"))
+        rows += [(code, day, round(10.0 * (1.0 + 0.0003 * (k + 2)) ** i, 4)) for i, day in enumerate(days)]
+    con.executemany("INSERT INTO nav_history (scheme_code, nav_date, nav) VALUES (%s,%s,%s)", rows)
+    # Make our DIRECT fund the clear laggard over the window.
+    con.execute("UPDATE nav_history SET nav = 50 WHERE scheme_code = %s", (DIRECT,))
+    con.close()
+    db.refresh_summary_table()
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 10000)
+    items = client.get(f"/api/holdings/portfolios/{pid}/insights").json()["insights"]
+    bq = next(i for i in items if i["kind"] == "bottom_quartile")
+    assert bq["scheme_codes"] == [DIRECT] and bq["numbers"]["percentile"] <= 25 and bq["numbers"]["peers"] >= 8
+
+
+# --- Expense-ratio sanity & fund-type-aware concentration ----------------------------------------
+
+ARB = "Hybrid Scheme - Arbitrage Fund"
+ARB_SPREAD = {(ARB, "Direct"): {"peers": 89, "p10": 1.09, "median": 1.47, "p90": 2.20}}
+
+
+def _meta(ter, status="official", parts=(0.10, 0.11, 0.04, 0.75)):
+    keys = ("ter_base_expense_ratio", "ter_brokerage_cost_pct", "ter_transaction_cost_pct", "ter_statutory_levies_pct")
+    return {"category": ARB, "plan_type": "Direct", "expense_ratio": ter, "ter_status": status,
+            "ter_as_of_date": d(2026, 9, 21), **dict(zip(keys, parts))}
+
+
+@pytest.mark.parametrize("meta,expected", [
+    (_meta(1.00), "ok"),                                          # real Motilal Oswal Arbitrage Direct: 0.10 base + costs
+    (_meta(4.00, parts=(3.10, 0.11, 0.04, 0.75)), "high"),        # far above 1.25 x p90
+    (_meta(0.30, parts=(0.30, 0.0, 0.0, 0.0)), "low"),            # under half of p10
+    (_meta(1.00, parts=(0.10, 0.11, 0.04, 0.25)), "inconsistent"),  # components sum to 0.50
+    (_meta(1.00, status="estimated"), "unverified"),
+    (_meta(None), "missing"),
+])
+def test_ter_is_judged_against_its_own_category(monkeypatch, meta, expected):
+    from app.db import holdings as hdb
+    from app.services import holdings_service as svc
+
+    monkeypatch.setattr(hdb, "category_ter_spread", lambda groups: ARB_SPREAD)
+    ctx = svc.ter_context({153187: meta})[153187]
+    assert ctx["status"] == expected
+    if expected == "ok":
+        assert ctx["reason"] is None and sum(ctx["breakdown"].values()) == pytest.approx(1.00)
+        assert ctx["category_spread"]["median"] == 1.47
+
+
+def test_cash_equivalents_do_not_count_toward_concentration():
+    from app.services import holdings_insights as hi
+
+    def pos(code, cat, broad, value):
+        return {"scheme_code": code, "scheme_name": f"F{code}", "display_name": f"F{code} [{code}]",
+                "category": cat, "broad_category": broad, "current_value": value}
+
+    # Liquid 91% + arbitrage 9%: parking money, not a concentrated bet.
+    parked = [pos(1, "Income/Debt Oriented Schemes - Liquid Fund", "Debt", 1501149), pos(2, ARB, "Hybrid", 150150)]
+    assert hi.concentration(parked) == []
+    # Add two equity funds 80/20: concentration is measured over those alone.
+    mixed = parked + [pos(3, "Equity Scheme - Flexi Cap Fund", "Equity", 80000), pos(4, "Equity Scheme - Mid Cap Fund", "Equity", 20000)]
+    (c,) = hi.concentration(mixed)
+    assert c["numbers"]["top1_pct"] == pytest.approx(80.0) and "market-linked" in c["title"]
+
+
+def test_bad_ter_surfaces_as_a_data_quality_insight(client):
+    con = connection.get_connection()
+    con.execute("UPDATE schemes SET expense_ratio = 1.00, ter_base_expense_ratio = 0.10, ter_brokerage_cost_pct = 0.11, "
+                "ter_transaction_cost_pct = 0.04, ter_statutory_levies_pct = 0.25 WHERE scheme_code = %s", (LIQUID,))
+    con.close()
+    db.refresh_summary_table()
+    pid = new_portfolio(client)
+    _buy(client, pid, LIQUID, "2022-02-01", 50000)
+    items = client.get(f"/api/holdings/portfolios/{pid}/insights").json()["insights"]
+    check = next(i for i in items if i["kind"] == "ter_check")
+    assert check["numbers"]["status"] == "inconsistent" and check["scheme_codes"] == [LIQUID]
+    detail = client.get(f"/api/holdings/portfolios/{pid}/positions/{LIQUID}").json()["ter"]
+    assert detail["status"] == "inconsistent" and detail["breakdown"]["statutory_levies_pct"] == 0.25
+
+
+# --- Alerts ------------------------------------------------------------------------------------
+
+def test_alert_rules_fire_once_and_can_be_acknowledged(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, REGULAR, "2022-02-01", 100000)
+    rule = client.post("/api/holdings/alert-rules", json={"kind": "regular_plan", "portfolio_id": pid}).json()
+    assert client.get("/api/holdings/alerts/count").json()["unacked"] == 1       # fired on creation
+    assert insights_svc.evaluate_all() == 0      # the sync re-evaluates; dedupe: condition unchanged
+    alerts = client.get("/api/holdings/alerts").json()["alerts"]
+    assert alerts[0]["rule_id"] == rule["id"] and "Regular plan" in alerts[0]["message"]
+    assert client.post("/api/holdings/alerts/ack", json={"ids": [alerts[0]["id"]]}).json()["acknowledged"] == 1
+    assert client.get("/api/holdings/alerts/count").json()["unacked"] == 0
+    assert client.delete(f"/api/holdings/alert-rules/{rule['id']}").status_code == 200
+
+
+def test_stale_nav_alert(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DEAD, "2022-02-01", 20000)
+    _buy(client, pid, DIRECT, "2022-02-01", 20000)
+    client.post("/api/holdings/alert-rules", json={"kind": "stale_nav", "portfolio_id": pid, "threshold": 30})
+    alerts = client.get("/api/holdings/alerts", params={"unacked": True}).json()["alerts"]
+    assert len(alerts) == 1 and alerts[0]["severity"] == "danger" and "Gamma Old Fund" in alerts[0]["message"]
+
+
+# --- Backup covers everything ----------------------------------------------------------------------
+
+def test_backup_restores_mandates_goals_and_rules(client):
+    pid = new_portfolio(client)
+    _buy(client, pid, DIRECT, "2022-02-01", 10000)
+    m = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 1000,
+                                                       "day_of_month": 10, "start_date": "2024-10-01"}).json()
+    client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True})
+    client.post("/api/holdings/goals", json={"name": "House", "target_amount": 900000, "target_date": "2031-01-01", "portfolio_ids": [pid]})
+    client.post("/api/holdings/alert-rules", json={"kind": "drawdown", "portfolio_id": pid, "threshold": 15})
+    backup = client.get("/api/holdings/backup.json").json()
+    con = connection.get_connection()
+    for t in ("holding_alerts", "holding_alert_rules", "goal_portfolios", "goals", "holding_transactions",
+              "sip_mandates", "portfolio_targets", "portfolios"):
+        con.execute(f"DELETE FROM {t}")
+    con.close()
+    r = client.post("/api/holdings/restore", json=backup)
+    assert r.status_code == 200, r.text
+    again = client.get("/api/holdings/backup.json").json()
+    for table in ("portfolios", "holding_transactions", "sip_mandates", "goals", "goal_portfolios", "holding_alert_rules"):
+        assert again[table] == backup[table], table
+    assert client.get("/api/holdings/goals").json()[0]["portfolio_ids"] == [pid]
+
+
+# --- Instalments are never written twice -------------------------------------------------------
+
+def _mandate(client, pid, day=6, start="2024-01-01", end="2024-06-30", code=DIRECT):
+    r = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": code, "amount": 5000,
+                                                       "day_of_month": day, "start_date": start, "end_date": end})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _sip_rows(pid):
+    con = connection.get_connection()
+    try:
+        return con.execute("SELECT trade_date, scheduled_date, sip_mandate_id FROM holding_transactions "
+                           "WHERE portfolio_id = %s AND deleted_at IS NULL ORDER BY trade_date, id", (pid,)).fetchall()
+    finally:
+        con.close()
+
+
+def test_describing_a_sip_again_does_not_offer_its_months_twice(client):
+    """The same SIP recorded a second time -- to move its day, or because the page once showed
+    "No SIPs recorded" when the request had failed: its months are already in the ledger."""
+    pid = new_portfolio(client)
+    first = _mandate(client, pid)
+    assert client.post(f"/api/holdings/sip-mandates/{first['id']}/generate", params={"confirm": True}).json()["count"] == 6
+    client.patch(f"/api/holdings/sip-mandates/{first['id']}", json={"active": False})
+    again = _mandate(client, pid, day=9)
+    assert again["instalments_pending"] == 0
+    assert client.post(f"/api/holdings/sip-mandates/{again['id']}/generate").json()["count"] == 0
+
+
+def test_a_second_active_mandate_for_the_same_sip_is_refused(client):
+    pid = new_portfolio(client)
+    _mandate(client, pid)
+    r = client.post("/api/holdings/sip-mandates", json={"portfolio_id": pid, "scheme_code": DIRECT, "amount": 5000,
+                                                       "day_of_month": 6, "start_date": "2024-01-01"})
+    assert r.status_code == 422 and "already recorded" in r.json()["detail"]["message"]
+
+
+def test_concurrent_confirms_write_each_instalment_once(client, monkeypatch):
+    """Two confirms at once (a second tab, a retried request) both worked out the same
+    pending months outside the ledger lock, and both wrote them."""
+    import threading
+
+    from app.db import holdings as hdb
+
+    pid = new_portfolio(client)
+    m = _mandate(client, pid)
+    barrier = threading.Barrier(2)
+    real = hdb.nav_on_or_after
+
+    def gated(code, on):
+        # Holds the first caller until the second arrives -- or, once pending is worked out
+        # under the lock and the second waits outside it, gives up after a second.
+        try:
+            barrier.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+        return real(code, on)
+
+    monkeypatch.setattr(hdb, "nav_on_or_after", gated)
+    outcomes = []
+
+    def confirm():
+        try:
+            outcomes.append(planning.generate_instalments(m["id"], True)["count"])
+        except Exception as e:     # noqa: BLE001 -- the unique index's refusal counts as a refusal
+            outcomes.append(type(e).__name__)
+
+    threads = [threading.Thread(target=confirm) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert sorted(outcomes, key=str) == [0, 6]
+    assert len(_sip_rows(pid)) == 6
+
+
+def test_an_instalment_after_a_long_nav_gap_is_offered_once(client):
+    """The fund published nothing for two weeks: the 6 March instalment is allotted on the
+    21st, outside the week a trade date is matched within. It carries its scheduled date."""
+    con = connection.get_connection()
+    con.execute("DELETE FROM nav_history WHERE scheme_code = %s AND nav_date BETWEEN '2024-03-01' AND '2024-03-20'", (DIRECT,))
+    con.close()
+    pid = new_portfolio(client)
+    m = _mandate(client, pid, start="2024-03-01", end="2024-04-30")
+    written = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True}).json()
+    assert [r["trade_date"] for r in written["rows"]] == ["2024-03-21", "2024-04-08"]
+    assert client.post(f"/api/holdings/sip-mandates/{m['id']}/generate").json()["count"] == 0
+    assert [(str(t), str(s)) for t, s, _ in _sip_rows(pid)] == [("2024-03-21", "2024-03-06"), ("2024-04-08", "2024-04-06")]
+
+
+def test_generating_into_an_archived_portfolio_is_refused(client):
+    pid = new_portfolio(client)
+    m = _mandate(client, pid)
+    client.delete(f"/api/holdings/portfolios/{pid}")
+    r = client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True})
+    assert r.status_code == 422 and "archived" in r.json()["detail"]["message"]
+    assert _sip_rows(pid) == []
+
+
+def test_the_migration_dates_older_generated_rows_from_their_note_once_each(client):
+    """Rows generated before scheduled_date existed carry it in their note. The first row per
+    (mandate, date) takes it; a month already written twice keeps its second copy undated, so
+    the unique index can always be built."""
+    from app.db import migrate
+
+    pid = new_portfolio(client)
+    m = _mandate(client, pid, end="2024-02-29")
+    client.post(f"/api/holdings/sip-mandates/{m['id']}/generate", params={"confirm": True})
+    con = connection.get_connection()
+    try:
+        con.execute("UPDATE holding_transactions SET scheduled_date = NULL")
+        con.execute("INSERT INTO holding_transactions (portfolio_id, scheme_code, txn_type, trade_date, amount, units, nav, "
+                    "sip_mandate_id, notes) SELECT portfolio_id, scheme_code, txn_type, trade_date, amount, units, nav, "
+                    "sip_mandate_id, notes FROM holding_transactions WHERE trade_date = '2024-01-08'")
+        con.execute(migrate.SIP_SCHEDULED_DATE_SQL)
+    finally:
+        con.close()
+    assert [(str(t), s and str(s)) for t, s, _ in _sip_rows(pid)] == [
+        ("2024-01-08", "2024-01-06"), ("2024-01-08", None), ("2024-02-06", "2024-02-06")]
+
+
+def test_pause_and_its_record_are_one_write_and_dates_are_checked(client, monkeypatch):
+    from app.db import holdings as hdb
+
+    pid = new_portfolio(client)
+    m = _mandate(client, pid)
+    assert client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"end_date": "2023-12-31"}).status_code == 422
+    # A failure recording the pause rolls the pause itself back: never "paused" with no
+    # pause on record, which would offer every later month as pending.
+    real_execute = connection.PooledCursor.execute
+
+    def failing(self, query, params=None):
+        if "INSERT INTO sip_mandate_pauses" in str(query):
+            raise psycopg.errors.DataError("boom")
+        return real_execute(self, query, params)
+
+    monkeypatch.setattr(connection.PooledCursor, "execute", failing)
+    assert client.patch(f"/api/holdings/sip-mandates/{m['id']}", json={"active": False}).status_code == 422
+    monkeypatch.undo()
+    assert hdb.get_sip_mandate(m["id"])["active"] is True
+
+
+def test_editing_a_goal_keeps_its_notes_and_a_far_date_is_refused(client):
+    pid = new_portfolio(client)
+    body = {"name": "College", "target_amount": 900000, "target_date": "2034-06-01", "portfolio_ids": [pid]}
+    g = client.post("/api/holdings/goals", json={**body, "notes": "for the kids"}).json()
+    edited = client.put(f"/api/holdings/goals/{g['id']}", json={**body, "name": "College fund"}).json()
+    assert edited["notes"] == "for the kids"
+    r = client.post("/api/holdings/goals", json={**body, "target_date": "9026-06-01"})
+    assert r.status_code == 422 and "years away" in r.json()["detail"]["message"]

@@ -1,0 +1,300 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens -- originally ported from the retired Streamlit app's
+ * theme.py (removed at Final Cutover; see git history if it's ever needed
+ * again). This file is now the single source of truth for the app's design
+ * tokens -- no other file to keep in sync with.
+ */
+:root {
+  color-scheme: light;
+  --mf-success: #047857;
+  --mf-success-bg: rgba(5, 150, 105, 0.12);
+  --mf-danger: #b91c1c;
+  --mf-danger-bg: rgba(220, 38, 38, 0.12);
+  --mf-warning: #92400e;
+  --mf-warning-bg: rgba(180, 83, 9, 0.12);
+  --mf-accent: #1d4ed8;
+  --mf-accent-bg: rgba(37, 99, 235, 0.12);
+  /* #334155 (slate-700) provides >10:1 contrast on white and card backgrounds,
+     ensuring secondary text, metric titles, subtitles, and captions are crisp and legible. */
+  --mf-muted: #334155;
+  --mf-border: rgba(100, 116, 139, 0.25);
+  --mf-card-bg: rgba(248, 250, 252, 0.8);
+
+  --mf-bg: #ffffff;
+  --mf-fg: #0f172a;
+}
+
+.dark {
+  color-scheme: dark;
+  --mf-bg: #0b0f19;
+  --mf-card-bg: #1e293b;
+  --mf-border: rgba(148, 163, 184, 0.2);
+  --mf-fg: #f8fafc;
+  --mf-muted: #94a3b8;
+
+  --mf-success: #34d399;
+  --mf-success-bg: rgba(52, 211, 153, 0.12);
+  --mf-danger: #f87171;
+  --mf-danger-bg: rgba(248, 113, 113, 0.10);
+  --mf-warning: #fbbf24;
+  --mf-warning-bg: rgba(251, 191, 36, 0.12);
+  --mf-accent: #60a5fa;
+  --mf-accent-bg: rgba(96, 165, 250, 0.12);
+
+  --mf-chart-1: #60A5FA;
+  --mf-chart-2: #34D399;
+  --mf-chart-3: #F87171;
+  --mf-chart-4: #FBBF24;
+  --mf-chart-5: #A78BFA;
+  --mf-chart-6: #38BDF8;
+}
+
+/*
+ * Chart data-series palette -- NEW, consolidating what used to be hardcoded
+ * hex literals scattered across every page's Plotly configs in the old app
+ * (see the migration plan's design-tokens section). Referenced from
+ * lib/format.ts / chart-building code, not from Tailwind classes.
+ */
+:root {
+  --mf-chart-1: #2563EB;
+  --mf-chart-2: #059669;
+  --mf-chart-3: #DC2626;
+  --mf-chart-4: #D97706;
+  --mf-chart-5: #7C3AED;
+  --mf-chart-6: #0EA5E9;
+}
+
+body {
+  background: var(--mf-bg);
+  color: var(--mf-fg);
+}
+
+select option {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+.dark select option {
+  background-color: #1e293b;
+  color: #f8fafc;
+}
+
+.dark .info-icon .tooltip-box {
+  background-color: #1e293b;
+  color: #f8fafc;
+  border-color: #334155;
+}
+
+.dark .info-icon .tooltip-box::after {
+  border-color: #1e293b transparent transparent transparent;
+}
+
+/*
+ * Shared component classes -- StatCard/Banner/StatusPill/FormulaTooltip
+ * (components/shared/) apply these class names rather than each
+ * reimplementing their own CSS, so every page's cards/banners/pills stay
+ * visually identical by construction.
+ */
+.mf-page-title {
+  font-size: 2.1rem;
+  font-weight: 800;
+  color: var(--mf-fg);
+  margin-bottom: 2px;
+  letter-spacing: -0.01em;
+}
+.mf-page-caption {
+  font-size: 1.02rem;
+  color: var(--mf-muted);
+  margin-bottom: 1.1rem;
+}
+
+.metric-card {
+  background: var(--mf-card-bg);
+  border: 1px solid var(--mf-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  min-height: 120px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  position: relative;
+  overflow: visible;
+  transition: border-color 0.15s ease;
+}
+.metric-card:hover { border-color: var(--mf-accent); }
+.metric-title {
+  font-size: 0.75rem;
+  color: var(--mf-muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  line-height: 1.15;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.metric-value {
+  font-size: 1.5rem;
+  font-weight: 800;
+  line-height: 1.2;
+  margin: 4px 0;
+  color: var(--mf-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metric-value.mf-pos { color: var(--mf-success); }
+.metric-value.mf-neg { color: var(--mf-danger); }
+.metric-value.mf-warn { color: var(--mf-warning); }
+.metric-value.mf-accent { color: var(--mf-accent); }
+.metric-sub {
+  font-size: 0.8rem;
+  color: var(--mf-muted);
+  line-height: 1.3;
+  height: 34px;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A period picker in a card's title row: reads as part of the title until hovered. */
+.metric-title-select {
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: var(--mf-fg);
+  background-color: var(--mf-card-bg);
+  border: 1px solid var(--mf-border);
+  border-radius: 6px;
+  padding: 1px 2px;
+  cursor: pointer;
+}
+.metric-title-select:hover { border-color: var(--mf-accent); }
+.metric-sub-neg { color: var(--mf-danger); font-weight: 500; }
+.metric-sub-pos { color: var(--mf-success); font-weight: 500; }
+.metric-sub-neutral { color: var(--mf-muted); }
+
+.mf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.mf-pill-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.mf-pill-success { background: var(--mf-success-bg); color: var(--mf-success); }
+.mf-pill-success .mf-pill-dot { background: var(--mf-success); }
+.mf-pill-warning { background: var(--mf-warning-bg); color: var(--mf-warning); }
+.mf-pill-warning .mf-pill-dot { background: var(--mf-warning); }
+.mf-pill-danger { background: var(--mf-danger-bg); color: var(--mf-danger); }
+.mf-pill-danger .mf-pill-dot { background: var(--mf-danger); }
+.mf-pill-neutral { background: var(--mf-card-bg); color: var(--mf-muted); }
+.mf-pill-neutral .mf-pill-dot { background: var(--mf-muted); }
+
+.mf-banner {
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  margin: 6px 0 14px 0;
+  border: 1px solid transparent;
+  color: var(--mf-fg);
+}
+.mf-banner-info { background: var(--mf-accent-bg); border-color: var(--mf-accent); }
+.mf-banner-warning { background: var(--mf-warning-bg); border-color: var(--mf-warning); }
+.mf-banner-danger { background: var(--mf-danger-bg); border-color: var(--mf-danger); }
+
+.filter-box {
+  background: var(--mf-card-bg);
+  border: 1px solid var(--mf-border);
+  border-radius: 10px;
+  padding: 12px 16px;
+  position: relative;
+  transition: border-color 0.15s ease;
+}
+.filter-box:focus-within {
+  z-index: 40;
+}
+
+.info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background-color: rgba(71, 85, 105, 0.15);
+  color: #334155;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: help;
+  margin-left: 6px;
+  position: relative;
+  vertical-align: middle;
+  transition: all 0.2s ease-in-out;
+}
+.info-icon:hover {
+  background-color: var(--mf-accent);
+  color: #FFFFFF;
+  box-shadow: 0 0 6px rgba(37, 99, 235, 0.5);
+}
+.info-icon .tooltip-box {
+  visibility: hidden;
+  opacity: 0;
+  width: 320px;
+  max-width: 90vw;
+  background-color: #FFFFFF;
+  color: #0F172A;
+  text-align: left;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.45;
+  position: absolute;
+  z-index: 999999;
+  bottom: 140%;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.15);
+  border: 1px solid #cbd5e1;
+  pointer-events: none;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s ease;
+  white-space: normal;
+  word-wrap: break-word;
+}
+.info-icon .tooltip-box::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  margin-left: -6px;
+  border-width: 6px;
+  border-style: solid;
+  border-color: #FFFFFF transparent transparent transparent;
+}
+.info-icon:hover .tooltip-box { visibility: visible; opacity: 1; }
+.info-icon.tooltip-align-left .tooltip-box { left: -12px; transform: none; }
+.info-icon.tooltip-align-left .tooltip-box::after { left: 18px; margin-left: 0; }
+.info-icon.tooltip-align-right .tooltip-box { left: auto; right: -12px; transform: none; }
+.info-icon.tooltip-align-right .tooltip-box::after { left: auto; right: 18px; margin-left: 0; }
+/* Viewport-positioned (see FormulaTooltip `fixed`): the arrow would point at nothing. */
+.info-icon.tooltip-fixed .tooltip-box::after { display: none; }
+
+/* Hide scrollbars while allowing touch/mousewheel horizontal scrolling */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

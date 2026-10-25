@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shape of https://www.rbi.org.in/pressreleases_rss.xml: naive IST pubDates, HTML-table
+     descriptions in CDATA, and mostly routine operations releases. -->
+<rss version="2.0">
+  <channel>
+    <title>RBI Press Releases</title>
+    <item>
+      <title>Money Market Operations as on October 14, 2026</title>
+      <description><![CDATA[<table class="MMO"><tr><td>(Amount in &#8377; crore, Rate in Per cent)</td><td>6,88,424.63&nbsp;&nbsp;5.55</td></tr></table>]]></description>
+      <link>https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx?prid=63808</link>
+      <pubDate>Thu, 15 Oct 2026 09:00:00</pubDate>
+    </item>
+    <item>
+      <title>91-Day, 182-Day and 364-Day T-Bill Auction Result: Cut-off</title>
+      <description><![CDATA[<table><tr><td>Cut-off yield 5.41</td></tr></table>]]></description>
+      <link>https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx?prid=63801</link>
+      <pubDate>Wed, 14 Oct 2026 18:30:00</pubDate>
+    </item>
+    <item>
+      <title>Result of the Overnight Variable Rate Reverse Repo (VRRR) auction held on October 15, 2026</title>
+      <description><![CDATA[<table><tr><td>Notified Amount</td></tr></table>]]></description>
+      <link>https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx?prid=63809</link>
+      <pubDate>Thu, 15 Oct 2026 10:20:00</pubDate>
+    </item>
+    <item>
+      <title>Monetary Policy Statement, 2026-27: Resolution of the Monetary Policy Committee</title>
+      <description><![CDATA[<p>On the basis of an assessment of the current and evolving macroeconomic situation, the Monetary Policy Committee (MPC) at its meeting today decided to keep the policy repo rate unchanged at 5.50&nbsp;per cent. Inflation has eased &mdash; growth remains robust.</p>]]></description>
+      <link>https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx?prid=63790</link>
+      <pubDate>Wed, 14 Oct 2026 10:00:00</pubDate>
+    </item>
+    <item>
+      <title>RBI imposes monetary penalty on The Example Co-operative Bank Ltd.</title>
+      <description><![CDATA[<p>Penalty for non-compliance.</p>]]></description>
+      <link>https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx?prid=63785</link>
+      <pubDate>Tue, 13 Oct 2026 17:00:00</pubDate>
+    </item>
+  </channel>
+</rss>

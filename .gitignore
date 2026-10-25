@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code runtime
+.claude/scheduled_tasks.lock
+
+# Local agent orchestration leftovers
+.agents/
+scratch/
+
+# Code-review reports (grill plugin): local working notes, not for the public repo
+grill-report-*.md
+
+# The owner's ledger: a backup or export saved into the repo folder must never be committed
+myfinonce-holdings-backup*.json
+*holdings*backup*.json
+holdings-*-transactions.csv
+.env

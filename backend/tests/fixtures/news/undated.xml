@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Like Nikkei Asia's feed: no dates at all. The old parser stamped every item "now". -->
+<rss version="2.0">
+  <channel>
+    <title>Undated</title>
+    <item>
+      <title>Asian chipmakers extend slide</title>
+      <link>https://example.com/asia/chips-1</link>
+    </item>
+    <item>
+      <title>Yen weakens past 160</title>
+      <link>https://example.com/asia/yen-2</link>
+      <pubDate>sometime last week</pubDate>
+    </item>
+  </channel>
+</rss>

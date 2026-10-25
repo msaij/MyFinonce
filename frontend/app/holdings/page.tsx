@@ -1,0 +1,1098 @@
+"use client";
+
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+
+import { AllocationPanel } from "@/components/holdings/AllocationPanel";
+import { InsightsPanel } from "@/components/holdings/InsightsPanel";
+import { PerformancePanel } from "@/components/holdings/PerformancePanel";
+import { PlanningPanel } from "@/components/holdings/PlanningPanel";
+import { PositionDrawer } from "@/components/holdings/PositionDrawer";
+import { RiskPanel } from "@/components/holdings/RiskPanel";
+import { TransactionDrawer } from "@/components/holdings/TransactionDrawer";
+import { TransactionsTable } from "@/components/holdings/TransactionsTable";
+import { AppShell } from "@/components/layout/AppShell";
+import { Banner } from "@/components/shared/Banner";
+import { DataTable, type ColumnConfig } from "@/components/shared/DataTable";
+import { FormulaTooltip } from "@/components/shared/FormulaTooltip";
+import { QueryStatus } from "@/components/shared/QueryStatus";
+import { StatCard } from "@/components/shared/StatCard";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import {
+  archivePortfolio,
+  createPortfolio,
+  deleteTransaction,
+  downloadBackup,
+  exportCsvUrl,
+  getBackupStatus,
+  getHoldingsSummary,
+  getMonthlyEarnings,
+  getRecentChanges,
+  listPortfolios,
+  listTransactions,
+  restoreBackup,
+  restoreTransaction,
+  updatePortfolio,
+  type BackupStatus,
+  type LedgerErrorItem,
+  type PortfolioKey,
+  type Position,
+  type Transaction,
+} from "@/lib/api/holdings";
+import { errorText } from "@/lib/api/client";
+import { formatDate, formatInr, formatInrWhole, formatSignedPct, toneOf } from "@/lib/format";
+import { useUrlSync } from "@/lib/hooks";
+import {
+  excessText,
+  excessTone,
+  formatSignedInr,
+  EARNING_NOW_FULL_AT_PP,
+  EARNING_NOW_REFERENCE_PCT,
+  WARNING_BADGES,
+  dayTotals,
+  earningNowShade,
+  formatMovePct,
+  formatTer,
+  formatUnits,
+  groupTransactionsByFund,
+  heldDays,
+  heldForText,
+  holdingsTotals,
+  investedForText,
+  monthName,
+  parsePortfolioKey,
+  positionBadges,
+  sellNowBreakdown,
+  windowPendingText,
+  xirrPendingText,
+  xirrReason,
+} from "@/lib/holdings";
+
+const TABS = ["overview", "holdings", "allocation", "risk", "insights", "plan", "transactions"] as const;
+type Tab = (typeof TABS)[number];
+const DEFAULT_TAB: Tab = "overview";
+const TAB_LABELS: Record<Tab, string> = {
+  overview: "Performance",
+  holdings: "Holdings",
+  allocation: "Allocation",
+  risk: "Risk",
+  insights: "Insights & alerts",
+  plan: "Goals & SIPs",
+  transactions: "Transactions",
+};
+
+const btn: React.CSSProperties = { borderColor: "var(--mf-border)", color: "var(--mf-fg)" };
+
+export default function HoldingsPage() {
+  return (
+    <Suspense fallback={<div className="p-6 text-sm" style={{ color: "var(--mf-muted)" }}>Loading holdings…</div>}>
+      <HoldingsContent />
+    </Suspense>
+  );
+}
+
+function HoldingsContent() {
+  const searchParams = useSearchParams();
+  const queryClient = useQueryClient();
+  const [pid, setPid] = useState<PortfolioKey>(() => parsePortfolioKey(searchParams.get("portfolio")) ?? "all");
+  const [tab, setTab] = useState<Tab>(() => (TABS.includes(searchParams.get("tab") as Tab) ? (searchParams.get("tab") as Tab) : DEFAULT_TAB));
+  const [showClosed, setShowClosed] = useState(false);
+  const [showDeleted, setShowDeleted] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [editing, setEditing] = useState<Transaction | null>(null);
+  const [prefill, setPrefill] = useState<{ code: number; name: string } | null>(null);
+  const [detailCode, setDetailCode] = useState<number | null>(null);
+  const [toast, setToast] = useState<{ text: string; undoId?: number } | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // The month picked on the "Earned in" tile; null follows the newest month.
+  const [earnedMonth, setEarnedMonth] = useState<string | null>(null);
+
+  useUrlSync({ portfolio: pid === "all" ? "all" : pid, tab: tab !== DEFAULT_TAB ? tab : undefined });
+
+  const portfoliosQ = useQuery({ queryKey: ["holdings", "portfolios"], queryFn: () => listPortfolios(true) });
+  const portfolios = portfoliosQ.data ?? [];
+  const active = portfolios.filter((p) => !p.archived);
+  const current = pid === "all" ? null : portfolios.find((p) => p.id === pid) ?? null;
+
+  // A deep link to a portfolio that no longer exists falls back to the household view.
+  useEffect(() => {
+    if (portfoliosQ.isSuccess && pid !== "all" && !portfolios.some((p) => p.id === pid)) setPid("all");
+  }, [portfoliosQ.isSuccess, portfolios, pid]);
+
+  const summaryQ = useQuery({
+    queryKey: ["holdings", "summary", pid],
+    queryFn: () => getHoldingsSummary(pid),
+    enabled: portfoliosQ.isSuccess && (pid === "all" || portfolios.some((p) => p.id === pid)),
+  });
+  const recentQ = useQuery({
+    queryKey: ["holdings", "recent-changes", pid],
+    queryFn: () => getRecentChanges(pid),
+    enabled: summaryQ.isSuccess,
+  });
+  const monthsQ = useQuery({
+    queryKey: ["holdings", "monthly-earnings", pid],
+    queryFn: () => getMonthlyEarnings(pid),
+    enabled: summaryQ.isSuccess,
+  });
+  const months = monthsQ.data?.months ?? [];
+  // A month the newly picked portfolio has no figure for falls back to its newest.
+  const earned = months.find((m) => m.month === earnedMonth) ?? months[months.length - 1] ?? null;
+  const txnsQ = useQuery({
+    queryKey: ["holdings", "transactions", pid, showDeleted],
+    queryFn: () => listTransactions(pid, showDeleted),
+    enabled: tab === "transactions" && summaryQ.isSuccess,
+  });
+  const backupQ = useQuery({ queryKey: ["holdings", "backup-status"], queryFn: getBackupStatus });
+
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["holdings"] });
+  const backup = useMutation({
+    mutationFn: downloadBackup,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["holdings", "backup-status"] }),
+    onError: (e: Error) => setActionError(`The backup could not be downloaded: ${errorText(e)}`),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => deleteTransaction(id),
+    onSuccess: (res, id) => {
+      invalidate();
+      setToast({ text: res.deleted_ids.length > 1 ? "Switch (both legs) deleted." : "Transaction deleted.", undoId: id });
+    },
+    onError: (e: Error) => setActionError(e.message),
+  });
+  const undo = useMutation({
+    mutationFn: (id: number) => restoreTransaction(id),
+    onSuccess: () => {
+      invalidate();
+      setToast({ text: "Restored." });
+    },
+    onError: (e: Error) => setActionError(e.message),
+  });
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), toast.undoId ? 10_000 : 3_000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const openAdd = (scheme?: { code: number; name: string }) => {
+    setEditing(null);
+    setPrefill(scheme ?? null);
+    setDrawerOpen(true);
+  };
+
+  const summary = summaryQ.data;
+  const k = summary?.kpis;
+  const positions = useMemo(
+    () => (summary?.positions ?? []).filter((p) => showClosed || !p.is_closed),
+    [summary, showClosed]
+  );
+  const txnGroups = useMemo(() => groupTransactionsByFund(txnsQ.data ?? []), [txnsQ.data]);
+  const closedCount = (summary?.positions ?? []).filter((p) => p.is_closed).length;
+  const noPortfolios = portfoliosQ.isSuccess && active.length === 0;
+  const emptyLedger = summary && summary.kpis.transactions === 0;
+
+  const pfName = useMemo(() => new Map(portfolios.map((p) => [p.id, p.name])), [portfolios]);
+  const holdingsColumns: ColumnConfig[] = useMemo(
+    () => [
+      {
+        key: "scheme_name",
+        label: "Fund",
+        tooltip: "Click a fund for its lots, transactions, NAV chart and expense-ratio detail. Under the name: its SEBI category, the asset class it counts toward on the Allocation tab, and its SEBI riskometer level.",
+        sortValue: (r) => r.display_name,
+        render: (row) => {
+          const p = row as unknown as Position;
+          const where = pid === "all" && p.portfolio_ids.length > 0 ? p.portfolio_ids.map((i) => pfName.get(i) ?? `#${i}`).join(", ") : null;
+          const badges = positionBadges(p);
+          return (
+            <div className="min-w-[16rem]">
+              <button type="button" className="text-left font-semibold hover:underline" style={{ color: "var(--mf-accent)" }} onClick={() => setDetailCode(p.scheme_code)}>
+                {p.display_name}
+              </button>
+              <div className="text-[0.7rem]" style={{ color: "var(--mf-muted)" }} title={p.category ?? undefined}>
+                {[p.sebi_category ?? p.category, p.asset_class].filter(Boolean).join(" · ")}
+                {p.riskometer && (
+                  <>
+                    {" · "}
+                    <RiskBadge level={p.riskometer} />
+                  </>
+                )}
+                {where && <> · In {where}</>}
+              </div>
+              {badges.length > 0 && (
+                <div className="mt-0.5 flex flex-wrap gap-1">
+                  {badges.map((b) => (
+                    <span key={b} className="rounded border px-1 text-[0.65rem] font-semibold" style={{ borderColor: "var(--mf-border)", color: WARNING_BADGES.includes(b) ? "var(--mf-warning)" : "var(--mf-muted)" }}>
+                      {b}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        },
+      },
+      {
+        key: "units", label: "Units", sortValue: (r) => r.units, render: (_r, v) => formatUnits(v as number),
+        tooltip: "Units you hold now, to the 3 decimals AMCs allot. After a unit split they are shown on AMFI's post-split scale.",
+      },
+      {
+        key: "avg_cost_nav", label: "Avg cost NAV", format: "number", decimals: 4,
+        tooltip: "Invested ÷ units: the average NAV you paid for the units you still hold (first in, first out, so redeemed lots no longer count).",
+      },
+      {
+        key: "latest_date", label: "NAV date",
+        sortValue: (r) => (r.latest_date ? String(r.latest_date) : ""),
+        render: (_r, v) => (v ? formatDate(v as string) : "-"),
+        tooltip: "The date of the NAV this row is valued at: the fund's latest on AMFI. Funds publish on different days (most skip weekends and holidays; liquid funds publish every day), so the dates can differ between rows.",
+      },
+      {
+        key: "latest_nav", label: "NAV", render: (_r, v) => (v == null ? "-" : Number(v).toFixed(4)),
+        tooltip: "AMFI's latest published NAV for the fund, as of the NAV date beside it.",
+      },
+      {
+        key: "cost_basis", label: "Invested", format: "inr",
+        tooltip: "What the units you still hold cost, first in first out, net of stamp duty. Money from units already redeemed is in Realised, not here.",
+      },
+      // No Value column: "If sold now" already shows what each holding is worth (what you would
+      // get), and the Current value tile has the total.
+      {
+        key: "unrealised_gain",
+        label: "Unrealised",
+        tooltip: "Today's value (units × latest NAV) − Invested, on the units you still hold. The % is on Invested. It is a paper gain until you redeem.",
+        sortValue: (r) => r.unrealised_gain,
+        render: (r, v) =>
+          v == null ? (
+            <span style={{ color: "var(--mf-muted)" }} title="No NAV on record to value this fund at, so it is left out of the totals.">—</span>
+          ) : (
+            <span className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}>
+              {formatSignedInr(v as number)}
+              <span className="block text-[0.7rem]">{formatSignedPct(r.unrealised_pct as number | null, 2)}</span>
+            </span>
+          ),
+      },
+      {
+        key: "day_change",
+        label: "1D gain",
+        tooltip: "Rupees gained on the fund's latest NAV move: units held at the previous close × (latest NAV − previous NAV). Units allotted at the latest NAV have not moved yet, so they add nothing; a liquid fund bought on the latest date is allotted at the previous day's NAV and has earned the day. The % underneath is that move on what those units were worth before it, so funds of different sizes compare directly. The total matches the 1-day change tile.",
+        sortValue: (r) => r.day_change,
+        render: (r, v) => {
+          const base = r.day_base as number | undefined;
+          const from = r.prev_nav_date as string | null | undefined;
+          const to = r.latest_date as string | null | undefined;
+          // A fund that skipped publishing (a holiday, or a late NAV) moves over several days at
+          // once; saying so keeps a three-day move from being compared as one day's.
+          const span = from && to ? Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000) : 1;
+          return (
+            <span
+              className={toneOf(v as number) === "pos" ? "mf-pos" : toneOf(v as number) === "neg" ? "mf-neg" : ""}
+              title={from && to ? `NAV move from ${formatDate(from)} to ${formatDate(to)}` : undefined}
+            >
+              {formatSignedInr(v as number)}
+              {base ? (
+                <span className="block text-[0.7rem]">
+                  {formatMovePct(((v as number) / base) * 100)}
+                  {span > 1 && <span style={{ color: "var(--mf-muted)" }}> · {span} days</span>}
+                </span>
+              ) : null}
+            </span>
+          );
+        },
+      },
+      {
+        key: "earning_now_pct",
+        label: "Earning now",
+        tooltip: "What this fund is earning at today's rates: its NAV growth over the last 30 days, scaled to a year (the NAV is already net of its expenses), and what your value earns on an average day at it. The shade is measured against your 7% a year reference: grey at it, red below and green above, deeper the further away (full at 4% and 10%). A recent rate, not a forecast. ⚠ marks a fund earning noticeably less than another one you hold in the same category. Equity funds show — because a month's move scaled to a year is noise; so do funds with under 30 days of NAVs.",
+        sortValue: (r) => (r.earning_now_pct as number | null) ?? null,
+        render: (r) => {
+          const p = r as unknown as Position;
+          if (p.earning_now_pct == null) return <span style={{ color: "var(--mf-muted)" }}>—</span>;
+          const behind = p.earning_now_behind;
+          return (
+            <span title={p.earning_now_from && p.latest_date ? `NAV growth from ${formatDate(p.earning_now_from)} to ${formatDate(p.latest_date)}, annualised` : undefined}>
+              <span className="rounded px-1 tabular-nums" style={{ background: earningNowShade(p.earning_now_pct) ?? undefined }}>{p.earning_now_pct.toFixed(2)}%</span>
+              {behind && (
+                <span
+                  className="ml-1 cursor-help"
+                  style={{ color: "var(--mf-warning)" }}
+                  title={`Earning ${behind.pp.toFixed(2)}% a year less than ${behind.than} in the same category: about ${formatInrWhole((behind.rupees_per_year))} a year on your ${formatInrWhole((p.current_value))}.`}
+                  aria-label={`Earning ${behind.pp.toFixed(2)}% a year less than ${behind.than}`}
+                >
+                  ⚠
+                </span>
+              )}
+              {p.earning_now_per_day != null && (
+                <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                  {formatInrWhole((p.earning_now_per_day))}/day
+                </span>
+              )}
+            </span>
+          );
+        },
+      },
+      {
+        key: "xirr_pct",
+        label: "XIRR",
+        tooltip: "Your annualised return in this fund, counting when each rupee went in and came out. Withheld for the first 30 days, because annualising a few days' move exaggerates it; the date it will show is given instead.",
+        sortValue: (r) => r.xirr_pct,
+        render: (r, v) =>
+          v == null ? (
+            <span className="text-xs" style={{ color: "var(--mf-muted)" }} title={xirrReason(r.xirr_note as string | null)}>
+              {r.xirr_note === "too_short" && r.xirr_available_on ? `from ${formatDate(r.xirr_available_on as string)}` : "—"}
+            </span>
+          ) : (
+            formatSignedPct(v as number, 2)
+          ),
+      },
+      // No Realised column: the owner does not record redemptions -- a fund sold is simply
+      // removed from the ledger -- so it would only ever read zero.
+      {
+        key: "weight_pct", label: "Weight", render: (_r, v) => (v == null ? "-" : `${(v as number).toFixed(1)}%`),
+        tooltip: "This fund's share of the portfolio's value today.",
+      },
+      {
+        key: "expense_ratio", label: "TER %",
+        tooltip: "Total expense ratio exactly as AMFI publishes it: the yearly fee the fund deducts from its NAV. Hover a value for its source status. Total row: the value-weighted average across your funds.",
+        render: (r, v) => (v == null ? "-" : <span title={String(r.ter_status ?? "")}>{formatTer(v as number)}</span>),
+      },
+      {
+        key: "annual_fee", label: "Yearly fee",
+        tooltip: "Today's value (units × latest NAV) × TER: roughly what the expense ratio costs you over a year. It is taken out of the NAV daily, so it is already inside every return shown here. It is not a separate bill.",
+        render: (_r, v) => (v == null ? "-" : formatInr(v as number)),
+      },
+      {
+        key: "sell_now_profit",
+        label: "If sold now",
+        tooltip: "What selling the whole holding today would give you, at the fund's latest NAV. Top: the profit, against the cash you paid (stamp duty included). Below: the amount you would receive. Assumes no exit load and leaves out income tax. The only deduction is STT, 0.001% on equity-oriented funds; there is no cess, stamp duty, GST or TDS on selling, and no platform charge for direct plans. You are paid the NAV of the day you sell, so the actual amount can differ slightly: usually a little higher for liquid funds, which earn about a day's interest more. ETFs and closed-ended funds are sold on the exchange at market price, so they show —.",
+        sortValue: (r) => (r.sell_now_profit as number | null) ?? null,
+        render: (r) => {
+          const p = r as unknown as Position;
+          if (p.sell_now_note === "exchange_traded") {
+            return <span style={{ color: "var(--mf-muted)" }} title="Sold on the stock exchange at the market price, with brokerage and exchange charges, so a NAV-based estimate would not match.">—</span>;
+          }
+          if (p.sell_now_profit == null || p.sell_now_value == null) return "-";
+          const stt = p.sell_now_stt ?? 0;
+          return (
+            <span title={sellNowBreakdown({ ...p, latest_date: p.latest_date ? formatDate(p.latest_date) : p.latest_date }) ?? undefined}>
+              <span className={toneOf(p.sell_now_profit) === "pos" ? "mf-pos" : toneOf(p.sell_now_profit) === "neg" ? "mf-neg" : ""}>
+                {formatSignedInr(p.sell_now_profit)}
+              </span>
+              <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                you get {formatInr(p.sell_now_value)}
+                {stt > 0 && ` · STT ${formatInr(stt)}`}
+              </span>
+            </span>
+          );
+        },
+      },
+      {
+        key: "first_date", label: "Held for",
+        tooltip: "Time since your first purchase in this fund, up to its latest NAV date. Useful for exit loads, and for the holding periods that set how gains are taxed.",
+        sortValue: (r) => heldDays(r.first_date as string | null, r.latest_date as string | null),
+        render: (r) => {
+          const days = heldDays(r.first_date as string | null, r.latest_date as string | null);
+          return days === null ? "-" : <span title={`First purchase ${formatDate(r.first_date as string)}`}>{heldForText(days)}</span>;
+        },
+      },
+    ],
+    [pid, pfName]
+  );
+  const totals = useMemo(() => holdingsTotals(positions), [positions]);
+  // Over every position, a fund closed today included: the 1-day tile counts its move, so
+  // the footer must too, even while closed rows are hidden.
+  const day = useMemo(() => dayTotals(summary?.positions ?? [], showClosed), [summary, showClosed]);
+  const holdingsFooter: Record<string, React.ReactNode> | undefined = k
+    ? {
+        scheme_name: `Total (${positions.length} fund${positions.length === 1 ? "" : "s"})`,
+        cost_basis: formatInr(totals.invested),
+        unrealised_gain: (
+          <span className={toneOf(totals.unrealised) === "pos" ? "mf-pos" : toneOf(totals.unrealised) === "neg" ? "mf-neg" : ""}>
+            {formatSignedInr(totals.unrealised)}
+            <span className="block text-[0.7rem]">{formatSignedPct(totals.unrealisedPct, 2)}</span>
+          </span>
+        ),
+        day_change: (
+          <span
+            className={toneOf(day.day) === "pos" ? "mf-pos" : toneOf(day.day) === "neg" ? "mf-neg" : ""}
+            title={day.closedMoving ? `Includes ${day.closedMoving} fund${day.closedMoving === 1 ? "" : "s"} closed on the latest NAV date (hidden above), whose units were held through the move.` : undefined}
+          >
+            {formatSignedInr(day.day)}
+            {day.base > 0 && <span className="block text-[0.7rem]">{formatMovePct((day.day / day.base) * 100)}</span>}
+            {day.closedMoving > 0 && <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>incl. {day.closedMoving} closed today</span>}
+          </span>
+        ),
+        earning_now_pct:
+          k.earning_now_pct != null ? (
+            <span title="Weighted by value across the funds with a rate (cash-like and debt funds)">
+              <span className="rounded px-1 tabular-nums" style={{ background: earningNowShade(k.earning_now_pct) ?? undefined }}>{k.earning_now_pct.toFixed(2)}%</span>
+              {k.earning_now_per_day != null && (
+                <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                  {formatInrWhole((k.earning_now_per_day))}/day
+                </span>
+              )}
+            </span>
+          ) : "—",
+        xirr_pct:
+          k.xirr_pct !== null ? (
+            <span title="The whole portfolio's XIRR, closed funds included">{formatSignedPct(k.xirr_pct, 2)}</span>
+          ) : (
+            <span className="text-xs font-medium" style={{ color: "var(--mf-muted)" }}>{xirrPendingText(k.xirr_note, k.xirr_available_on)}</span>
+          ),
+        weight_pct: `${totals.weight.toFixed(1)}%`,
+        expense_ratio:
+          k.weighted_ter_pct !== null ? (
+            <span title={`Value-weighted over ${k.ter_coverage_pct?.toFixed(1)}% of the portfolio's value (the funds with a TER on record)`}>{formatTer(k.weighted_ter_pct)}</span>
+          ) : "-",
+        annual_fee: totals.annualFee !== null ? formatInr(totals.annualFee) : "-",
+        sell_now_profit:
+          k.sell_now_profit != null && k.sell_now_value != null ? (
+            <span
+              title={`Selling everything at the latest NAVs: you would receive ${formatInr(k.sell_now_value)} after ${formatInr(k.sell_now_stt ?? 0)} of STT.${
+                k.sell_now_excluded ? ` ${k.sell_now_excluded} exchange-traded fund${k.sell_now_excluded === 1 ? " is" : "s are"} left out.` : ""
+              }`}
+            >
+              <span className={toneOf(k.sell_now_profit) === "pos" ? "mf-pos" : toneOf(k.sell_now_profit) === "neg" ? "mf-neg" : ""}>
+                {formatSignedInr(k.sell_now_profit)}
+              </span>
+              <span className="block text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+                you get {formatInr(k.sell_now_value)}
+                {(k.sell_now_stt ?? 0) > 0 && ` · STT ${formatInr(k.sell_now_stt ?? 0)}`}
+              </span>
+            </span>
+          ) : "-",
+      }
+    : undefined;
+
+  return (
+    <AppShell>
+      <h1 className="mf-page-title">Holdings</h1>
+      <p className="mf-page-caption">
+        Your own mutual fund portfolios, valued daily at official AMFI NAVs. Every figure traces back to a transaction you entered.
+      </p>
+
+      <PortfolioBar pid={pid} onSelect={setPid} />
+
+      {actionError && (
+        <div className="mt-3">
+          <Banner level="danger">
+            {actionError}
+            <button type="button" className="ml-2 text-xs font-semibold underline" onClick={() => setActionError(null)}>
+              Dismiss
+            </button>
+          </Banner>
+        </div>
+      )}
+      <div className="mt-3 empty:hidden">
+        <QueryStatus query={portfoliosQ} what="your portfolios" />
+      </div>
+
+      {noPortfolios ? (
+        <EmptyStart />
+      ) : (
+        <>
+          <div className="mt-4 flex flex-col gap-2 empty:hidden">
+            <QueryStatus query={summaryQ} what="your holdings" />
+            {k && <LedgerHealth kpis={k} portfolioName={(id) => pfName.get(id) ?? `#${id}`} />}
+          </div>
+
+          {k && !emptyLedger && (
+            <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+              {/* Each fund is valued at its own latest NAV. On a day AMFI has priced only some
+                  of them, say so rather than claim one date for all. */}
+              <StatCard
+                title="Current value"
+                value={formatInr(k.current_value)}
+                sub={
+                  !summary?.as_of
+                    ? ""
+                    : k.oldest_nav_date && k.oldest_nav_date < summary.as_of
+                      ? `Latest NAVs, ${formatDate(k.oldest_nav_date)} to ${formatDate(summary.as_of)}`
+                      : `NAVs as of ${formatDate(summary.as_of)}`
+                }
+              />
+              <StatCard
+                title="Invested"
+                value={formatInr(k.invested)}
+                sub={`Across ${k.open_positions} fund${k.open_positions === 1 ? "" : "s"}${k.stamp_duty > 0 ? ` · + ${formatInr(k.stamp_duty)} stamp duty` : ""}`}
+                tooltip={
+                  <FormulaTooltip
+                    label="Invested"
+                    formula="Σ units × purchase NAV (units still held, FIFO)"
+                    description="The value allotted to you, as on your AMC statement or investment app. Stamp duty is not included; it is shown under Total gain. Units already sold move to Realised gain."
+                  />
+                }
+              />
+              {/* Unrealised gain used to have its own tile. For a buy-and-hold ledger it
+                  differs from Total gain only by stamp duty, so two tiles said one thing;
+                  it now leads this tile's sub-line and the full split is in the tooltip. */}
+              <StatCard
+                title="Total gain"
+                value={formatSignedInr(k.total_gain)}
+                tone={toneOf(k.total_gain)}
+                // Current value − Invested is before stamp duty; this tile is after it. Saying
+                // so is what makes the three tiles add up (to AMC unit-rounding paise).
+                sub={`${k.total_gain_pct !== null ? `${formatSignedPct(k.total_gain_pct, 2)}${k.avg_days_invested != null ? ` in ${investedForText(k.avg_days_invested)}` : ""}` : ""}${k.stamp_duty > 0 ? `${k.total_gain_pct !== null ? " · " : ""}after stamp duty` : ""}`}
+                subTone={toneOf(k.total_gain_pct ?? k.total_gain)}
+                tooltip={
+                  <FormulaTooltip
+                    // Too long to open upwards from the top row without running off the
+                    // screen: placed against the viewport, below the icon where it fits.
+                    fixed
+                    estHeight={360}
+                    label="Total gain"
+                    formula="current value + money taken out − money put in"
+                    description={`What you have gained on the cash you actually paid (${formatInr(k.net_contributed)} net). Made up of unrealised ${formatSignedInr(k.unrealised_gain)} + realised ${formatSignedInr(k.realised_gain)} + dividends ${formatInr(k.dividend_income)} − stamp duty ${formatInr(k.stamp_duty)}; the parts can differ by a few paise because AMCs round units to 3 decimals.${
+                      k.avg_days_invested != null
+                        ? ` Your money has been invested for ${Math.round(k.avg_days_invested).toLocaleString("en-IN")} days on average: each rupee counts from the day it went in (to the day it came back out, oldest first, if sold), weighted by amount; switches between your funds keep the original date.${
+                            k.days_since_first_investment != null && k.first_investment_date
+                              ? ` Your first investment was ${k.days_since_first_investment.toLocaleString("en-IN")} days ago, on ${formatDate(k.first_investment_date)}.`
+                              : ""
+                          }`
+                        : ""
+                    }${
+                      // Ties this tile to the table's "If sold now": the two differ only by the
+                      // STT a sale would cost, which Total gain (valued at the NAV) leaves out.
+                      k.sell_now_profit != null
+                        ? ` If you sold everything today you'd net ${formatSignedInr(k.sell_now_profit)}${
+                            (k.sell_now_stt ?? 0) > 0 ? ` after ${formatInr(k.sell_now_stt ?? 0)} of STT` : " (no STT applies to your funds)"
+                          }${k.sell_now_excluded ? `, leaving out ${k.sell_now_excluded} exchange-traded fund${k.sell_now_excluded === 1 ? "" : "s"}` : ""} (see If sold now in the Holdings table).`
+                        : ""
+                    }`}
+                  />
+                }
+              />
+              {/* Replaced "Return since start" (a time-weighted return from the first rupee,
+                  which answered how ₹100 kept in these funds since day one would have grown --
+                  not a question the owner asks of a cash-like portfolio). */}
+              <StatCard
+                title="Earning now"
+                value={k.earning_now_pct != null ? `${k.earning_now_pct.toFixed(2)}% a year` : "—"}
+                // Shaded against the owner's 7% reference: grey at it, deeper red below, deeper
+                // green above. The number itself stays in normal ink.
+                valueBackground={earningNowShade(k.earning_now_pct)}
+                sub={[
+                  k.earning_now_per_day != null ? `≈ ${formatInrWhole((k.earning_now_per_day))} a day` : "",
+                  k.gain_vs_peers != null ? `${formatSignedInr(k.gain_vs_peers)} vs avg funds` : "",
+                  k.earning_now_coverage_pct != null && k.earning_now_coverage_pct < 99.5 ? `on ${Math.round(k.earning_now_coverage_pct)}% of your money` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+                subTone={k.gain_vs_peers != null ? toneOf(k.gain_vs_peers) : "neutral"}
+                tooltip={
+                  <FormulaTooltip
+                    fixed
+                    estHeight={400}
+                    label="Earning now"
+                    formula={"(1 + day)^365 − 1, day = Σ value × ((NAV today ÷ NAV 30 days ago)^(1 ÷ days) − 1) ÷ Σ value"}
+                    description={`What your money is earning at today's rates: each fund's average day over its last ${k.earning_now_days ?? 30} days of NAVs, weighted by how much you hold in it, then compounded to a year. The shade is measured against your ${EARNING_NOW_REFERENCE_PCT}% a year reference: grey at it, red below and green above, deeper the further away (full at ${EARNING_NOW_REFERENCE_PCT - EARNING_NOW_FULL_AT_PP}% and ${EARNING_NOW_REFERENCE_PCT + EARNING_NOW_FULL_AT_PP}%). The NAV is already net of the fund's expenses, so this is what you actually earn. The rupees a day are what today's value earns on an average day at that rate. It is a recent rate, not a forecast: liquid fund yields follow RBI rates, and arbitrage funds move with the monthly F&O expiry. Equity funds are left out, because a month's move scaled to a year is noise.${
+                      k.gain_vs_peers != null && k.peer_gain != null
+                        ? ` "vs avg funds": you made ${formatSignedInr(k.peer_gain + k.gain_vs_peers)}; the same money, paid in on the same dates (same allotment NAV date and stamp duty) into each fund's category average, would have made ${formatSignedInr(k.peer_gain)}.`
+                        : ""
+                    }`}
+                  />
+                }
+              />
+              <StatCard
+                title="XIRR"
+                value={k.xirr_pct !== null ? formatSignedPct(k.xirr_pct, 2) : "—"}
+                tone={toneOf(k.xirr_pct)}
+                sub={k.xirr_pct === null ? xirrPendingText(k.xirr_note, k.xirr_available_on) : "Money-weighted, annualised"}
+                tooltip={
+                  <FormulaTooltip
+                    label="XIRR"
+                    formula="Σ CFᵢ / (1 + r)^(tᵢ / 365.25) = 0"
+                    description="The annual rate that makes every rupee you put in and took out, plus today's value, net to zero. Switches between your own funds are internal and excluded. Withheld until your money has been invested for 30 days on average (weighted by amount, not counted from your first rupee), because annualising a few days' return turns small moves into absurd yearly rates. A new purchase pushes the date back."
+                  />
+                }
+              />
+              <StatCard
+                title="Earned in"
+                titleControl={
+                  earned ? (
+                    <select
+                      className="metric-title-select"
+                      aria-label="Month"
+                      value={earned.month}
+                      onChange={(e) => setEarnedMonth(e.target.value)}
+                    >
+                      {months.map((m) => (
+                        <option key={m.month} value={m.month}>
+                          {monthName(m.month)}
+                        </option>
+                      ))}
+                    </select>
+                  ) : undefined
+                }
+                value={earned ? formatSignedInr(earned.gain) : "—"}
+                tone={earned ? toneOf(earned.gain) : ""}
+                sub={
+                  earned
+                    ? `${formatMovePct(earned.change_pct)}${earned.benchmark_change_pct !== null ? ` · peers ${formatMovePct(earned.benchmark_change_pct)}` : ""}`
+                    : monthsQ.isError
+                      ? "Could not load"
+                      : ""
+                }
+                subTone={earned ? toneOf(earned.change_pct) : "neutral"}
+                tooltip={
+                  earned ? (
+                    <FormulaTooltip
+                      // The last tile in its row at every width: a centred box runs off the screen.
+                      align="right"
+                      label={`Earned in ${monthName(earned.month, true)}`}
+                      formula="Σ (Vₜ − Vₜ₋₁ − Fₜ) over the month's NAV days"
+                      // Kept short: a top-row box opens upwards, and a long one runs off the top.
+                      description={`${earned.start ? `From the ${formatDate(earned.start)} NAV` : "From your first investment"} to the ${formatDate(earned.end)} NAV${earned.month === monthsQ.data?.as_of?.slice(0, 7) ? ", the month so far" : ""}. Money paid in or taken out is not earnings; stamp duty and dividends paid out count, as in Total gain, so the months add up to it. The percentage is time-weighted.${
+                        earned.benchmark_change_pct !== null
+                          ? ` Peers: ${monthsQ.data?.benchmark_name && !monthsQ.data.benchmark_name.startsWith("Category blend") ? monthsQ.data.benchmark_name : "your funds’ SEBI category averages"}, same days${earned.excess_pp !== null ? ` (${excessText(earned.excess_pp)})` : ""}.`
+                          : ""
+                      }`}
+                    />
+                  ) : undefined
+                }
+              />
+            </div>
+          )}
+
+          {k && !emptyLedger && (
+            <div className="mt-3 empty:hidden">
+              <QueryStatus query={monthsQ} what="this month's earnings" />
+              <QueryStatus query={recentQ} what="the last few days' movement" />
+            </div>
+          )}
+
+          {k && !emptyLedger && (
+            <div className="mt-3">
+              {/* One row of short-term moves, rupees first on every tile. The 1-day tile comes
+                  from the summary, so it stands even when the windows fail to load. */}
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <StatCard
+                  title="1-day change"
+                  value={formatSignedInr(k.day_change)}
+                  tone={toneOf(k.day_change)}
+                  sub={`${formatMovePct(k.day_change_pct)}${k.day_benchmark_pct !== null ? ` · peers ${formatMovePct(k.day_benchmark_pct)}` : ""}`}
+                  subTone={toneOf(k.day_change_pct)}
+                  tooltip={
+                    <FormulaTooltip
+                      label="1-day change"
+                      formula="Vₜ − Vₜ₋₁ − Fₜ"
+                      description="The total of the 1D gain column in the Holdings table: each fund's own latest NAV move, on the units you held before it (units bought at the latest NAV have not moved yet). When AMFI has priced only some funds for the newest date, the others count their own latest move, so nothing already published is left out and no fund is counted as unchanged. The percentage is on what those units were worth before the move; peers are each fund's SEBI category over that same fund's move, weighted the same way."
+                    />
+                  }
+                />
+                {(recentQ.data?.windows ?? []).map((w, i, all) => (
+                  <StatCard
+                    key={w.days}
+                    title={`Last ${w.days} days`}
+                    value={w.available ? formatSignedInr(w.gain) : "—"}
+                    tone={w.available ? toneOf(w.gain) : ""}
+                    // The peers' figure sits beside the percentage so the two can be read
+                    // against each other at a glance.
+                    sub={
+                      w.available
+                        ? `${formatMovePct(w.change_pct)}${w.benchmark_change_pct !== null ? ` · peers ${formatMovePct(w.benchmark_change_pct)}` : ""}`
+                        : windowPendingText(w.days_needed)
+                    }
+                    subTone={w.available ? toneOf(w.change_pct) : "neutral"}
+                    tooltip={
+                      w.available ? (
+                        <FormulaTooltip
+                          align={i === all.length - 1 ? "right" : "center"}
+                          label={`Last ${w.days} NAV days`}
+                          description={`${w.start ? `From ${formatDate(w.start)}, time-weighted. ` : ""}Averages ${formatSignedPct(w.avg_daily_pct, 3)} a day, compounded.${w.excess_pp !== null ? ` ${excessText(w.excess_pp).replace(/^./, (c) => c.toUpperCase())} (${recentQ.data?.benchmark_name ?? "benchmark"}).` : ""}`}
+                        />
+                      ) : undefined
+                    }
+                  />
+                ))}
+              </div>
+              {(recentQ.data?.windows?.length ?? 0) > 0 && (
+                <p className="mt-1 text-xs" style={{ color: "var(--mf-muted)" }}>
+                  1-day change is the total of the 1D gain column in the Holdings table. The other tiles are the movement of the holdings
+                  over the last few NAV days, time-weighted — money paid in during a window is not counted as a gain, though its stamp
+                  duty counts against the window, as it does against Total gain; the peers pay the same.{" "}
+                  {recentQ.data?.benchmark_name && !recentQ.data.benchmark_name.startsWith("Category blend")
+                    ? `On those tiles “peers” is your chosen benchmark, ${recentQ.data.benchmark_name}, over the same window.`
+                    : "On those tiles “peers” is the same window for the average fund in each of your funds’ SEBI categories, weighted like your portfolio."}
+                  {recentQ.data?.as_of ? ` NAVs as of ${formatDate(recentQ.data.as_of)}.` : ""}
+                  {recentQ.data?.awaiting_funds && recentQ.data.latest_nav_date
+                    ? ` ${recentQ.data.awaiting_funds} of your funds (${Math.round(recentQ.data.awaiting_value_pct ?? 0)}% of the money) have not published ${formatDate(recentQ.data.latest_nav_date)} yet; their move for it is added when AMFI does, and their peers skip it until then.`
+                    : ""}
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="mt-6 flex flex-wrap items-center gap-1.5 border-b pb-2" style={{ borderColor: "var(--mf-border)" }}>
+            {TABS.map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTab(t)}
+                className="rounded-full px-3.5 py-1.5 text-xs font-bold"
+                style={{
+                  background: tab === t ? "var(--mf-accent)" : "transparent",
+                  color: tab === t ? "#ffffff" : "var(--mf-fg)",
+                  border: tab === t ? "1px solid var(--mf-accent)" : "1px solid var(--mf-border)",
+                }}
+              >
+                {TAB_LABELS[t]}
+              </button>
+            ))}
+            <div className="ml-auto flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => openAdd()}
+                disabled={current?.archived}
+                className="rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                style={{ background: "var(--mf-accent)", color: "#fff" }}
+              >
+                + Add transaction
+              </button>
+              <a href={exportCsvUrl(pid)} className="rounded-lg border px-3 py-1.5 text-xs font-semibold" style={btn}>
+                Export CSV
+              </a>
+              <button
+                type="button"
+                onClick={() => { setActionError(null); backup.mutate(); }}
+                disabled={backup.isPending}
+                className="rounded-lg border px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                style={{ ...btn, ...(backupQ.data?.backup_due ? { borderColor: "var(--mf-warning)" } : {}) }}
+                title="Every portfolio, transaction, SIP, goal and alert rule, for safe keeping. The ledger lives only in the app's database, so keep a recent copy somewhere else."
+              >
+                {backup.isPending ? "Preparing…" : "Download backup"}
+              </button>
+            </div>
+          </div>
+          <BackupNote status={backupQ.data} />
+
+
+          {summaryQ.isLoading && <div className="mt-4 text-sm" style={{ color: "var(--mf-muted)" }}>Valuing your holdings…</div>}
+
+          {emptyLedger && (
+            <div className="mt-6 rounded-lg border p-6 text-center" style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}>
+              <div className="text-base font-bold">No transactions yet</div>
+              <p className="mt-1 text-sm" style={{ color: "var(--mf-muted)" }}>
+                Add your first purchase or SIP. Pick the fund and date. The NAV fills in from AMFI, and you can overwrite it with the one on your statement.
+              </p>
+              <button type="button" onClick={() => openAdd()} className="mt-3 rounded-lg px-4 py-2 text-sm font-semibold" style={{ background: "var(--mf-accent)", color: "#fff" }}>
+                + Add your first holding
+              </button>
+            </div>
+          )}
+
+          {tab === "overview" && summary && !emptyLedger && <PerformancePanel pid={pid} />}
+
+          {tab === "allocation" && summary && !emptyLedger && <AllocationPanel pid={pid} />}
+
+          {tab === "risk" && summary && !emptyLedger && <RiskPanel pid={pid} />}
+
+          {tab === "insights" && summary && !emptyLedger && <InsightsPanel pid={pid} portfolios={portfolios} onOpenScheme={setDetailCode} />}
+
+          {tab === "plan" && summary && <PlanningPanel pid={pid} portfolios={portfolios} />}
+
+          {tab === "holdings" && summary && !emptyLedger && (
+            <div className="mt-4">
+              {closedCount > 0 && (
+                <label className="mb-2 flex items-center gap-2 text-xs" style={{ color: "var(--mf-muted)" }}>
+                  <input type="checkbox" checked={showClosed} onChange={(e) => setShowClosed(e.target.checked)} />
+                  Show {closedCount} fully redeemed holding{closedCount === 1 ? "" : "s"}
+                </label>
+              )}
+              <DataTable columns={holdingsColumns} rows={positions as unknown as Record<string, unknown>[]} keyField="scheme_code" footer={holdingsFooter} />
+              <p className="mt-2 text-xs" style={{ color: "var(--mf-muted)" }}>
+                Valued at each fund&apos;s latest AMFI NAV{summary.as_of ? ` (up to ${formatDate(summary.as_of)})` : ""}. The total row adds up the funds shown
+                {closedCount > 0 && !showClosed ? "; fully redeemed funds are hidden, but their realised gains still count on the Performance tab" : ""}.
+              </p>
+            </div>
+          )}
+
+          {tab === "transactions" && !emptyLedger && (
+            <div className="mt-4">
+              <label className="mb-2 flex items-center gap-2 text-xs" style={{ color: "var(--mf-muted)" }}>
+                <input type="checkbox" checked={showDeleted} onChange={(e) => setShowDeleted(e.target.checked)} />
+                Show deleted transactions (to restore one)
+              </label>
+              {txnsQ.isLoading && <div className="text-sm" style={{ color: "var(--mf-muted)" }}>Loading ledger…</div>}
+              {/* Without this the tab renders blank on a failed fetch, which reads as "no transactions". */}
+              <QueryStatus query={txnsQ} what="the ledger" />
+              {txnsQ.data && (
+                <TransactionsTable
+                  groups={txnGroups}
+                  portfolioName={pid === "all" ? (id) => portfolios.find((p) => p.id === id)?.name ?? `#${id}` : undefined}
+                  onOpenFund={setDetailCode}
+                  onEdit={(t) => { setEditing(t); setPrefill(null); setDrawerOpen(true); }}
+                  onDelete={(t) => { setActionError(null); del.mutate(t.id); }}
+                  onRestore={(t) => { setActionError(null); undo.mutate(t.id); }}
+                  deleting={del.isPending || undo.isPending}
+                />
+              )}
+            </div>
+          )}
+
+          <p className="mt-6 text-xs" style={{ color: "var(--mf-muted)" }}>
+            Values use AMFI&apos;s closing NAV and ignore exit loads and taxes. Realised gain uses FIFO lots per portfolio as a performance measure, not a tax computation.
+          </p>
+        </>
+      )}
+
+      <TransactionDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        portfolios={portfolios}
+        defaultPortfolioId={pid === "all" ? (active.length === 1 ? active[0].id : null) : pid}
+        editing={editing}
+        prefillScheme={prefill}
+      />
+      <PositionDrawer pid={pid} schemeCode={detailCode} onClose={() => setDetailCode(null)} />
+
+      {toast && (
+        <div className="fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 rounded-lg px-4 py-2 text-sm shadow-lg" role="status" style={{ background: "#0f172a", color: "#fff" }}>
+          {toast.text}
+          {toast.undoId && (
+            <button type="button" className="font-bold underline" onClick={() => { undo.mutate(toast.undoId!); setToast(null); }}>
+              Undo
+            </button>
+          )}
+        </div>
+      )}
+    </AppShell>
+  );
+}
+
+function PortfolioBar({ pid, onSelect }: { pid: PortfolioKey; onSelect: (p: PortfolioKey) => void }) {
+  const queryClient = useQueryClient();
+  const { data: portfolios = [] } = useQuery({ queryKey: ["holdings", "portfolios"], queryFn: () => listPortfolios(true) });
+  const [creating, setCreating] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+
+  const current = pid === "all" ? null : portfolios.find((p) => p.id === pid) ?? null;
+  const visible = portfolios.filter((p) => showArchived || !p.archived || p.id === pid);
+  const done = () => {
+    setCreating(false);
+    setRenaming(false);
+    setName("");
+    setError(null);
+    queryClient.invalidateQueries({ queryKey: ["holdings"] });
+  };
+
+  const create = useMutation({
+    mutationFn: () => createPortfolio({ name: name.trim() }),
+    onSuccess: (p) => {
+      done();
+      onSelect(p.id);
+    },
+    onError: (e: Error) => setError(e.message),
+  });
+  const rename = useMutation({ mutationFn: () => updatePortfolio(current!.id, { name: name.trim() }), onSuccess: done, onError: (e: Error) => setError(e.message) });
+  const archive = useMutation({
+    mutationFn: () => archivePortfolio(current!.id),
+    onSuccess: () => { done(); onSelect("all"); },
+    onError: (e: Error) => setError(`Couldn't archive: ${errorText(e)}`),
+  });
+  // Unarchiving onto a name another active portfolio now uses is refused (409); say so.
+  const unarchive = useMutation({
+    mutationFn: () => updatePortfolio(current!.id, { archived: false }),
+    onSuccess: done,
+    onError: (e: Error) => setError(`Couldn't unarchive: ${errorText(e)}`),
+  });
+
+  const pill = (active: boolean): React.CSSProperties => ({
+    background: active ? "var(--mf-accent-bg)" : "transparent",
+    color: active ? "var(--mf-accent)" : "var(--mf-fg)",
+    border: `1px solid ${active ? "var(--mf-accent)" : "var(--mf-border)"}`,
+  });
+
+  return (
+    <div className="mt-4 flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-1.5" role="tablist" aria-label="Portfolio">
+        <button type="button" role="tab" aria-selected={pid === "all"} onClick={() => onSelect("all")} className="rounded-full px-3 py-1 text-xs font-semibold" style={pill(pid === "all")}>
+          All portfolios
+        </button>
+        {visible.map((p) => (
+          <button key={p.id} type="button" role="tab" aria-selected={pid === p.id} onClick={() => onSelect(p.id)} className="rounded-full px-3 py-1 text-xs font-semibold" style={{ ...pill(pid === p.id), opacity: p.archived ? 0.6 : 1 }}>
+            {p.name}
+            {p.archived ? " (archived)" : ""}
+          </button>
+        ))}
+        {!creating && (
+          <button type="button" onClick={() => { setCreating(true); setRenaming(false); setName(""); }} className="rounded-full px-3 py-1 text-xs font-semibold" style={{ color: "var(--mf-accent)", border: "1px dashed var(--mf-border)" }}>
+            + New portfolio
+          </button>
+        )}
+        {portfolios.some((p) => p.archived) && (
+          <label className="ml-1 flex items-center gap-1 text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} /> archived
+          </label>
+        )}
+        {current && !creating && !renaming && (
+          <div className="ml-auto flex gap-3 text-xs font-semibold">
+            <button type="button" style={{ color: "var(--mf-accent)" }} onClick={() => { setRenaming(true); setName(current.name); }}>
+              Rename
+            </button>
+            {current.archived ? (
+              <button type="button" style={{ color: "var(--mf-accent)" }} onClick={() => unarchive.mutate()}>
+                Unarchive
+              </button>
+            ) : (
+              <button type="button" style={{ color: "var(--mf-muted)" }} onClick={() => archive.mutate()} title="Hides it from the household view. Nothing is deleted.">
+                Archive
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      {(creating || renaming) && (
+        <form
+          className="flex flex-wrap items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!name.trim()) return;
+            (creating ? create : rename).mutate();
+          }}
+        >
+          <input
+            autoFocus
+            value={name}
+            maxLength={80}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={creating ? "e.g. Self, Spouse, Retirement" : ""}
+            className="rounded-lg border px-2 py-1.5 text-sm"
+            style={{ borderColor: "var(--mf-border)", background: "var(--mf-bg)", color: "var(--mf-fg)" }}
+          />
+          <button type="submit" className="rounded-lg px-3 py-1.5 text-xs font-semibold" style={{ background: "var(--mf-accent)", color: "#fff" }}>
+            {creating ? "Create" : "Save"}
+          </button>
+          <button type="button" className="text-xs font-semibold" style={{ color: "var(--mf-muted)" }} onClick={() => { setCreating(false); setRenaming(false); setError(null); }}>
+            Cancel
+          </button>
+          {error && <span className="text-xs" style={{ color: "var(--mf-danger)" }}>{error}</span>}
+        </form>
+      )}
+      {error && !creating && !renaming && <Banner level="danger">{error}</Banner>}
+    </div>
+  );
+}
+
+/** Says when the figures leave something out: rows the ledger can't replay, funds with no
+ *  NAV, funds whose 1-day move is unknown. Each would otherwise pass silently as a number. */
+function LedgerHealth({
+  kpis,
+  portfolioName,
+}: {
+  kpis: { ledger_errors?: LedgerErrorItem[]; unpriced_funds?: number; funds_without_day_change?: number; peer_comparison_incomplete?: string[] };
+  portfolioName: (id: number) => string;
+}) {
+  const errors = kpis.ledger_errors ?? [];
+  const unpriced = kpis.unpriced_funds ?? 0;
+  const noDay = kpis.funds_without_day_change ?? 0;
+  const peerGaps = kpis.peer_comparison_incomplete ?? [];
+  return (
+    <>
+      {errors.length > 0 && (
+        <Banner level="danger">
+          {errors.length === 1 ? "One transaction" : `${errors.length} transactions`} can&apos;t be applied as recorded, so every figure
+          here leaves {errors.length === 1 ? "it" : "them"} out. Fix or delete {errors.length === 1 ? "it" : "them"} on the Transactions tab:
+          <ul className="mt-1 list-disc pl-5 text-xs">
+            {errors.slice(0, 5).map((e, i) => (
+              <li key={i}>
+                #{e.txn_id ?? "?"} on {formatDate(e.trade_date)}
+                {e.portfolio_id != null ? ` in ${portfolioName(e.portfolio_id)}` : ""}: {e.message}
+              </li>
+            ))}
+            {errors.length > 5 && <li>…and {errors.length - 5} more.</li>}
+          </ul>
+        </Banner>
+      )}
+      {unpriced > 0 && (
+        <Banner level="warning">
+          {unpriced} fund{unpriced === 1 ? " has" : "s have"} no NAV on record, so {unpriced === 1 ? "it is" : "they are"} left out of
+          Current value, Invested and the gains until AMFI&apos;s next sync prices {unpriced === 1 ? "it" : "them"}.
+        </Banner>
+      )}
+      {noDay > 0 && (
+        <Banner level="info">
+          The 1-day change leaves out {noDay} fund{noDay === 1 ? "" : "s"}: the price table is being rebuilt, and until it is, only
+          {noDay === 1 ? " its" : " their"} latest NAV is known.
+        </Banner>
+      )}
+      {peerGaps.length > 0 && (
+        <Banner level="warning">
+          The comparison with peers is incomplete right now: the peer returns for {peerGaps.join(", ")} failed to load, so
+          &quot;vs avg funds&quot; and the peer figures leave {peerGaps.length === 1 ? "that category" : "those categories"} out. Reload in a
+          moment.
+        </Banner>
+      )}
+    </>
+  );
+}
+
+/** When the ledger was last backed up, and a nudge once a backup is due: the ledger lives
+ *  only in the app's database volume. */
+function BackupNote({ status }: { status: BackupStatus | undefined }) {
+  if (!status) return null;
+  const last = status.last_backup_at ? formatDate(status.last_backup_at.slice(0, 10)) : null;
+  const days = status.days_since_backup;
+  const ago = days == null ? "" : days < 1 ? "today" : `${Math.floor(days)} day${Math.floor(days) === 1 ? "" : "s"} ago`;
+  if (status.backup_due) {
+    return (
+      <div className="mt-2">
+        <Banner level="warning">
+          {last ? `Your last backup was ${ago} (${last}), and the ledger has changed since.` : "You haven't downloaded a backup yet."} The
+          ledger is stored only in this app&apos;s database; keep a recent copy somewhere else with Download backup.
+        </Banner>
+      </div>
+    );
+  }
+  return last ? (
+    <p className="mt-1 text-right text-[0.7rem]" style={{ color: "var(--mf-muted)" }}>
+      Last backup {ago} ({last}){status.changed_since_backup ? "; changed since" : ""}.
+    </p>
+  ) : null;
+}
+
+function EmptyStart() {
+  const queryClient = useQueryClient();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [msg, setMsg] = useState<{ level: "info" | "danger"; text: string } | null>(null);
+  const restore = useMutation({
+    mutationFn: async (file: File) => restoreBackup(JSON.parse(await file.text())),
+    onSuccess: (r) => {
+      setMsg({ level: "info", text: `Restored ${r.portfolios} portfolio(s) and ${r.holding_transactions} transaction(s).` });
+      queryClient.invalidateQueries({ queryKey: ["holdings"] });
+    },
+    onError: (e: Error) => setMsg({ level: "danger", text: e.message }),
+  });
+  return (
+    <div className="mt-6 rounded-lg border p-6" style={{ borderColor: "var(--mf-border)", background: "var(--mf-card-bg)" }}>
+      <div className="text-base font-bold">Start tracking what you own</div>
+      <p className="mt-1 text-sm" style={{ color: "var(--mf-muted)" }}>
+        Create a portfolio above, one per person or goal (Self, Spouse, Retirement…). &quot;All portfolios&quot; then shows the whole household together.
+      </p>
+      <div className="mt-4 text-xs" style={{ color: "var(--mf-muted)" }}>
+        Have a backup file from this app?{" "}
+        <button type="button" className="font-semibold underline" style={{ color: "var(--mf-accent)" }} onClick={() => fileRef.current?.click()}>
+          Restore it
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) restore.mutate(f);
+            e.target.value = "";
+          }}
+        />
+      </div>
+      {msg && (
+        <div className="mt-3">
+          <Banner level={msg.level}>{msg.text}</Banner>
+        </div>
+      )}
+    </div>
+  );
+}

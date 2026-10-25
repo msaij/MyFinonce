@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HTML named entities inside CDATA, an escaped entity outside it, and a trailing bare
+     "AT&T"-style ampersand that the HTML cleaner must not swallow. -->
+<rss version="2.0">
+  <channel>
+    <title>Entities</title>
+    <item>
+      <title><![CDATA[Sensex &amp; Nifty&nbsp;rally &mdash; S&P up]]></title>
+      <description><![CDATA[<p>Markets&nbsp;&nbsp;climbed &rsquo;sharply&rsquo; on AT&T]]></description>
+      <link>https://example.com/markets/sensex-nifty-rally</link>
+      <pubDate>Wed, 14 Oct 2026 12:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Speech at the Central Bank of the Republic of T&amp;uuml;rkiye</title>
+      <description>Speech At the Istanbul Economic Forum &amp;amp; dinner</description>
+      <link>https://www.federalreserve.gov/newsevents/speech/waller20261008a.htm</link>
+      <pubDate>Thu, 8 Oct 2026 08:30:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

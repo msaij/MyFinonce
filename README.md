@@ -1,0 +1,96 @@
+# myFinonce
+
+A self-hosted dashboard for Indian mutual funds, built on official AMFI data. Screen and compare funds, backtest SIPs, analyse risk, and track your own portfolios. It also covers live NSE IPOs and everyday financial calculators.
+
+> Analysis software, not investment advice. myFinonce is not a SEBI-registered adviser.
+
+## What's inside
+
+The left menu is grouped the same way as this list.
+
+### Calculator
+| Route | What it does |
+|---|---|
+| `/calculator` | **Calculator** — order of operations, brackets, powers and roots, phone-style percent, memory, history, and quick percentages and GST.<br>**EMI** — monthly instalment, total interest and the full schedule by calendar or financial year, with CSV export. Prepayments can be monthly, yearly, a yearly EMI step-up or one-time, and after each one you choose to reduce the tenure or the EMI. Charts show interest saved and the loan balance with and without prepayments. |
+
+### Stock Market
+| Route | What it does |
+|---|---|
+| `/nse-ipo` | **NSE IPO** — current and upcoming public issues, live from nseindia.com. Each issue has full issue information, bid details (NSE only and all exchanges), demand graph and demand data. A "take a chance?" read of bidding demand covers subscription by investor category, issue size, fresh issue vs offer for sale, minimum application and timing. **Nothing from NSE is stored** anywhere. |
+
+### Mutual Funds
+| Route | What it does |
+|---|---|
+| `/` | **Overview** — market pulse by asset class, fund houses scored against their peers, category matrix, alpha leaders and laggards, a risk-reward quadrant, category rotation, and an **All Funds** table of every scheme. |
+| `/holdings` | **Holdings** — your own portfolios, entered transaction by transaction. Shows value, total gain and how long the money behind it has been invested, return since start, XIRR, recent windows against peers, allocation, risk, SIPs and goals. |
+| `/screener` | **Scheme Screener** — filter and rank the whole scheme universe, with CSV export. |
+| `/compare` | **Compare & Simulate** — funds side by side, plus SIP and lumpsum backtests (XIRR, CAGR, Sharpe, max drawdown). |
+| `/quant` | **Quantitative MF Analysis** — factor attribution, stress tests, fee drag, tail risk, rolling returns, Monte Carlo. |
+| `/admin` | **Data Management** — NAV and TER sync, historical backfill, live logs. |
+| `/scheme/[code]` | Single-fund page, reached from search and tables. |
+
+The date range and the plan (Direct/Regular) and option (Growth/IDCW) filters are shared across the mutual-fund pages and kept in the URL.
+
+## Data sources
+
+- **AMFI** — daily NAVs and full NAV history (~27M rows since 2008), Total Expense Ratios as AMFI publishes them (four decimals), and fund-performance data (AUM, official benchmark returns, riskometer).
+- **NSE** — public-issue data, fetched live when you open the NSE IPO page and never saved.
+- **You** — Holdings transactions, stored only in your local database.
+- **USD → INR rate** — the Calculator page's rate tile is fetched by your browser, not the backend: from Coinbase (`api.coinbase.com`), falling back to ExchangeRate-API (`open.er-api.com`), about once a minute while the page is visible. Only the currency pair is requested, but like any website those providers see your IP address and browser.
+
+## Privacy
+
+Everything runs on your machine. The backend and frontend listen on `127.0.0.1` only, because the Holdings ledger is personal financial data and there is no login. The database lives in a local Docker volume. NSE data and the basic calculator's history stay in memory in your browser tab. The EMI calculator's inputs are kept in your browser's localStorage (`mf.calculator.emi.v1`, no expiry) so a refresh keeps them; they never leave the browser, but any other app served from the same address and port can read them.
+
+## Stack
+
+- **PostgreSQL 16**, in the Docker volume `indian-mutual-funds_pgdata`
+- **FastAPI** backend at `http://localhost:8000`
+- **Next.js 14** frontend at `http://localhost:3000`
+- **Docker Compose**, with the project name pinned to `indian-mutual-funds` so the volume stays attached if the folder moves
+
+## Run (Windows)
+
+Docker Desktop must be running. The passwords and the admin token live in `.env` beside `docker-compose.yml`, never in the repository. Copy `.env.example` to `.env` and replace each `change-me` with a long random value; compose refuses to start without them.
+
+```powershell
+.\start.ps1
+# or
+docker compose up -d
+```
+
+Day-to-day jobs go through one script:
+
+```powershell
+.\scripts\dev.ps1 frontend       # after frontend changes: check, build, restart (~25s warm)
+.\scripts\dev.ps1 backend        # after backend changes: restart, wait until healthy
+.\scripts\dev.ps1 backend-image  # only when backend/requirements.txt changes
+.\scripts\dev.ps1 db-role        # after changing a password in .env, or to rotate one
+```
+
+- The frontend's source is baked into its image. The image can't be built unless the type-check, lint and unit tests pass, because they run as a stage of the Docker build, in parallel with the compile. Each stage keeps its cache between builds, so only what changed is redone.
+- The backend's source is mounted into its container, so a code change needs a restart, not a rebuild.
+- `backend` and `backend-image` refuse to restart while a sync job is running, because that would kill it mid-write. Pass `-Force` to override.
+
+**First run:** a fresh clone starts with an empty database. Open **Data Management** (`/admin`) and run the NAV and TER sync, then the historical backfill. Admin actions need the `X-Admin-Token` header: paste `ADMIN_TOKEN` from `.env` into the box at the top of that page.
+
+The backend logs in as `mf_app`, which owns the app's tables but is not a superuser. On a new volume, Postgres creates that role on its first start (`scripts/postgres-init/10-app-role.sh`).
+
+> `docker compose down -v` deletes the database volume, including your Holdings ledger. Back it up first from the Holdings page.
+
+## Tests
+
+```powershell
+.\scripts\dev.ps1 check                                   # frontend checks + backend pytest, deploys nothing
+.\scripts\dev.ps1 test tests/test_holdings_planning.py    # some backend tests
+```
+
+## Layout
+
+```
+backend/app/         FastAPI app: routers/, services/, db/ (SQL), AMFI and NSE clients
+backend/tests/       pytest suite (runs against a separate test database)
+frontend/app/        Next.js pages, one folder per route
+frontend/components/ page components (holdings/, calculator/, nse-ipo/, overview/, shared/ ...)
+frontend/lib/        API clients and pure logic, with vitest tests beside them
+```

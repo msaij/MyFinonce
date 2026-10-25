@@ -1,0 +1,39 @@
+import datetime
+from typing import Optional
+
+from pydantic import BaseModel
+
+
+class MetaStatus(BaseModel):
+    """One consolidated poll target: data_version + DB bounds/counts + staleness.
+    Replaces separately polling get_data_version()/get_database_stats()/
+    is_database_stale() from three places -- the frontend's global date-range
+    store (see the migration plan) polls this single endpoint every 60s."""
+
+    data_version: int
+    schemes_count: int
+    amc_count: int
+    nav_count: int
+    file_size_mb: float
+    min_date: Optional[datetime.date]
+    max_date: Optional[datetime.date]
+    db_path: str
+    is_stale: bool
+    expected_date: Optional[datetime.date]
+    # Stale only because tonight's scheduled evening sync has not had its slot yet.
+    sync_scheduled: bool = False
+    ter_records_count: Optional[int] = 0
+    ter_official_schemes: Optional[int] = 0
+    flags: dict = {}
+    # The sync job running now (kind, label, trigger, step, started_at), or None.
+    sync_activity: Optional[dict] = None
+    # A historical NAV or TER backfill is running.
+    backfill_running: bool = False
+
+
+class MetaFilters(BaseModel):
+    amcs: list[str]
+    broad_categories: list[str]
+    sub_categories: list[str]
+    options: list[str]
+    plans: list[str]
